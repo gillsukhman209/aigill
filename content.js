@@ -13,8 +13,39 @@ let amazonContainer = null;
 let ourHost = null;
 let shadowRoot = null;
 
+// Settings (persisted to localStorage)
+const SETTINGS_KEY = "rfx_settings";
+const DEFAULT_SETTINGS = {
+  hideAmazonLoads: false,
+  pollMinSeconds: 2,
+  pollMaxSeconds: 5,
+  showScoreBar: true,
+  showPerHr: true,
+  showPerMi: true,
+  showDistance: true,
+  showDuration: true,
+  showVersionBadge: true,
+  showStopAddress: true,
+  showLegDistance: true,
+  showDwellTime: true,
+  showLoadTypeBadge: true,
+  showBookButton: true,
+  showDriverType: true,
+  showEquipment: true,
+  showStopCount: true,
+};
+let settings = { ...DEFAULT_SETTINGS };
+function loadSettings() {
+  try { const s = JSON.parse(localStorage.getItem(SETTINGS_KEY)); if (s) settings = { ...DEFAULT_SETTINGS, ...s }; } catch {}
+}
+function saveSettings() {
+  try { localStorage.setItem(SETTINGS_KEY, JSON.stringify(settings)); } catch {}
+}
+loadSettings();
+
 // Bot state
 let botRunning = false;
+let settingsOpen = false;
 let botTimer = null;
 let lastPollTime = null;
 let lastRefreshInterval = null;
@@ -87,20 +118,30 @@ function scoreColor(s) { return s >= 70 ? "#067d62" : s >= 40 ? "#b8860b" : "#cc
 function scoreBg(s) { return s >= 70 ? "#e6f7f2" : s >= 40 ? "#fef9e7" : "#fdecea"; }
 
 // ============================================================
-// SOUND
+// SOUND — AudioContext created once, reused for instant playback
 // ============================================================
+let audioCtx = null;
+function ensureAudioCtx() {
+  if (!audioCtx) {
+    audioCtx = new AudioContext();
+  }
+  // Resume if suspended (browsers suspend until user gesture)
+  if (audioCtx.state === "suspended") {
+    audioCtx.resume();
+  }
+}
 function playAlert() {
   try {
-    const ctx = new AudioContext();
-    const osc = ctx.createOscillator();
-    const gain = ctx.createGain();
+    ensureAudioCtx();
+    const osc = audioCtx.createOscillator();
+    const gain = audioCtx.createGain();
     osc.connect(gain);
-    gain.connect(ctx.destination);
+    gain.connect(audioCtx.destination);
     osc.frequency.value = 880;
-    gain.gain.setValueAtTime(0.3, ctx.currentTime);
-    gain.gain.exponentialRampToValueAtTime(0.001, ctx.currentTime + 0.5);
-    osc.start(ctx.currentTime);
-    osc.stop(ctx.currentTime + 0.5);
+    gain.gain.setValueAtTime(0.3, audioCtx.currentTime);
+    gain.gain.exponentialRampToValueAtTime(0.001, audioCtx.currentTime + 0.5);
+    osc.start(audioCtx.currentTime);
+    osc.stop(audioCtx.currentTime + 0.5);
   } catch (e) { console.warn("[Bot] Audio alert failed:", e); }
 }
 
@@ -329,6 +370,30 @@ const CSS = `
 .rfx-book-btn:hover { background: #e88b00; }
 .rfx-empty { text-align: center; color: #888; padding: 40px 20px; font-size: 14px; }
 
+/* Settings */
+.rfx-gear-btn {
+  background: none; border: 1px solid #d5d9d9; border-radius: 6px; cursor: pointer;
+  font-size: 16px; padding: 2px 8px; line-height: 1; color: #565959;
+}
+.rfx-gear-btn:hover { background: #f7fafa; }
+.rfx-settings-panel {
+  background: #fff; border: 1px solid #d5d9d9; border-radius: 10px;
+  padding: 16px; margin-bottom: 10px; display: none;
+}
+.rfx-settings-panel.open { display: block; }
+.rfx-settings-title { font-size: 15px; font-weight: 700; color: #0f1111; margin-bottom: 12px; }
+.rfx-settings-section { margin-bottom: 14px; }
+.rfx-settings-section-title { font-size: 12px; font-weight: 700; color: #565959; text-transform: uppercase; letter-spacing: 0.5px; margin-bottom: 6px; }
+.rfx-setting-row {
+  display: flex; align-items: center; gap: 8px; padding: 4px 0;
+}
+.rfx-setting-row label { font-size: 13px; color: #0f1111; cursor: pointer; flex: 1; }
+.rfx-setting-row input[type="checkbox"] { width: 16px; height: 16px; cursor: pointer; accent-color: #067d62; }
+.rfx-range-row { display: flex; align-items: center; gap: 10px; padding: 4px 0; }
+.rfx-range-row label { font-size: 13px; color: #0f1111; min-width: 80px; }
+.rfx-range-row input[type="range"] { flex: 1; accent-color: #ff9900; }
+.rfx-range-val { font-size: 13px; font-weight: 600; color: #0f1111; min-width: 30px; text-align: right; }
+
 /* Responsive */
 @media (max-width: 900px) {
   .rfx-right { min-width: 110px; }
@@ -374,8 +439,10 @@ function renderCard(wo, extraClass, changeBadge) {
   ].filter(Boolean).join(" ");
 
   let vBadge = "";
-  if (ver > 3) vBadge = `<span class="rfx-version bad">v${ver} ⚠</span>`;
-  else if (ver > 1) vBadge = `<span class="rfx-version ok">v${ver}</span>`;
+  if (settings.showVersionBadge) {
+    if (ver > 3) vBadge = `<span class="rfx-version bad">v${ver} ⚠</span>`;
+    else if (ver > 1) vBadge = `<span class="rfx-version ok">v${ver}</span>`;
+  }
 
   let badgeHtml = changeBadge ? `<span class="rfx-change-badge ${changeBadge.cls}">${changeBadge.text}</span>` : "";
   if (goneLoads.has(wo.id)) badgeHtml = `<span class="rfx-change-badge badge-gone">GONE</span>`;
@@ -403,15 +470,15 @@ function renderCard(wo, extraClass, changeBadge) {
       </div>
       <div class="rfx-stop-info">
         <div class="rfx-stop-name">${loc.label || loc.stopCode || "?"} · ${loc.city || "?"}, ${loc.state || "?"}</div>
-        <div class="rfx-stop-addr">${loc.line1 || ""}</div>
+        ${settings.showStopAddress ? `<div class="rfx-stop-addr">${loc.line1 || ""}</div>` : ""}
         <div class="rfx-stop-meta">
           <span class="rfx-stop-time">${fmtTimeShort(checkin, tz)}</span>
-          ${dwell ? `<span class="rfx-stop-dwell">${dwell}</span>` : ""}
-          ${ltBadge}
+          ${dwell && settings.showDwellTime ? `<span class="rfx-stop-dwell">${dwell}</span>` : ""}
+          ${settings.showLoadTypeBadge ? ltBadge : ""}
         </div>
       </div>
     </div>`;
-    if (conn && loc.latitude && loc.longitude) {
+    if (conn && settings.showLegDistance && loc.latitude && loc.longitude) {
       const nL = stops[i + 1]?.location;
       if (nL?.latitude && nL?.longitude) {
         const ld = (haversine(loc.latitude, loc.longitude, nL.latitude, nL.longitude) * 1.25).toFixed(1);
@@ -420,32 +487,37 @@ function renderCard(wo, extraClass, changeBadge) {
     }
   }
 
+  // Build stats conditionally
+  let statsHtml = `<span class="rfx-payout">${fmt$(pay)}</span>`;
+  if (settings.showPerHr) statsHtml += `<span class="rfx-stat"><b>${fmt$(perHr)}</b>/hr</span>`;
+  if (settings.showPerMi) statsHtml += `<span class="rfx-stat"><b>${fmt$(perMi)}</b>/mi</span>`;
+  const distDur = [];
+  if (settings.showDistance) distDur.push(`<b>${dist.toFixed(1)}</b> mi`);
+  if (settings.showDuration) distDur.push(`<b>${fmtDur(durMs)}</b>`);
+  if (distDur.length) statsHtml += `<span class="rfx-stat">${distDur.join(" · ")}</span>`;
+  statsHtml += vBadge;
+
+  // Build footer tags conditionally
+  let footerTags = `<span class="rfx-tag"><b>${fmtTime(wo.firstPickupTime, firstTz)}</b></span>`;
+  if (settings.showDriverType) footerTags += `<span class="rfx-tag">${driver}</span>`;
+  if (settings.showEquipment) footerTags += `<span class="rfx-tag">53' Trailer</span>`;
+  if (settings.showStopCount) footerTags += `<span class="rfx-tag">${wo.stopCount || stops.length} stops</span>`;
+
   return `<div class="${cls}" data-id="${wo.id}">
     ${badgeHtml}
     <div class="rfx-body">
       <div class="rfx-left">
-        <div class="rfx-score-row">
+        ${settings.showScoreBar ? `<div class="rfx-score-row">
           <div class="rfx-score-bg"><div class="rfx-score-fill" style="width:${score}%;background:${sc}"></div></div>
           <span class="rfx-score-label" style="color:${sc}">${score}</span>
           <span class="rfx-score-tag" style="background:${scoreBg(score)};color:${sc}">${score >= 70 ? "Great" : score >= 40 ? "OK" : "Low"}</span>
-        </div>
+        </div>` : ""}
         <div class="rfx-stops">${stopsHtml}</div>
-        <div class="rfx-footer">
-          <span class="rfx-tag"><b>${fmtTime(wo.firstPickupTime, firstTz)}</b></span>
-          <span class="rfx-tag">${driver}</span>
-          <span class="rfx-tag">53' Trailer</span>
-          <span class="rfx-tag">${wo.stopCount || stops.length} stops</span>
-        </div>
+        <div class="rfx-footer">${footerTags}</div>
       </div>
       <div class="rfx-right">
-        <div class="rfx-stats-group">
-          <span class="rfx-payout">${fmt$(pay)}</span>
-          <span class="rfx-stat"><b>${fmt$(perHr)}</b>/hr</span>
-          <span class="rfx-stat"><b>${fmt$(perMi)}</b>/mi</span>
-          <span class="rfx-stat"><b>${dist.toFixed(1)}</b> mi · <b>${fmtDur(durMs)}</b></span>
-          ${vBadge}
-        </div>
-        <button class="rfx-book-btn" data-wo-id="${wo.id}">BOOK</button>
+        <div class="rfx-stats-group">${statsHtml}</div>
+        ${settings.showBookButton ? `<button class="rfx-book-btn" data-wo-id="${wo.id}">BOOK</button>` : ""}
       </div>
     </div>
   </div>`;
@@ -496,8 +568,9 @@ function injectCards() {
   // Only search for Amazon's container if we don't have a host yet
   if (!ourHost) {
     if (!amazonContainer) amazonContainer = findLoadContainer();
-    if (amazonContainer) amazonContainer.style.display = "none";
   }
+  // Apply hide setting
+  applyHideAmazonLoads();
 
   // Create our shadow host if needed
   if (!ourHost) {
@@ -522,7 +595,15 @@ function injectCards() {
       }
     }
     ourHost.style.padding = "0 16px";
-    ourHost.style.maxWidth = "100%";
+    ourHost.style.width = "100%";
+    // Remove width constraints on all ancestors up to the main layout
+    let p = ourHost.parentElement;
+    for (let i = 0; i < 6 && p && p !== document.body; i++) {
+      p.style.maxWidth = "none";
+      p.style.width = "100%";
+      p.style.flex = "1";
+      p = p.parentElement;
+    }
     shadowRoot = ourHost.attachShadow({ mode: "open" });
   }
 
@@ -557,6 +638,51 @@ function injectCards() {
     <button class="rfx-bot-btn rfx-start-btn" id="rfx-start-btn" ${botRunning || alertedLoads.length > 0 ? "disabled" : ""}>Start</button>
     <button class="rfx-bot-btn rfx-stop-btn" id="rfx-stop-btn" ${!botRunning ? "disabled" : ""}>Stop</button>
     <button class="rfx-bot-btn rfx-reset-btn" id="rfx-reset-btn">Reset</button>
+    <button class="rfx-gear-btn" id="rfx-gear-btn" title="Settings">⚙</button>
+  </div>`;
+
+  // Settings panel
+  const chk = (key, label) => `<div class="rfx-setting-row"><input type="checkbox" id="rfx-s-${key}" ${settings[key] ? "checked" : ""} data-key="${key}"><label for="rfx-s-${key}">${label}</label></div>`;
+
+  const settingsPanel = `<div class="rfx-settings-panel${settingsOpen ? " open" : ""}" id="rfx-settings-panel">
+    <div class="rfx-settings-title">Settings</div>
+
+    <div class="rfx-settings-section">
+      <div class="rfx-settings-section-title">General</div>
+      ${chk("hideAmazonLoads", "Hide Amazon's original load list when AI mode is on")}
+    </div>
+
+    <div class="rfx-settings-section">
+      <div class="rfx-settings-section-title">Bot Speed</div>
+      <div class="rfx-range-row">
+        <label>Min interval</label>
+        <input type="range" id="rfx-s-pollMin" min="1" max="30" value="${settings.pollMinSeconds}" data-key="pollMinSeconds">
+        <span class="rfx-range-val" id="rfx-s-pollMin-val">${settings.pollMinSeconds}s</span>
+      </div>
+      <div class="rfx-range-row">
+        <label>Max interval</label>
+        <input type="range" id="rfx-s-pollMax" min="1" max="30" value="${settings.pollMaxSeconds}" data-key="pollMaxSeconds">
+        <span class="rfx-range-val" id="rfx-s-pollMax-val">${settings.pollMaxSeconds}s</span>
+      </div>
+    </div>
+
+    <div class="rfx-settings-section">
+      <div class="rfx-settings-section-title">Card Display</div>
+      ${chk("showScoreBar", "Score bar")}
+      ${chk("showPerHr", "$/hr")}
+      ${chk("showPerMi", "$/mi")}
+      ${chk("showDistance", "Distance")}
+      ${chk("showDuration", "Duration")}
+      ${chk("showVersionBadge", "Version badge (v14 ⚠)")}
+      ${chk("showStopAddress", "Street addresses")}
+      ${chk("showLegDistance", "Leg distances between stops")}
+      ${chk("showDwellTime", "Time at stop")}
+      ${chk("showLoadTypeBadge", "Load type badge (PRELOADED, LIVE, DROP)")}
+      ${chk("showBookButton", "BOOK button")}
+      ${chk("showDriverType", "Driver type (Solo/Team)")}
+      ${chk("showEquipment", "Equipment (53' Trailer)")}
+      ${chk("showStopCount", "Stop count")}
+    </div>
   </div>`;
 
   // Alert section
@@ -581,11 +707,16 @@ function injectCards() {
     <span class="rfx-count">${sorted.length} loads</span>
   </div>`;
 
-  const cardsHtml = sorted.length > 0
-    ? sorted.map(wo => renderCard(wo, knownIds.has(wo.id) ? "" : "new-load")).join("")
-    : `<div class="rfx-empty">No loads yet. Click <b>Start</b> to begin polling or <b>Fetch All</b> to load results.</div>`;
+  let cardsHtml;
+  if (sorted.length > 0) {
+    cardsHtml = sorted.map(wo => renderCard(wo, knownIds.has(wo.id) ? "" : "new-load")).join("");
+  } else if (alertedLoads.length > 0) {
+    cardsHtml = ""; // all loads are in the alert section, don't show empty message
+  } else {
+    cardsHtml = `<div class="rfx-empty">No loads yet. Click <b>Start</b> to begin polling or <b>Fetch All</b> to load results.</div>`;
+  }
 
-  shadowRoot.innerHTML = `<style>${CSS}</style>${statusBar}${alertSection}${toolbar}${cardsHtml}`;
+  shadowRoot.innerHTML = `<style>${CSS}</style>${statusBar}${settingsPanel}${alertSection}${toolbar}${cardsHtml}`;
 
   for (const wo of sorted) knownIds.add(wo.id);
 
@@ -611,6 +742,51 @@ function injectCards() {
   if (resetBtn) resetBtn.addEventListener("click", resetBot);
   if (resumeBtn) resumeBtn.addEventListener("click", resumeBot);
 
+  // Gear / settings
+  const gearBtn = shadowRoot.getElementById("rfx-gear-btn");
+  if (gearBtn) gearBtn.addEventListener("click", () => {
+    settingsOpen = !settingsOpen;
+    const panel = shadowRoot.getElementById("rfx-settings-panel");
+    if (panel) panel.classList.toggle("open", settingsOpen);
+  });
+
+  // Settings checkboxes
+  shadowRoot.querySelectorAll('.rfx-setting-row input[type="checkbox"]').forEach(cb => {
+    cb.addEventListener("change", () => {
+      settings[cb.dataset.key] = cb.checked;
+      saveSettings();
+      applyHideAmazonLoads();
+      injectCards();
+    });
+  });
+
+  // Settings range sliders
+  shadowRoot.querySelectorAll('.rfx-range-row input[type="range"]').forEach(slider => {
+    slider.addEventListener("input", () => {
+      const key = slider.dataset.key;
+      settings[key] = parseInt(slider.value);
+      // Ensure min <= max
+      if (key === "pollMinSeconds" && settings.pollMinSeconds > settings.pollMaxSeconds) {
+        settings.pollMaxSeconds = settings.pollMinSeconds;
+      }
+      if (key === "pollMaxSeconds" && settings.pollMaxSeconds < settings.pollMinSeconds) {
+        settings.pollMinSeconds = settings.pollMaxSeconds;
+      }
+      saveSettings();
+      const valEl = shadowRoot.getElementById(slider.id + "-val");
+      if (valEl) valEl.textContent = slider.value + "s";
+      // Update the other slider's display too
+      const minVal = shadowRoot.getElementById("rfx-s-pollMin-val");
+      const maxVal = shadowRoot.getElementById("rfx-s-pollMax-val");
+      const minSlider = shadowRoot.getElementById("rfx-s-pollMin");
+      const maxSlider = shadowRoot.getElementById("rfx-s-pollMax");
+      if (minVal && minSlider) minVal.textContent = settings.pollMinSeconds + "s";
+      if (maxVal && maxSlider) maxVal.textContent = settings.pollMaxSeconds + "s";
+      if (minSlider) minSlider.value = settings.pollMinSeconds;
+      if (maxSlider) maxSlider.value = settings.pollMaxSeconds;
+    });
+  });
+
   // Start the last-refresh timer
   updateLastRefresh();
 }
@@ -630,8 +806,38 @@ function updateLastRefresh() {
 // Update the "last refreshed" display every second
 setInterval(updateLastRefresh, 1000);
 
+function applyHideAmazonLoads() {
+  if (!aiModeActive) return;
+  const hide = settings.hideAmazonLoads;
+  // Target Amazon's known elements by class/id
+  const selectors = [
+    ".load-list",
+    ".pagination-bar",
+    "#search-results-summary-panel",
+    ".search-results-summary__panel",
+  ];
+  for (const sel of selectors) {
+    const el = document.querySelector(sel);
+    if (el) el.style.display = hide ? "none" : "";
+  }
+}
+
 function removeOurCards() {
   if (amazonContainer) amazonContainer.style.display = "";
+  [".load-list", ".pagination-bar", "#search-results-summary-panel", ".search-results-summary__panel"].forEach(sel => {
+    const el = document.querySelector(sel);
+    if (el) el.style.display = "";
+  });
+  // Restore parent width overrides
+  if (ourHost) {
+    let p = ourHost.parentElement;
+    for (let i = 0; i < 6 && p && p !== document.body; i++) {
+      p.style.maxWidth = "";
+      p.style.width = "";
+      p.style.flex = "";
+      p = p.parentElement;
+    }
+  }
   if (ourHost?._hiddenNoMatches) ourHost._hiddenNoMatches.style.display = "";
   if (ourHost) { ourHost.remove(); ourHost = null; shadowRoot = null; }
 }
@@ -653,6 +859,7 @@ function toggleAiMode() {
 // ============================================================
 function startBot() {
   if (botRunning) return;
+  ensureAudioCtx(); // warm up audio on user gesture so alerts play instantly
   botRunning = true;
   isFirstPoll = seenLoads.size === 0;
   chrome.runtime.sendMessage({ action: "botStarted" }).catch(() => {});
@@ -691,7 +898,9 @@ function resumeBot() {
 
 function scheduleNext() {
   if (!botRunning) return;
-  const delay = 2000 + Math.random() * 3000; // 2-5 seconds
+  const minMs = settings.pollMinSeconds * 1000;
+  const maxMs = settings.pollMaxSeconds * 1000;
+  const delay = minMs + Math.random() * (maxMs - minMs);
   botTimer = setTimeout(() => {
     if (!botRunning) return;
     doPoll();
