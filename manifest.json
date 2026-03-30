@@ -1,0 +1,27 @@
+{
+  "manifest_version": 3,
+  "name": "Relay Load Fetcher",
+  "version": "0.2",
+  "description": "Fetches loads from Amazon Relay load board",
+  "permissions": ["activeTab", "cookies"],
+  "host_permissions": ["https://relay.amazon.com/*"],
+  "background": {
+    "service_worker": "background.js"
+  },
+  "content_scripts": [
+    {
+      "matches": ["https://relay.amazon.com/loadboard/*"],
+      "js": ["interceptor.js"],
+      "run_at": "document_start",
+      "world": "MAIN"
+    },
+    {
+      "matches": ["https://relay.amazon.com/loadboard/*"],
+      "js": ["content.js"],
+      "run_at": "document_idle"
+    }
+  ],
+  "action": {
+    "default_popup": "popup.html"
+  }
+}
