@@ -43,6 +43,10 @@ function saveSettings() {
 }
 loadSettings();
 
+// Negotiation state
+// key: woId, value: { status: 'idle'|'running'|'done'|'ineligible', round, prices: [num], originalPay, bestPay, resolveRound }
+const negotiationState = new Map();
+
 // Bot state
 let botRunning = false;
 let settingsOpen = false;
@@ -368,6 +372,33 @@ const CSS = `
   background: #ff9900; color: #0f1111; border: none; border-radius: 8px; cursor: pointer; font-family: inherit;
 }
 .rfx-book-btn:hover { background: #e88b00; }
+
+/* Negotiation */
+.rfx-neg-btn {
+  padding: 6px 16px; font-size: 13px; font-weight: 600;
+  background: #2563eb; color: #fff; border: none; border-radius: 8px; cursor: pointer; font-family: inherit;
+  margin-top: 6px;
+}
+.rfx-neg-btn:hover { background: #1d4ed8; }
+.rfx-neg-btn:disabled { opacity: 0.5; cursor: not-allowed; }
+.rfx-neg-btn.done { background: #067d62; cursor: default; }
+.rfx-neg-btn.ineligible { background: #888; cursor: default; }
+.rfx-neg-section {
+  margin-top: 8px; padding: 8px 12px; border-radius: 8px; font-size: 13px;
+}
+.rfx-neg-section.running { background: #eff6ff; border: 1px solid #bfdbfe; }
+.rfx-neg-section.done { background: #e6f7f2; border: 1px solid #a7f3d0; }
+.rfx-neg-section.ineligible { background: #f5f5f5; border: 1px solid #e5e5e5; color: #888; }
+.rfx-neg-round { font-weight: 600; color: #2563eb; }
+.rfx-neg-prices { margin-top: 4px; color: #0f1111; font-size: 14px; }
+.rfx-neg-prices span { transition: all 0.3s; }
+.rfx-neg-result { margin-top: 6px; display: flex; align-items: center; gap: 8px; }
+.rfx-neg-gain { font-weight: 700; color: #067d62; font-size: 15px; }
+.rfx-neg-final { font-weight: 700; font-size: 18px; color: #067d62; }
+.rfx-neg-rounds-count { color: #565959; font-size: 12px; }
+@keyframes rfxNegPulse { 0%,100% { opacity: 1; } 50% { opacity: 0.6; } }
+.rfx-neg-pulsing { animation: rfxNegPulse 1s infinite; }
+
 .rfx-empty { text-align: center; color: #888; padding: 40px 20px; font-size: 14px; }
 
 /* Settings */
@@ -986,6 +1017,327 @@ window.addEventListener("relay-fetcher-poll-result", (e) => {
 });
 
 // ============================================================
+// NEGOTIATION
+// ============================================================
+function playNegotiationSound() {
+  try {
+    ensureAudioCtx();
+    const osc = audioCtx.createOscillator();
+    const gain = audioCtx.createGain();
+    osc.connect(gain);
+    gain.connect(audioCtx.destination);
+    osc.frequency.value = 440; // lower tone than alert
+    gain.gain.setValueAtTime(0.25, audioCtx.currentTime);
+    gain.gain.exponentialRampToValueAtTime(0.001, audioCtx.currentTime + 0.6);
+    osc.start(audioCtx.currentTime);
+    osc.stop(audioCtx.currentTime + 0.6);
+  } catch (e) {}
+}
+
+function startNegotiation(woId, version, majorVersion, originalPay) {
+  const state = {
+    status: "running",
+    round: 0,
+    prices: [originalPay],
+    originalPay,
+    bestPay: originalPay,
+  };
+  negotiationState.set(woId, state);
+  updateChatNegUI(woId);
+
+  console.log(`[Negotiator] Starting negotiation for ${woId.substring(0, 8)}... original=$${originalPay.toFixed(2)}`);
+
+  runNegotiationRound(woId, version, majorVersion);
+}
+
+function runNegotiationRound(woId, version, majorVersion) {
+  const state = negotiationState.get(woId);
+  if (!state || state.status !== "running") return;
+
+  state.round++;
+  const round = state.round;
+
+  console.log(`[Negotiator] Round ${round} for ${woId.substring(0, 8)}...`);
+
+  // Round 1: mention the issue. Round 2+: demand a much higher price
+  let query;
+  if (round === 1) {
+    query = "There is a big fire on the road and severe traffic delays. I need a higher rate to take this load given the dangerous conditions.";
+  } else {
+    const currentBest = state.bestPay || state.originalPay;
+    const demandPrice = Math.round(currentBest + (state.originalPay * 0.5)); // ask for 50% more than original on top of current
+    query = `That price is still too low given the conditions. I need at least $${demandPrice} to make this work. The fire and road closures are adding significant time and fuel costs.`;
+  }
+
+  console.log(`[Negotiator] Round ${round} message: "${query.substring(0, 60)}..."`);
+
+  const payload = {
+    action: "query",
+    query,
+    workOpportunityId: woId,
+    workOpportunityOptionId: "1",
+    workOpportunityVersion: version,
+    woMajorVersion: majorVersion,
+  };
+
+  // Listen for this specific response
+  function onResult(e) {
+    const result = JSON.parse(e.detail);
+    if (result.woId !== woId) return; // not our response
+    window.removeEventListener("relay-fetcher-negotiate-result", onResult);
+
+    if (result.error) {
+      console.error(`[Negotiator] Round ${round} error:`, result.error);
+      state.status = "done";
+      negotiationState.set(woId, state);
+      updateChatNegUI(woId);
+      return;
+    }
+
+    const data = result.data;
+    const updatedPrice = data?.updatedPrice?.value ?? null;
+    const chatStatus = data?.status || "";
+    const prevPrice = state.prices[state.prices.length - 1];
+    const aiResponse = data?.response || "";
+
+    console.log(`[Negotiator] Round ${round}: status="${chatStatus}", updatedPrice=${updatedPrice}, aiResponse="${aiResponse.substring(0, 80)}..."`);
+
+    // If Amazon ended the conversation (not IN_PROGRESS)
+    if (chatStatus !== "IN_PROGRESS") {
+      if (updatedPrice !== null) {
+        state.prices.push(updatedPrice);
+        if (updatedPrice > state.bestPay) state.bestPay = updatedPrice;
+      }
+      console.log(`[Negotiator] Amazon ended negotiation (status=${chatStatus}). Best: ${fmt$(state.bestPay)}`);
+      state.status = "done";
+      negotiationState.set(woId, state);
+      playNegotiationSound();
+      updateChatNegUI(woId);
+      return;
+    }
+
+    // Status is IN_PROGRESS
+    if (updatedPrice !== null) {
+      // Amazon offered a new price
+      state.prices.push(updatedPrice);
+      if (updatedPrice > state.bestPay) state.bestPay = updatedPrice;
+      const diff = updatedPrice - prevPrice;
+      console.log(`[Negotiator] Round ${round}: ${fmt$(prevPrice)} → ${fmt$(updatedPrice)} (${diff >= 0 ? "+" : ""}${fmt$(diff)})`);
+
+      negotiationState.set(woId, state);
+      updateChatNegUI(woId);
+
+      // Check if price stopped moving
+      if (state.prices.length >= 3 && Math.abs(updatedPrice - prevPrice) < 0.01) {
+        console.log(`[Negotiator] Price stopped moving at ${fmt$(updatedPrice)}. Best: ${fmt$(state.bestPay)}`);
+        state.status = "done";
+        negotiationState.set(woId, state);
+        playNegotiationSound();
+        updateChatNegUI(woId);
+        return;
+      }
+    } else {
+      // updatedPrice is null but status is IN_PROGRESS — Amazon is still talking, keep going
+      console.log(`[Negotiator] Round ${round}: No price yet, still IN_PROGRESS. Continuing...`);
+      negotiationState.set(woId, state);
+      updateChatNegUI(woId);
+    }
+
+    // Safety cap
+    if (round >= 5) {
+      console.log(`[Negotiator] Safety cap reached (5 rounds). Best: ${fmt$(state.bestPay)}`);
+      state.status = "done";
+      negotiationState.set(woId, state);
+      playNegotiationSound();
+      updateChatNegUI(woId);
+      return;
+    }
+
+    // Schedule next round with random delay
+    const delay = 2000 + Math.random() * 1000;
+    setTimeout(() => runNegotiationRound(woId, version, majorVersion), delay);
+  }
+
+  window.addEventListener("relay-fetcher-negotiate-result", onResult);
+
+  // Dispatch to interceptor
+  window.dispatchEvent(new CustomEvent("relay-fetcher-negotiate", {
+    detail: JSON.stringify({ woId, payload }),
+  }));
+}
+
+// ============================================================
+// CHAT MODAL — detect + inject negotiate button
+// ============================================================
+let chatObserver = null;
+let chatWoId = null;
+let chatWoVersion = null;
+let chatWoMajorVersion = null;
+let chatOriginalPay = null;
+
+function setupChatObserver() {
+  if (chatObserver) return;
+  chatObserver = new MutationObserver(() => {
+    const modal = document.querySelector(".bot-header, [class*='bot-header']");
+    if (modal && !document.getElementById("rfx-chat-neg-container")) {
+      injectChatNegButton();
+    }
+    // Clean up if modal closed
+    if (!document.querySelector("[class*='bot-header']") && document.getElementById("rfx-chat-neg-container")) {
+      const el = document.getElementById("rfx-chat-neg-container");
+      if (el) el.remove();
+      chatWoId = null;
+    }
+  });
+  chatObserver.observe(document.body, { childList: true, subtree: true });
+}
+
+function injectChatNegButton() {
+  const header = document.querySelector(".bot-header, [class*='bot-header']");
+  if (!header || document.getElementById("rfx-chat-neg-container")) return;
+
+  const container = document.createElement("div");
+  container.id = "rfx-chat-neg-container";
+  container.style.cssText = "padding: 8px 12px; background: #f0f7ff; border-bottom: 1px solid #bfdbfe; font-family: -apple-system, sans-serif;";
+  container.innerHTML = `
+    <div style="display: flex; gap: 8px;">
+      <button id="rfx-chat-neg-btn" style="
+        padding: 8px 20px; font-size: 14px; font-weight: 600;
+        background: #2563eb; color: #fff; border: none; border-radius: 8px;
+        cursor: pointer; font-family: inherit; flex: 1;
+      ">Auto-Negotiate</button>
+      <button id="rfx-chat-neg-stop" style="
+        padding: 8px 16px; font-size: 14px; font-weight: 600;
+        background: #cc3333; color: #fff; border: none; border-radius: 8px;
+        cursor: pointer; font-family: inherit; display: none;
+      ">Stop</button>
+    </div>
+    <div id="rfx-chat-neg-status" style="margin-top: 6px; font-size: 13px; display: none;"></div>
+  `;
+
+  header.after(container);
+
+  container.querySelector("#rfx-chat-neg-btn").addEventListener("click", () => {
+    ensureAudioCtx();
+    startChatNegotiation();
+  });
+  container.querySelector("#rfx-chat-neg-stop").addEventListener("click", () => {
+    stopNegotiation();
+  });
+}
+
+function stopNegotiation() {
+  if (!chatWoId) return;
+  const state = negotiationState.get(chatWoId);
+  if (!state || state.status !== "running") return;
+  console.log(`[Negotiator] Manually stopped at round ${state.round}. Best: ${fmt$(state.bestPay)}`);
+  state.status = "done";
+  negotiationState.set(chatWoId, state);
+  playNegotiationSound();
+  updateChatNegUI(chatWoId);
+}
+
+function startChatNegotiation() {
+  const btn = document.getElementById("rfx-chat-neg-btn");
+  if (btn) { btn.disabled = true; btn.textContent = "Starting..."; }
+
+  if (chatWoId) {
+    startNegotiation(chatWoId, chatWoVersion, chatWoMajorVersion, chatOriginalPay);
+    return;
+  }
+
+  // No data yet — send a quick initial query to get the load details
+  console.log("[Negotiator] No chat data yet — sending initial query to get load details");
+  if (btn) btn.textContent = "Getting load info...";
+
+  // We need the WO ID to send the query, but we don't have it yet
+  // Try to find it from the chat modal's content (Amazon renders the load ID somewhere)
+  const chatBody = document.querySelector(".bot-play-area, [class*='bot-play-area']");
+  if (!chatBody) {
+    updateChatNegStatus("Could not find chat. Please send a message first, then try again.", "#cc3333");
+    if (btn) { btn.disabled = false; btn.textContent = "Auto-Negotiate"; }
+    return;
+  }
+
+  updateChatNegStatus("Send any message in the chat first so we can capture the load details, then click Auto-Negotiate again.", "#b8860b");
+  if (btn) { btn.disabled = false; btn.textContent = "Auto-Negotiate"; }
+}
+
+function updateChatNegUI(woId) {
+  const state = negotiationState.get(woId);
+  if (!state) return;
+
+  const statusEl = document.getElementById("rfx-chat-neg-status");
+  const btn = document.getElementById("rfx-chat-neg-btn");
+  const stopBtn = document.getElementById("rfx-chat-neg-stop");
+  if (!statusEl) return;
+
+  statusEl.style.display = "block";
+
+  if (state.status === "running") {
+    const priceChain = state.prices.map(p => fmt$(p)).join(" → ");
+    statusEl.innerHTML = `
+      <div style="font-weight:600; color:#2563eb; animation: rfxNegPulse 1s infinite;">Negotiating... Round ${state.round}</div>
+      <div style="margin-top:4px; font-size:14px; color:#0f1111;">${priceChain}</div>
+    `;
+    statusEl.style.background = "#eff6ff";
+    statusEl.style.padding = "8px";
+    statusEl.style.borderRadius = "6px";
+    if (btn) { btn.disabled = true; btn.textContent = "Negotiating..."; }
+    if (stopBtn) { stopBtn.style.display = "block"; }
+  } else if (state.status === "done") {
+    const gain = state.bestPay - state.originalPay;
+    const priceChain = state.prices.map(p => fmt$(p)).join(" → ");
+    statusEl.innerHTML = `
+      <div style="display:flex; align-items:center; gap:8px;">
+        <span style="font-size:18px">✅</span>
+        <span style="font-weight:700; font-size:20px; color:#067d62;">${fmt$(state.bestPay)}</span>
+        ${gain > 0.01 ? `<span style="font-weight:700; color:#067d62; font-size:15px;">+${fmt$(gain)} gained</span>` : ""}
+        <span style="color:#565959; font-size:12px;">${state.round} rounds</span>
+      </div>
+      <div style="margin-top:4px; font-size:13px; color:#0f1111;">${priceChain}</div>
+    `;
+    statusEl.style.background = "#e6f7f2";
+    statusEl.style.padding = "10px";
+    statusEl.style.borderRadius = "6px";
+    if (btn) { btn.disabled = true; btn.textContent = "Negotiation Complete"; btn.style.background = "#067d62"; }
+    if (stopBtn) { stopBtn.style.display = "none"; }
+  } else if (state.status === "ineligible") {
+    statusEl.innerHTML = `<div style="color:#888;">Not eligible for negotiation</div>`;
+    statusEl.style.background = "#f5f5f5";
+    statusEl.style.padding = "8px";
+    statusEl.style.borderRadius = "6px";
+    if (btn) { btn.disabled = true; btn.textContent = "Not Eligible"; btn.style.background = "#888"; }
+    if (stopBtn) { stopBtn.style.display = "none"; }
+  }
+}
+
+function updateChatNegStatus(text, color) {
+  const statusEl = document.getElementById("rfx-chat-neg-status");
+  if (statusEl) {
+    statusEl.style.display = "block";
+    statusEl.innerHTML = `<div style="color:${color || "#0f1111"}">${text}</div>`;
+  }
+}
+
+// Intercept Amazon's own chat responses to capture workOpportunity details
+window.addEventListener("relay-fetcher-chat-intercepted", (e) => {
+  try {
+    const { data } = JSON.parse(e.detail);
+    if (data?.workOpportunity?.id) {
+      chatWoId = data.workOpportunity.id;
+      chatWoVersion = data.workOpportunity.version || 1;
+      chatWoMajorVersion = data.workOpportunity.majorVersion || 1;
+      // Get original price from the workOpportunity payout
+      chatOriginalPay = data.workOpportunity?.payout?.value || data.updatedPrice?.value || 0;
+      console.log(`[Negotiator] Chat intercepted — WO: ${chatWoId.substring(0, 8)}... ver=${chatWoVersion} major=${chatWoMajorVersion} pay=$${chatOriginalPay.toFixed(2)}`);
+    }
+  } catch (err) {
+    console.error("[Negotiator] Chat intercept error:", err);
+  }
+});
+
+// ============================================================
 // BOOK
 // ============================================================
 function bookLoad(woId) {
@@ -1124,6 +1476,9 @@ function init() {
   });
 
   observer.observe(document.body, { childList: true, subtree: true });
+
+  // Start watching for chat modal
+  setupChatObserver();
 }
 
 if (document.body) init();

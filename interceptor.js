@@ -39,6 +39,24 @@
       } catch (e) {}
     }
 
+    // Capture Amazon's own chat/demand-support responses to grab workOpportunity details
+    if (url.includes("/api/loadboard/demand-support/") && config?.method === "POST" && config?.body) {
+      try {
+        const parsed = JSON.parse(config.body);
+        if (!parsed._isNegotiator) {
+          const response = await _origFetch.apply(this, args);
+          const clone = response.clone();
+          try {
+            const data = await clone.json();
+            window.dispatchEvent(new CustomEvent("relay-fetcher-chat-intercepted", {
+              detail: JSON.stringify({ data, request: parsed }),
+            }));
+          } catch (e) {}
+          return response;
+        }
+      } catch (e) {}
+    }
+
     return _origFetch.apply(this, args);
   };
 
@@ -150,6 +168,40 @@
     } catch (err) {
       window.dispatchEvent(new CustomEvent("relay-fetcher-poll-result", {
         detail: JSON.stringify({ error: err.message }),
+      }));
+    }
+  });
+
+  // Negotiation request — sends a single query to demand-support endpoint
+  window.addEventListener("relay-fetcher-negotiate", async (e) => {
+    const req = JSON.parse(e.detail);
+    let csrfToken = capturedCsrfToken;
+    if (!csrfToken) {
+      const cookies = document.cookie.split(";");
+      for (const c of cookies) {
+        const t = c.trim(); const eq = t.indexOf("=");
+        if (eq === -1) continue;
+        const n = t.substring(0, eq), v = t.substring(eq + 1);
+        if (n === "x-csrf-token" || n === "csrf-token" || n === "anti-csrftoken-a2z") {
+          csrfToken = decodeURIComponent(v); break;
+        }
+      }
+    }
+
+    try {
+      const response = await _origFetch("https://relay.amazon.com/api/loadboard/demand-support/query", {
+        method: "POST",
+        headers: { "Content-Type": "application/json", ...(csrfToken ? { "x-csrf-token": csrfToken } : {}) },
+        credentials: "include",
+        body: JSON.stringify({ ...req.payload, _isNegotiator: true }),
+      });
+      const data = await response.json();
+      window.dispatchEvent(new CustomEvent("relay-fetcher-negotiate-result", {
+        detail: JSON.stringify({ woId: req.woId, status: response.status, data }),
+      }));
+    } catch (err) {
+      window.dispatchEvent(new CustomEvent("relay-fetcher-negotiate-result", {
+        detail: JSON.stringify({ woId: req.woId, error: err.message }),
       }));
     }
   });
