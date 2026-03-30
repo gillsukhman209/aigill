@@ -3,7 +3,7 @@
   "name": "Relay Load Fetcher",
   "version": "0.2",
   "description": "Fetches loads from Amazon Relay load board",
-  "permissions": ["activeTab", "cookies"],
+  "permissions": ["activeTab", "cookies", "alarms"],
   "host_permissions": ["https://relay.amazon.com/*"],
   "background": {
     "service_worker": "background.js"

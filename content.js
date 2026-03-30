@@ -1,5 +1,5 @@
 // Content script — relay.amazon.com/loadboard/* (isolated world)
-// Replaces Amazon's load cards in-place with enhanced cards
+// Custom UI + Bot polling + Detection logic
 
 // ============================================================
 // STATE
@@ -12,6 +12,17 @@ let aiModeActive = false;
 let amazonContainer = null;
 let ourHost = null;
 let shadowRoot = null;
+
+// Bot state
+let botRunning = false;
+let botTimer = null;
+let lastPollTime = null;
+let lastRefreshInterval = null;
+let isFirstPoll = true;
+const seenLoads = new Map(); // id -> { version, payout, pickupTime }
+const missingCounts = new Map(); // id -> consecutive miss count
+let alertedLoads = []; // loads in the "new load detected" section
+let goneLoads = new Set(); // ids fading out
 
 // ============================================================
 // UTILITIES
@@ -26,15 +37,15 @@ function fmtTime(iso, tz) {
   if (!iso) return "N/A";
   try {
     const d = new Date(iso), now = new Date();
-    const time = d.toLocaleTimeString("en-US", { hour: "numeric", minute: "2-digit", timeZone: tz || undefined });
+    const time = d.toLocaleTimeString("en-US", { hour: "numeric", minute: "2-digit", timeZone: tz || "America/Los_Angeles" });
     const diff = Math.floor((d - new Date(now.getFullYear(), now.getMonth(), now.getDate())) / 86400000);
-    const label = diff === 0 ? "Today" : diff === 1 ? "Tomorrow" : d.toLocaleDateString("en-US", { weekday: "short", month: "short", day: "numeric", timeZone: tz || undefined });
+    const label = diff === 0 ? "Today" : diff === 1 ? "Tomorrow" : d.toLocaleDateString("en-US", { weekday: "short", month: "short", day: "numeric", timeZone: tz || "America/Los_Angeles" });
     return `${label} ${time}`;
   } catch { return iso; }
 }
 function fmtTimeShort(iso, tz) {
   if (!iso) return "";
-  try { return new Date(iso).toLocaleTimeString("en-US", { hour: "numeric", minute: "2-digit", timeZone: tz || undefined }); } catch { return ""; }
+  try { return new Date(iso).toLocaleTimeString("en-US", { hour: "numeric", minute: "2-digit", timeZone: tz || "America/Los_Angeles" }); } catch { return ""; }
 }
 function haversine(lat1, lon1, lat2, lon2) {
   const R = 3959, r = Math.PI / 180;
@@ -76,12 +87,174 @@ function scoreColor(s) { return s >= 70 ? "#067d62" : s >= 40 ? "#b8860b" : "#cc
 function scoreBg(s) { return s >= 70 ? "#e6f7f2" : s >= 40 ? "#fef9e7" : "#fdecea"; }
 
 // ============================================================
-// CSS — light theme matching Amazon Relay
+// SOUND
+// ============================================================
+function playAlert() {
+  try {
+    const ctx = new AudioContext();
+    const osc = ctx.createOscillator();
+    const gain = ctx.createGain();
+    osc.connect(gain);
+    gain.connect(ctx.destination);
+    osc.frequency.value = 880;
+    gain.gain.setValueAtTime(0.3, ctx.currentTime);
+    gain.gain.exponentialRampToValueAtTime(0.001, ctx.currentTime + 0.5);
+    osc.start(ctx.currentTime);
+    osc.stop(ctx.currentTime + 0.5);
+  } catch (e) { console.warn("[Bot] Audio alert failed:", e); }
+}
+
+// ============================================================
+// DETECTION LOGIC
+// ============================================================
+function detectChanges(newLoads) {
+  console.log(`[Bot:Detect] --- Detection run --- isFirstPoll=${isFirstPoll}, seenLoads=${seenLoads.size}, incoming=${newLoads.length}`);
+
+  if (isFirstPoll) {
+    for (const wo of newLoads) {
+      seenLoads.set(wo.id, {
+        version: wo.version || 1,
+        payout: wo.payout?.value || 0,
+        pickupTime: wo.firstPickupTime || "",
+      });
+      console.log(`[Bot:Detect] FIRST POLL — seeded: ${wo.id.substring(0, 8)}... pay=${wo.payout?.value?.toFixed(2)}`);
+    }
+    isFirstPoll = false;
+    console.log(`[Bot:Detect] First poll done. seenLoads=${seenLoads.size}. No alerts.`);
+    return [];
+  }
+
+  const alerts = [];
+  const currentIds = new Set();
+
+  for (const wo of newLoads) {
+    currentIds.add(wo.id);
+    const prev = seenLoads.get(wo.id);
+    const newPay = wo.payout?.value || 0;
+    const newVer = wo.version || 1;
+    const newPickup = wo.firstPickupTime || "";
+    const shortId = wo.id.substring(0, 8);
+
+    if (!prev) {
+      console.log(`[Bot:Detect] ★ NEW load: ${shortId}... pay=$${newPay.toFixed(2)} ver=${newVer}`);
+      alerts.push({ wo, badge: "NEW", badgeClass: "badge-new" });
+      seenLoads.set(wo.id, { version: newVer, payout: newPay, pickupTime: newPickup });
+    } else {
+      const payChanged = Math.abs(newPay - prev.payout) > 1;
+      const verChanged = newVer !== prev.version;
+      const timeChanged = newPickup !== prev.pickupTime;
+
+      if (payChanged || verChanged || timeChanged) {
+        let badge, badgeClass;
+        if (payChanged && newPay > prev.payout) {
+          badge = `PRICE UP ${fmt$(prev.payout)} → ${fmt$(newPay)}`;
+          badgeClass = "badge-price-up";
+        } else if (payChanged && newPay < prev.payout) {
+          badge = `PRICE DOWN ${fmt$(prev.payout)} → ${fmt$(newPay)}`;
+          badgeClass = "badge-price-down";
+        } else if (timeChanged) {
+          badge = `TIME CHANGED ${fmtTimeShort(prev.pickupTime)} → ${fmtTimeShort(newPickup)}`;
+          badgeClass = "badge-time";
+        } else {
+          badge = "UPDATED";
+          badgeClass = "badge-updated";
+        }
+        console.log(`[Bot:Detect] ★ CHANGED load: ${shortId}... ${badge} (pay:${prev.payout.toFixed(2)}→${newPay.toFixed(2)} ver:${prev.version}→${newVer} time:${prev.pickupTime !== newPickup ? "changed" : "same"})`);
+        alerts.push({ wo, badge, badgeClass });
+        seenLoads.set(wo.id, { version: newVer, payout: newPay, pickupTime: newPickup });
+      } else {
+        console.log(`[Bot:Detect] — SAME load: ${shortId}... (no change)`);
+      }
+      missingCounts.delete(wo.id);
+    }
+  }
+
+  // Case 4: Disappeared loads
+  for (const [id] of seenLoads) {
+    if (!currentIds.has(id)) {
+      const count = (missingCounts.get(id) || 0) + 1;
+      missingCounts.set(id, count);
+      console.log(`[Bot:Detect] ✕ MISSING load: ${id.substring(0, 8)}... miss count=${count}`);
+      if (count >= 2) {
+        console.log(`[Bot:Detect] ✕ GONE confirmed: ${id.substring(0, 8)}...`);
+        goneLoads.add(id);
+        setTimeout(() => {
+          seenLoads.delete(id);
+          missingCounts.delete(id);
+          goneLoads.delete(id);
+          allLoads = allLoads.filter(w => w.id !== id);
+          if (aiModeActive) injectCards();
+        }, 5000);
+      }
+    }
+  }
+
+  console.log(`[Bot:Detect] Result: ${alerts.length} alerts, seenLoads=${seenLoads.size}`);
+  return alerts;
+}
+
+// ============================================================
+// CSS
 // ============================================================
 const CSS = `
 :host { all: initial; font-family: "Amazon Ember", -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif; font-size: 14px; color: #0f1111; }
 * { box-sizing: border-box; margin: 0; padding: 0; }
 
+/* Bot status bar */
+.rfx-status-bar {
+  display: flex; align-items: center; gap: 10px; padding: 8px 12px; margin-bottom: 8px;
+  background: #f7f7f7; border: 1px solid #e7e7e7; border-radius: 8px; flex-wrap: wrap;
+}
+.rfx-dot { width: 10px; height: 10px; border-radius: 50%; flex-shrink: 0; }
+.rfx-dot.green { background: #067d62; animation: rfxPulse 1.5s infinite; }
+.rfx-dot.amber { background: #b8860b; animation: rfxPulse 1s infinite; }
+.rfx-dot.red { background: #cc3333; }
+.rfx-dot.grey { background: #aaa; }
+@keyframes rfxPulse { 0%,100% { opacity: 1; } 50% { opacity: 0.4; } }
+.rfx-status-text { font-size: 13px; color: #565959; }
+.rfx-status-text b { color: #0f1111; }
+.rfx-last-refresh { font-size: 12px; color: #888; margin-left: auto; }
+.rfx-bot-btn {
+  padding: 5px 14px; font-size: 12px; font-weight: 600; border-radius: 6px; cursor: pointer;
+  font-family: inherit; border: none;
+}
+.rfx-start-btn { background: #067d62; color: #fff; }
+.rfx-start-btn:hover { background: #055d4a; }
+.rfx-start-btn:disabled { opacity: 0.4; cursor: not-allowed; }
+.rfx-stop-btn { background: #cc3333; color: #fff; }
+.rfx-stop-btn:hover { background: #a82a2a; }
+.rfx-stop-btn:disabled { opacity: 0.4; cursor: not-allowed; }
+.rfx-resume-btn { background: #ff9900; color: #0f1111; font-size: 14px; padding: 8px 24px; }
+.rfx-resume-btn:hover { background: #e88b00; }
+.rfx-reset-btn { background: transparent; color: #888; border: 1px solid #d5d9d9; font-size: 11px; padding: 3px 10px; }
+
+/* Alert section */
+.rfx-alert-section {
+  border: 2px solid #ff9900; border-radius: 10px; padding: 12px; margin-bottom: 12px;
+  background: linear-gradient(135deg, #fffbf0 0%, #fff5e0 100%);
+  box-shadow: 0 0 15px rgba(255,153,0,0.25);
+  animation: rfxGlow 2s infinite alternate;
+}
+@keyframes rfxGlow { 0% { box-shadow: 0 0 10px rgba(255,153,0,0.2); } 100% { box-shadow: 0 0 25px rgba(255,153,0,0.45); } }
+.rfx-alert-title {
+  font-size: 15px; font-weight: 700; color: #b8860b; margin-bottom: 8px;
+  display: flex; align-items: center; gap: 6px;
+}
+.rfx-alert-card {
+  background: #fff; border: 2px solid #ff9900; border-radius: 8px;
+  padding: 12px 16px; margin-bottom: 8px;
+}
+.rfx-change-badge {
+  display: inline-block; font-size: 11px; font-weight: 700; padding: 2px 8px; border-radius: 4px; margin-bottom: 6px;
+}
+.badge-new { background: #067d62; color: #fff; }
+.badge-price-up { background: #067d62; color: #fff; }
+.badge-price-down { background: #cc3333; color: #fff; }
+.badge-time { background: #b8860b; color: #fff; }
+.badge-updated { background: #565959; color: #fff; }
+.badge-gone { background: #e7e7e7; color: #888; }
+
+/* Toolbar */
 .rfx-toolbar {
   display: flex; align-items: center; gap: 6px; padding: 8px 0 10px 0; flex-wrap: wrap;
   border-bottom: 1px solid #e7e7e7; margin-bottom: 8px;
@@ -95,17 +268,18 @@ const CSS = `
 .rfx-sort-btn.active { background: #232f3e; color: #fff; border-color: #232f3e; }
 .rfx-count { font-size: 13px; color: #565959; margin-left: auto; }
 
+/* Cards */
 .rfx-card {
   background: #fff; border: 1px solid #d5d9d9; border-radius: 8px;
   padding: 12px 16px; margin-bottom: 8px; cursor: pointer;
-  transition: box-shadow 0.15s, border-color 0.15s;
+  transition: box-shadow 0.15s, border-color 0.15s, opacity 0.5s;
 }
 .rfx-card:hover { box-shadow: 0 1px 5px rgba(0,0,0,0.12); border-color: #c0c0c0; }
 .rfx-card.version-warn { border-left: 3px solid #cc3333; }
 .rfx-card.new-load { animation: rfxFlash 2s ease-out; }
+.rfx-card.gone { opacity: 0.4; }
 @keyframes rfxFlash { 0% { background: #e6f7e6; } 100% { background: #fff; } }
 
-/* Two-column layout */
 .rfx-body { display: flex; gap: 16px; }
 .rfx-left { flex: 1; min-width: 0; }
 .rfx-right { flex-shrink: 0; display: flex; flex-direction: column; align-items: flex-end; justify-content: space-between; min-width: 130px; text-align: right; }
@@ -117,14 +291,12 @@ const CSS = `
 .rfx-version.ok { background: #f0f0f0; color: #565959; }
 .rfx-version.bad { background: #fdecea; color: #cc3333; }
 
-/* Score bar */
 .rfx-score-row { display: flex; align-items: center; gap: 8px; margin-bottom: 6px; }
 .rfx-score-bg { flex: 1; height: 5px; background: #e7e7e7; border-radius: 3px; overflow: hidden; max-width: 200px; }
 .rfx-score-fill { height: 100%; border-radius: 3px; }
 .rfx-score-label { font-size: 12px; font-weight: 700; min-width: 22px; }
 .rfx-score-tag { font-size: 11px; padding: 1px 8px; border-radius: 4px; font-weight: 600; margin-left: 4px; }
 
-/* Stop timeline */
 .rfx-stops { margin: 4px 0 0 0; }
 .rfx-stop { display: flex; align-items: flex-start; gap: 10px; position: relative; }
 .rfx-stop-line { display: flex; flex-direction: column; align-items: center; width: 24px; flex-shrink: 0; }
@@ -141,45 +313,72 @@ const CSS = `
 .rfx-stop-meta { display: flex; gap: 6px; align-items: center; margin-top: 2px; flex-wrap: wrap; }
 .rfx-stop-time { font-size: 12px; color: #565959; }
 .rfx-stop-dwell { font-size: 11px; color: #888; }
-.rfx-badge {
-  font-size: 10px; padding: 1px 6px; border-radius: 3px; font-weight: 600; text-transform: uppercase;
-}
+.rfx-badge { font-size: 10px; padding: 1px 6px; border-radius: 3px; font-weight: 600; text-transform: uppercase; }
 .rfx-badge.preloaded { background: #e6f7f2; color: #067d62; }
 .rfx-badge.live { background: #fef3cd; color: #856404; }
 .rfx-badge.drop { background: #e8f0fe; color: #1a56db; }
 .rfx-leg-dist { font-size: 11px; color: #888; padding: 1px 0 3px 34px; }
 
-/* Footer */
 .rfx-footer { display: flex; align-items: center; gap: 10px; flex-wrap: wrap; padding-top: 6px; border-top: 1px solid #f0f0f0; }
 .rfx-tag { font-size: 12px; color: #565959; }
 .rfx-tag b { color: #0f1111; }
 .rfx-book-btn {
   margin-left: auto; padding: 5px 16px; font-size: 13px; font-weight: 600;
-  background: #ff9900; color: #0f1111; border: none; border-radius: 6px; cursor: pointer;
-  font-family: inherit;
+  background: #ff9900; color: #0f1111; border: none; border-radius: 6px; cursor: pointer; font-family: inherit;
 }
 .rfx-book-btn:hover { background: #e88b00; }
-
 .rfx-empty { text-align: center; color: #888; padding: 40px 20px; font-size: 14px; }
+
+/* Responsive */
+@media (max-width: 900px) {
+  .rfx-right { min-width: 110px; }
+  .rfx-payout { font-size: 18px; }
+  .rfx-stat { font-size: 12px; }
+}
+@media (max-width: 640px) {
+  .rfx-body { flex-direction: column; gap: 8px; }
+  .rfx-right { flex-direction: row; align-items: center; gap: 12px; min-width: 0; text-align: left; flex-wrap: wrap; }
+  .rfx-stats-group { flex-direction: row; gap: 8px; flex-wrap: wrap; align-items: center; }
+  .rfx-payout { font-size: 20px; }
+  .rfx-book-btn { margin-left: 0; }
+  .rfx-status-bar { gap: 6px; }
+  .rfx-toolbar { gap: 4px; }
+  .rfx-sort-btn { padding: 3px 8px; font-size: 11px; }
+  .rfx-card { padding: 10px 12px; }
+  .rfx-alert-section { padding: 8px; }
+}
+@media (max-width: 400px) {
+  .rfx-stop-addr { display: none; }
+  .rfx-leg-dist { display: none; }
+  .rfx-stats-group { gap: 4px; }
+  .rfx-stat { font-size: 11px; }
+}
 `;
 
 // ============================================================
 // CARD HTML
 // ============================================================
-function renderCard(wo, isNew) {
+function renderCard(wo, extraClass, changeBadge) {
   const pay = wo.payout?.value || 0, dist = wo.totalDistance?.value || 0;
   const durMs = wo.totalDuration || 0, durH = durMs / 3600000;
   const perHr = durH > 0 ? pay / durH : 0, perMi = dist > 0 ? pay / dist : 0;
   const ver = wo.version || 1, score = scoreLoad(wo), sc = scoreColor(score);
   const stops = getAllStops(wo);
   const driver = wo.transitOperatorType === "TEAM_DRIVER" ? "Team" : "Solo";
-  const firstTz = stops[0]?.location?.timeZone;
-  const warnCls = ver > 5 ? " version-warn" : "";
-  const newCls = isNew ? " new-load" : "";
+  const firstTz = stops[0]?.location?.timeZone || "America/Los_Angeles";
+  const cls = [
+    "rfx-card",
+    ver > 5 ? "version-warn" : "",
+    goneLoads.has(wo.id) ? "gone" : "",
+    extraClass || "",
+  ].filter(Boolean).join(" ");
 
   let vBadge = "";
   if (ver > 3) vBadge = `<span class="rfx-version bad">v${ver} ⚠</span>`;
   else if (ver > 1) vBadge = `<span class="rfx-version ok">v${ver}</span>`;
+
+  let badgeHtml = changeBadge ? `<span class="rfx-change-badge ${changeBadge.cls}">${changeBadge.text}</span>` : "";
+  if (goneLoads.has(wo.id)) badgeHtml = `<span class="rfx-change-badge badge-gone">GONE</span>`;
 
   let stopsHtml = "";
   for (let i = 0; i < stops.length; i++) {
@@ -197,7 +396,6 @@ function renderCard(wo, isNew) {
       ltBadge = `<span class="rfx-badge ${c}">${lt}</span>`;
     }
     const conn = i < stops.length - 1;
-
     stopsHtml += `<div class="rfx-stop">
       <div class="rfx-stop-line">
         <div class="rfx-stop-dot ${dotCls}">${i + 1}</div>
@@ -222,7 +420,8 @@ function renderCard(wo, isNew) {
     }
   }
 
-  return `<div class="rfx-card${warnCls}${newCls}" data-id="${wo.id}">
+  return `<div class="${cls}" data-id="${wo.id}">
+    ${badgeHtml}
     <div class="rfx-body">
       <div class="rfx-left">
         <div class="rfx-score-row">
@@ -256,22 +455,17 @@ function renderCard(wo, isNew) {
 // FIND AMAZON'S LOAD CONTAINER
 // ============================================================
 function findLoadContainer() {
-  // Strategy: find clickable rows that contain "$" and "mi" — those are load cards
-  // Their common parent is the load list container
   const allEls = document.querySelectorAll("div, a, li, tr");
   const loadRows = [];
   for (const el of allEls) {
+    // Skip our own injected elements
+    if (el.closest("#rfx-host") || el.id === "rfx-host") continue;
     const t = el.textContent || "";
-    // A load row has a price, distance, and is not too large (not the whole page)
     if (t.length < 2000 && /\$\d+\.\d{2}/.test(t) && /\d+\.?\d*\s*mi/i.test(t) && el.children.length >= 2) {
       loadRows.push(el);
     }
   }
-
   if (loadRows.length < 3) return null;
-
-  // Find the deepest common parent that contains most of these rows as descendants
-  // Usually the rows are direct children of a single container
   const parentCounts = new Map();
   for (const row of loadRows) {
     let p = row.parentElement;
@@ -280,50 +474,62 @@ function findLoadContainer() {
       p = p.parentElement;
     }
   }
-
-  // Find the most specific parent that contains most rows
   let best = null, bestCount = 0, bestDepth = Infinity;
   for (const [el, count] of parentCounts) {
     if (count >= 3) {
-      let depth = 0; let p = el;
+      let depth = 0, p = el;
       while (p) { depth++; p = p.parentElement; }
       if (count > bestCount || (count === bestCount && depth > bestDepth)) {
         best = el; bestCount = count; bestDepth = depth;
       }
     }
   }
-
   return best;
 }
 
 // ============================================================
-// INJECT OUR CARDS
+// INJECT CARDS
 // ============================================================
 function injectCards() {
-  if (!aiModeActive || allLoads.length === 0) return;
+  if (!aiModeActive) return;
 
-  // Find Amazon's container if we haven't yet
-  if (!amazonContainer) {
-    amazonContainer = findLoadContainer();
-    if (!amazonContainer) {
-      console.warn("[Relay Fetcher] Could not find Amazon's load container yet");
-      return;
-    }
+  // Only search for Amazon's container if we don't have a host yet
+  if (!ourHost) {
+    if (!amazonContainer) amazonContainer = findLoadContainer();
+    if (amazonContainer) amazonContainer.style.display = "none";
   }
-
-  // Hide Amazon's cards
-  amazonContainer.style.display = "none";
 
   // Create our shadow host if needed
   if (!ourHost) {
     ourHost = document.createElement("div");
     ourHost.id = "rfx-host";
-    amazonContainer.parentElement.insertBefore(ourHost, amazonContainer);
+
+    // Insert our UI next to Amazon's load list (keep sidebar/filters visible)
+    if (amazonContainer) {
+      amazonContainer.parentElement.insertBefore(ourHost, amazonContainer);
+    } else {
+      // No Amazon container (0 loads) — find the "no matches" area and replace it
+      const noMatches = Array.from(document.querySelectorAll("h1, h2, h3, h4, div, p")).find(
+        el => /no matches|no results/i.test(el.textContent) && el.textContent.length < 200
+      );
+      if (noMatches) {
+        const container = noMatches.closest("div") || noMatches.parentElement;
+        container.style.display = "none";
+        ourHost._hiddenNoMatches = container;
+        container.parentElement.insertBefore(ourHost, container.nextSibling);
+      } else {
+        document.body.appendChild(ourHost);
+      }
+    }
+    ourHost.style.padding = "0 16px";
+    ourHost.style.maxWidth = "100%";
     shadowRoot = ourHost.attachShadow({ mode: "open" });
   }
 
-  // Sort loads
-  const sorted = [...allLoads];
+  // Sort regular loads (exclude alerted ones)
+  const alertIds = new Set(alertedLoads.map(a => a.wo.id));
+  const regularLoads = allLoads.filter(wo => !alertIds.has(wo.id));
+  const sorted = [...regularLoads];
   const dir = currentSortDir === "desc" ? -1 : 1;
   sorted.sort((a, b) => {
     let va, vb;
@@ -339,10 +545,34 @@ function injectCards() {
     return (va - vb) * dir;
   });
 
-  const newIds = new Set();
-  for (const wo of sorted) { if (!knownIds.has(wo.id)) newIds.add(wo.id); }
+  // Status bar
+  let dotClass = "grey", statusText = "Stopped";
+  if (botRunning) { dotClass = "green"; statusText = "Running"; }
+  else if (alertedLoads.length > 0) { dotClass = "amber"; statusText = "PAUSED — New Load Detected"; }
 
-  // Build toolbar
+  const statusBar = `<div class="rfx-status-bar">
+    <div class="rfx-dot ${dotClass}"></div>
+    <span class="rfx-status-text"><b>${statusText}</b></span>
+    <span class="rfx-last-refresh" id="rfx-last-refresh"></span>
+    <button class="rfx-bot-btn rfx-start-btn" id="rfx-start-btn" ${botRunning || alertedLoads.length > 0 ? "disabled" : ""}>Start</button>
+    <button class="rfx-bot-btn rfx-stop-btn" id="rfx-stop-btn" ${!botRunning ? "disabled" : ""}>Stop</button>
+    <button class="rfx-bot-btn rfx-reset-btn" id="rfx-reset-btn">Reset</button>
+  </div>`;
+
+  // Alert section
+  let alertSection = "";
+  if (alertedLoads.length > 0) {
+    const alertCards = alertedLoads.map(a => renderCard(a.wo, "", { text: a.badge, cls: a.badgeClass })).join("");
+    alertSection = `<div class="rfx-alert-section">
+      <div class="rfx-alert-title">⚠ NEW LOAD DETECTED</div>
+      ${alertCards}
+      <div style="text-align:center;margin-top:8px;">
+        <button class="rfx-bot-btn rfx-resume-btn" id="rfx-resume-btn">Resume Bot</button>
+      </div>
+    </div>`;
+  }
+
+  // Toolbar
   const sortButtons = ["score", "perhr", "permi", "pay", "dist", "pickup"];
   const sortLabels = { score: "Score", perhr: "$/hr", permi: "$/mi", pay: "Payout", dist: "Distance", pickup: "Pickup" };
   const toolbar = `<div class="rfx-toolbar">
@@ -351,12 +581,15 @@ function injectCards() {
     <span class="rfx-count">${sorted.length} loads</span>
   </div>`;
 
-  shadowRoot.innerHTML = `<style>${CSS}</style>${toolbar}${sorted.map(wo => renderCard(wo, newIds.has(wo.id))).join("")}`;
+  const cardsHtml = sorted.length > 0
+    ? sorted.map(wo => renderCard(wo, knownIds.has(wo.id) ? "" : "new-load")).join("")
+    : `<div class="rfx-empty">No loads yet. Click <b>Start</b> to begin polling or <b>Fetch All</b> to load results.</div>`;
 
-  // Mark known
+  shadowRoot.innerHTML = `<style>${CSS}</style>${statusBar}${alertSection}${toolbar}${cardsHtml}`;
+
   for (const wo of sorted) knownIds.add(wo.id);
 
-  // Sort button listeners
+  // Bind listeners
   shadowRoot.querySelectorAll(".rfx-sort-btn").forEach(btn => {
     btn.addEventListener("click", () => {
       const s = btn.dataset.sort;
@@ -365,18 +598,41 @@ function injectCards() {
       injectCards();
     });
   });
-
-  // Book button listeners
   shadowRoot.querySelectorAll(".rfx-book-btn").forEach(btn => {
-    btn.addEventListener("click", (e) => {
-      e.stopPropagation();
-      bookLoad(btn.dataset.woId);
-    });
+    btn.addEventListener("click", (e) => { e.stopPropagation(); bookLoad(btn.dataset.woId); });
   });
+  const startBtn = shadowRoot.getElementById("rfx-start-btn");
+  const stopBtn = shadowRoot.getElementById("rfx-stop-btn");
+  const resetBtn = shadowRoot.getElementById("rfx-reset-btn");
+  const resumeBtn = shadowRoot.getElementById("rfx-resume-btn");
+
+  if (startBtn) startBtn.addEventListener("click", startBot);
+  if (stopBtn) stopBtn.addEventListener("click", stopBot);
+  if (resetBtn) resetBtn.addEventListener("click", resetBot);
+  if (resumeBtn) resumeBtn.addEventListener("click", resumeBot);
+
+  // Start the last-refresh timer
+  updateLastRefresh();
 }
+
+function updateLastRefresh() {
+  if (!shadowRoot) return;
+  const el = shadowRoot.getElementById("rfx-last-refresh");
+  if (!el) return;
+  if (lastPollTime) {
+    const ago = Math.round((Date.now() - lastPollTime) / 1000);
+    el.textContent = `Last refreshed: ${ago}s ago`;
+  } else {
+    el.textContent = "";
+  }
+}
+
+// Update the "last refreshed" display every second
+setInterval(updateLastRefresh, 1000);
 
 function removeOurCards() {
   if (amazonContainer) amazonContainer.style.display = "";
+  if (ourHost?._hiddenNoMatches) ourHost._hiddenNoMatches.style.display = "";
   if (ourHost) { ourHost.remove(); ourHost = null; shadowRoot = null; }
 }
 
@@ -385,12 +641,7 @@ function toggleAiMode() {
   const btn = document.querySelector("#rfx-toggle-btn button");
   if (aiModeActive) {
     if (btn) btn.textContent = "Amazon UI";
-    if (allLoads.length > 0) {
-      injectCards();
-    } else {
-      // Trigger fetch if no loads yet
-      fetchAllLoads();
-    }
+    injectCards();
   } else {
     if (btn) btn.textContent = "AI Loads";
     removeOurCards();
@@ -398,43 +649,169 @@ function toggleAiMode() {
 }
 
 // ============================================================
-// BOOK BUTTON
+// BOT CONTROL
+// ============================================================
+function startBot() {
+  if (botRunning) return;
+  botRunning = true;
+  isFirstPoll = seenLoads.size === 0;
+  chrome.runtime.sendMessage({ action: "botStarted" }).catch(() => {});
+  console.log(`[Bot] ▶ Started. isFirstPoll=${isFirstPoll}, seenLoads=${seenLoads.size}, allLoads=${allLoads.length}`);
+  doPoll(); // immediate first poll
+  scheduleNext();
+  if (aiModeActive) injectCards();
+}
+
+function stopBot() {
+  botRunning = false;
+  if (botTimer) { clearTimeout(botTimer); botTimer = null; }
+  chrome.runtime.sendMessage({ action: "botStopped" }).catch(() => {});
+  console.log("[Bot] Stopped");
+  if (aiModeActive) injectCards();
+}
+
+function resetBot() {
+  stopBot();
+  seenLoads.clear();
+  missingCounts.clear();
+  alertedLoads = [];
+  goneLoads.clear();
+  isFirstPoll = true;
+  lastPollTime = null;
+  console.log("[Bot] Reset — detection map cleared");
+  if (aiModeActive) injectCards();
+}
+
+function resumeBot() {
+  // Move alerted loads into regular list
+  alertedLoads = [];
+  console.log("[Bot] Resumed — alerts cleared");
+  startBot();
+}
+
+function scheduleNext() {
+  if (!botRunning) return;
+  const delay = 2000 + Math.random() * 3000; // 2-5 seconds
+  botTimer = setTimeout(() => {
+    if (!botRunning) return;
+    doPoll();
+    scheduleNext();
+  }, delay);
+}
+
+function doPoll() {
+  lastPollTime = Date.now();
+  console.log(`[Bot:Poll] Polling now... seenLoads=${seenLoads.size}, isFirstPoll=${isFirstPoll}`);
+
+  const fallback = {
+    workOpportunityTypeList: ["ONE_WAY", "ROUND_TRIP", "HOSTLER_SHUTTLE"],
+    originCity: null, liveCity: null,
+    originCities: [{ displayValue: "TRACY, CA", stateCode: "CA", isCityLive: false, latitude: 37.724328, longitude: -121.444622, name: "TRACY" }],
+    startCityName: null, startCityStateCode: null, startCityLatitude: null, startCityLongitude: null, startCityDisplayValue: null,
+    isOriginCityLive: null, startCityRadius: 50, destinationCity: null,
+    originCitiesRadiusFilters: [{ cityLatitude: 37.724328, cityLongitude: -121.444622, cityName: "TRACY", cityStateCode: "CA", cityDisplayValue: "TRACY, CA", radius: 50 }],
+    destinationCitiesRadiusFilters: [], exclusionCitiesFilter: null, endCityName: null, endCityStateCode: null, endCityDisplayValue: null,
+    endCityLatitude: null, endCityLongitude: null, isDestinationCityLive: null, endCityRadius: 5, startDate: null, endDate: null,
+    minDistance: null, maxDistance: null, minimumDurationInMillis: null, maximumDurationInMillis: null, minPayout: null, minPricePerDistance: null,
+    driverTypeFilters: ["SINGLE_DRIVER", "TEAM_DRIVER"], uiiaCertificationsFilter: [], workOpportunityOperatingRegionFilter: [],
+    loadingTypeFilters: ["LIVE", "DROP"], maximumNumberOfStops: 3, workOpportunityAccessType: null,
+    sortByField: "relevanceForSearchTab", sortOrder: "asc", visibilityStatusType: "ALL",
+    categorizedEquipmentTypeList: [{ equipmentCategory: "PROVIDED", equipmentsList: ["FIFTY_THREE_FOOT_TRUCK", "SKIRTED_FIFTY_THREE_FOOT_TRUCK", "FIFTY_THREE_FOOT_DRY_VAN", "FIFTY_THREE_FOOT_A5_AIR_TRAILER", "FORTY_FIVE_FOOT_TRUCK", "FIFTY_THREE_FOOT_CONTAINER"] }],
+    categorizedEquipmentTypeListForFilterPills: [{ equipmentCategory: "PROVIDED", equipmentsList: ["FIFTY_THREE_FOOT_TRUCK", "FIFTY_THREE_FOOT_CONTAINER"] }],
+    nextItemToken: 0, resultSize: 50, searchURL: "", isAutoRefreshCall: false, notificationId: "",
+    auditContextMap: JSON.stringify({ rlbChannel: "EXACT_MATCH", isOriginCityLive: "false", isDestinationCityLive: "false", userAgent: navigator.userAgent, source: "AVAILABLE_WORK" }),
+  };
+
+  window.dispatchEvent(new CustomEvent("relay-fetcher-poll", { detail: JSON.stringify({ payload: fallback }) }));
+}
+
+// Handle poll results
+window.addEventListener("relay-fetcher-poll-result", (e) => {
+  try {
+    const { status, data, error } = JSON.parse(e.detail);
+
+    if (error || data?.errorCode) {
+      const msg = error || data?.defaultErrorMessage || "";
+      if (msg.includes("CSRF") || msg.includes("csrf") || status === 401) {
+        stopBot();
+        console.error("[Bot] Session expired:", msg);
+        // Show error in UI
+        if (shadowRoot) {
+          const dot = shadowRoot.querySelector(".rfx-dot");
+          const txt = shadowRoot.querySelector(".rfx-status-text");
+          if (dot) { dot.className = "rfx-dot red"; }
+          if (txt) { txt.innerHTML = "<b style='color:#cc3333'>Session expired — please refresh the page</b>"; }
+        }
+        return;
+      }
+      console.warn("[Bot] Poll error:", msg);
+      return;
+    }
+
+    const loads = data?.workOpportunities || [];
+    console.log(`[Bot:Poll] Response: status=${status}, loads=${loads.length}, totalResults=${data?.totalResultsSize}`);
+
+    // Run detection even on 0 loads (handles first-poll seeding and disappearances)
+    const alerts = detectChanges(loads);
+
+    // Merge into allLoads (bot polls merge, unlike auto-update which replaces)
+    const map = new Map();
+    for (const wo of allLoads) map.set(wo.id, wo);
+    for (const wo of loads) map.set(wo.id, wo);
+    allLoads = Array.from(map.values());
+    console.log(`[Bot:Poll] allLoads after merge: ${allLoads.length}`);
+
+    if (alerts.length > 0) {
+      console.log(`[Bot:Poll] ★★★ ${alerts.length} ALERTS — stopping bot, playing sound`);
+      botRunning = false;
+      if (botTimer) { clearTimeout(botTimer); botTimer = null; }
+      alertedLoads.push(...alerts);
+      playAlert();
+    } else {
+      console.log(`[Bot:Poll] No alerts this cycle.`);
+    }
+
+    if (aiModeActive) injectCards();
+  } catch (err) {
+    console.error("[Bot] Poll result error:", err);
+  }
+});
+
+// ============================================================
+// BOOK
 // ============================================================
 function bookLoad(woId) {
-  // Search Amazon's DOM for matching load element
   const allEls = document.querySelectorAll("a, div[role='button'], button, [data-testid]");
   for (const el of allEls) {
     if (el.innerHTML?.includes(woId) || el.href?.includes(woId)) {
-      el.click();
-      console.log("[Relay Fetcher] Clicked matching element for", woId);
-      return;
+      el.click(); return;
     }
   }
-  console.log("[Relay Fetcher] Could not find element for", woId);
   window.open(`https://relay.amazon.com/loadboard/loads/${woId}`, "_blank");
 }
 
 // ============================================================
-// FETCH ALL (paginated)
+// FETCH ALL (paginated, manual)
 // ============================================================
 function fetchAllLoads() {
   return new Promise((resolve) => {
     const btn = document.querySelector("#rfx-fetch-btn button");
-
-    function onProgress(e) {
-      const { fetched, total } = JSON.parse(e.detail);
-      if (btn) btn.textContent = `${fetched}/${total}...`;
-    }
+    function onProgress(e) { const { fetched, total } = JSON.parse(e.detail); if (btn) btn.textContent = `${fetched}/${total}...`; }
     window.addEventListener("relay-fetcher-progress", onProgress);
-
     function onResult(e) {
       window.removeEventListener("relay-fetcher-result", onResult);
       window.removeEventListener("relay-fetcher-progress", onProgress);
       const { data, error } = JSON.parse(e.detail);
       if (btn) btn.textContent = "Fetch All";
-      if (error || data?.errorCode) { console.error("[Relay Fetcher]", error || data?.defaultErrorMessage); resolve(); return; }
+      if (error || data?.errorCode) { resolve(); return; }
       allLoads = data?.workOpportunities || [];
-      console.log(`[Relay Fetcher] Fetched all ${allLoads.length} loads`);
+      // Populate seenLoads map so detection works correctly from here
+      for (const wo of allLoads) {
+        if (!seenLoads.has(wo.id)) {
+          seenLoads.set(wo.id, { version: wo.version || 1, payout: wo.payout?.value || 0, pickupTime: wo.firstPickupTime || "" });
+        }
+      }
+      isFirstPoll = false;
       if (aiModeActive) injectCards();
       if (!aiModeActive && allLoads.length > 0) toggleAiMode();
       resolve();
@@ -442,18 +819,17 @@ function fetchAllLoads() {
     window.addEventListener("relay-fetcher-result", onResult);
 
     const fallback = {
-      workOpportunityTypeList: ["ONE_WAY", "ROUND_TRIP", "HOSTLER_SHUTTLE"],
-      originCity: null, liveCity: null,
+      workOpportunityTypeList: ["ONE_WAY", "ROUND_TRIP", "HOSTLER_SHUTTLE"], originCity: null, liveCity: null,
       originCities: [{ displayValue: "TRACY, CA", stateCode: "CA", isCityLive: false, latitude: 37.724328, longitude: -121.444622, name: "TRACY" }],
       startCityName: null, startCityStateCode: null, startCityLatitude: null, startCityLongitude: null, startCityDisplayValue: null,
       isOriginCityLive: null, startCityRadius: 50, destinationCity: null,
       originCitiesRadiusFilters: [{ cityLatitude: 37.724328, cityLongitude: -121.444622, cityName: "TRACY", cityStateCode: "CA", cityDisplayValue: "TRACY, CA", radius: 50 }],
       destinationCitiesRadiusFilters: [], exclusionCitiesFilter: null, endCityName: null, endCityStateCode: null, endCityDisplayValue: null,
-      endCityLatitude: null, endCityLongitude: null, isDestinationCityLive: null, endCityRadius: 5,
-      startDate: null, endDate: null, minDistance: null, maxDistance: null, minimumDurationInMillis: null, maximumDurationInMillis: null,
-      minPayout: null, minPricePerDistance: null, driverTypeFilters: ["SINGLE_DRIVER", "TEAM_DRIVER"],
-      uiiaCertificationsFilter: [], workOpportunityOperatingRegionFilter: [], loadingTypeFilters: ["LIVE", "DROP"],
-      maximumNumberOfStops: 3, workOpportunityAccessType: null, sortByField: "relevanceForSearchTab", sortOrder: "asc", visibilityStatusType: "ALL",
+      endCityLatitude: null, endCityLongitude: null, isDestinationCityLive: null, endCityRadius: 5, startDate: null, endDate: null,
+      minDistance: null, maxDistance: null, minimumDurationInMillis: null, maximumDurationInMillis: null, minPayout: null, minPricePerDistance: null,
+      driverTypeFilters: ["SINGLE_DRIVER", "TEAM_DRIVER"], uiiaCertificationsFilter: [], workOpportunityOperatingRegionFilter: [],
+      loadingTypeFilters: ["LIVE", "DROP"], maximumNumberOfStops: 3, workOpportunityAccessType: null,
+      sortByField: "relevanceForSearchTab", sortOrder: "asc", visibilityStatusType: "ALL",
       categorizedEquipmentTypeList: [{ equipmentCategory: "PROVIDED", equipmentsList: ["FIFTY_THREE_FOOT_TRUCK", "SKIRTED_FIFTY_THREE_FOOT_TRUCK", "FIFTY_THREE_FOOT_DRY_VAN", "FIFTY_THREE_FOOT_A5_AIR_TRAILER", "FORTY_FIVE_FOOT_TRUCK", "FIFTY_THREE_FOOT_CONTAINER"] }],
       categorizedEquipmentTypeListForFilterPills: [{ equipmentCategory: "PROVIDED", equipmentsList: ["FIFTY_THREE_FOOT_TRUCK", "FIFTY_THREE_FOOT_CONTAINER"] }],
       nextItemToken: 0, resultSize: 50, searchURL: "", isAutoRefreshCall: false, notificationId: "",
@@ -469,30 +845,47 @@ function fetchAllLoads() {
 window.addEventListener("relay-fetcher-auto-update", (e) => {
   try {
     const { data } = JSON.parse(e.detail);
-    if (data?.workOpportunities?.length) {
-      const map = new Map();
-      for (const wo of allLoads) map.set(wo.id, wo);
-      for (const wo of data.workOpportunities) map.set(wo.id, wo);
-      allLoads = Array.from(map.values());
-      console.log(`[Relay Fetcher] Auto-update: ${data.workOpportunities.length} loads (${allLoads.length} total)`);
+    if (data?.workOpportunities) {
+      console.log(`[Bot:AutoUpdate] Amazon page search returned ${data.workOpportunities.length} loads. botRunning=${botRunning}`);
+      // Replace the display list
+      allLoads = data.workOpportunities;
+
+      if (!botRunning) {
+        // Bot is stopped — safe to reset detection state to match new search
+        seenLoads.clear();
+        for (const wo of allLoads) {
+          seenLoads.set(wo.id, { version: wo.version || 1, payout: wo.payout?.value || 0, pickupTime: wo.firstPickupTime || "" });
+        }
+        isFirstPoll = false;
+        console.log(`[Bot:AutoUpdate] Bot stopped — reset seenLoads to ${seenLoads.size}. isFirstPoll=${isFirstPoll}`);
+      } else {
+        // Bot is running — do NOT touch seenLoads. Let the bot's own poll detect changes.
+        console.log(`[Bot:AutoUpdate] Bot RUNNING — NOT touching seenLoads (${seenLoads.size}). Bot will detect changes on next poll.`);
+      }
       if (aiModeActive) injectCards();
     }
   } catch (err) { console.error("[Relay Fetcher] Auto-update error:", err); }
 });
 
-// Retry finding the container when the page updates (SPA navigation)
-const observer = new MutationObserver(() => {
-  if (aiModeActive && !amazonContainer && allLoads.length > 0) {
+// Keepalive handler
+chrome.runtime.onMessage.addListener((msg) => { if (msg.action === "keepalive") return; });
+
+// MutationObserver for SPA navigation — only fires when we don't have a host yet
+const observer = new MutationObserver((mutations) => {
+  // Ignore mutations from our own elements
+  for (const m of mutations) {
+    if (m.target.id === "rfx-host" || m.target.closest?.("#rfx-host")) return;
+  }
+  if (aiModeActive && !ourHost && !amazonContainer) {
     amazonContainer = findLoadContainer();
     if (amazonContainer) injectCards();
   }
 });
 
 // ============================================================
-// INIT — inject toggle buttons
+// INIT
 // ============================================================
 function init() {
-  // "AI Loads" toggle button
   const toggleWrap = document.createElement("div");
   toggleWrap.id = "rfx-toggle-btn";
   toggleWrap.innerHTML = `<style>
@@ -510,7 +903,6 @@ function init() {
   document.body.appendChild(toggleWrap);
   toggleWrap.querySelector("button").addEventListener("click", toggleAiMode);
 
-  // "Fetch All" button
   const fetchWrap = document.createElement("div");
   fetchWrap.id = "rfx-fetch-btn";
   fetchWrap.innerHTML = `<button>Fetch All</button>`;

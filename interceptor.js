@@ -109,5 +109,50 @@
     }
   });
 
+  // Single-page poll (non-paginated, fast) used by the bot loop
+  window.addEventListener("relay-fetcher-poll", async (e) => {
+    const request = JSON.parse(e.detail);
+    let basePayload = lastSearchPayload || request.payload;
+    if (!basePayload) {
+      window.dispatchEvent(new CustomEvent("relay-fetcher-poll-result", {
+        detail: JSON.stringify({ error: "No search filters. Search on the page first." }),
+      }));
+      return;
+    }
+
+    let csrfToken = capturedCsrfToken;
+    if (!csrfToken) {
+      const cookies = document.cookie.split(";");
+      for (const c of cookies) {
+        const t = c.trim(); const eq = t.indexOf("=");
+        if (eq === -1) continue;
+        const n = t.substring(0, eq), v = t.substring(eq + 1);
+        if (n === "x-csrf-token" || n === "csrf-token" || n === "anti-csrftoken-a2z") {
+          csrfToken = decodeURIComponent(v); break;
+        }
+      }
+    }
+
+    try {
+      const payload = { ...basePayload, nextItemToken: 0, resultSize: 50, _isRelayFetcher: true };
+      const response = await _origFetch("https://relay.amazon.com/api/loadboard/search", {
+        method: "POST",
+        headers: { "Content-Type": "application/json", ...(csrfToken ? { "x-csrf-token": csrfToken } : {}) },
+        credentials: "include",
+        body: JSON.stringify(payload),
+      });
+      const data = await response.json();
+      // Capture token from our own request
+      if (csrfToken && !capturedCsrfToken) capturedCsrfToken = csrfToken;
+      window.dispatchEvent(new CustomEvent("relay-fetcher-poll-result", {
+        detail: JSON.stringify({ status: response.status, data }),
+      }));
+    } catch (err) {
+      window.dispatchEvent(new CustomEvent("relay-fetcher-poll-result", {
+        detail: JSON.stringify({ error: err.message }),
+      }));
+    }
+  });
+
   console.log("[Relay Interceptor] Installed (MAIN world).");
 })();

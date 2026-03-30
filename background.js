@@ -1,10 +1,23 @@
-// Service worker — listens for popup messages and forwards to content script
+// Service worker — keepalive + message routing
+
+// Keep service worker alive while bot is running
+let botRunning = false;
 
 chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
+  if (message.action === "botStarted") {
+    botRunning = true;
+    chrome.alarms.create("keepalive", { periodInMinutes: 0.4 });
+    sendResponse({ ok: true });
+  }
+  if (message.action === "botStopped") {
+    botRunning = false;
+    chrome.alarms.clear("keepalive");
+    sendResponse({ ok: true });
+  }
   if (message.action === "fetchLoads") {
     chrome.tabs.query({ active: true, currentWindow: true }, (tabs) => {
       const tab = tabs[0];
-      if (!tab || !tab.url || !tab.url.includes("relay.amazon.com")) {
+      if (!tab?.url?.includes("relay.amazon.com")) {
         sendResponse({ error: "Navigate to relay.amazon.com/loadboard first" });
         return;
       }
@@ -14,28 +27,15 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
     });
     return true;
   }
+});
 
-  if (message.action === "getCsrfToken") {
-    // Try multiple possible cookie names for the CSRF token
-    const cookieNames = ["x-csrf-token", "csrf-token", "anti-csrftoken-a2z", "XSRF-TOKEN"];
-    let found = false;
-
-    let remaining = cookieNames.length;
-    for (const name of cookieNames) {
-      chrome.cookies.get({ url: "https://relay.amazon.com", name }, (cookie) => {
-        remaining--;
-        if (cookie && !found) {
-          found = true;
-          sendResponse({ token: cookie.value });
-        } else if (remaining === 0 && !found) {
-          // None found — list all cookies for debugging
-          chrome.cookies.getAll({ domain: "relay.amazon.com" }, (allCookies) => {
-            console.log("[Relay BG] All relay.amazon.com cookies:", allCookies.map(c => c.name));
-            sendResponse({ token: null, cookieNames: allCookies.map(c => c.name) });
-          });
-        }
-      });
-    }
-    return true;
+chrome.alarms.onAlarm.addListener((alarm) => {
+  if (alarm.name === "keepalive" && botRunning) {
+    // Ping content script to keep connection alive
+    chrome.tabs.query({ url: "https://relay.amazon.com/loadboard/*" }, (tabs) => {
+      for (const tab of tabs) {
+        chrome.tabs.sendMessage(tab.id, { action: "keepalive" }).catch(() => {});
+      }
+    });
   }
 });
