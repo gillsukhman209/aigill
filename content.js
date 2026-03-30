@@ -470,7 +470,7 @@ function renderCard(wo, extraClass, changeBadge) {
       </div>
       <div class="rfx-stop-info">
         <div class="rfx-stop-name">${loc.label || loc.stopCode || "?"} · ${loc.city || "?"}, ${loc.state || "?"}</div>
-        ${settings.showStopAddress ? `<div class="rfx-stop-addr">${loc.line1 || ""}</div>` : ""}
+        ${settings.showStopAddress ? `<div class="rfx-stop-addr">${[loc.line1, loc.line2].filter(Boolean).join(", ")}</div>` : ""}
         <div class="rfx-stop-meta">
           <span class="rfx-stop-time">${fmtTimeShort(checkin, tz)}</span>
           ${dwell && settings.showDwellTime ? `<span class="rfx-stop-dwell">${dwell}</span>` : ""}
@@ -635,7 +635,7 @@ function injectCards() {
     <div class="rfx-dot ${dotClass}"></div>
     <span class="rfx-status-text"><b>${statusText}</b></span>
     <span class="rfx-last-refresh" id="rfx-last-refresh"></span>
-    <button class="rfx-bot-btn rfx-start-btn" id="rfx-start-btn" ${botRunning || alertedLoads.length > 0 ? "disabled" : ""}>Start</button>
+    <button class="rfx-bot-btn rfx-start-btn" id="rfx-start-btn" ${botRunning ? "disabled" : ""}>Start</button>
     <button class="rfx-bot-btn rfx-stop-btn" id="rfx-stop-btn" ${!botRunning ? "disabled" : ""}>Stop</button>
     <button class="rfx-bot-btn rfx-reset-btn" id="rfx-reset-btn">Reset</button>
     <button class="rfx-gear-btn" id="rfx-gear-btn" title="Settings">⚙</button>
@@ -692,9 +692,6 @@ function injectCards() {
     alertSection = `<div class="rfx-alert-section">
       <div class="rfx-alert-title">⚠ NEW LOAD DETECTED</div>
       ${alertCards}
-      <div style="text-align:center;margin-top:8px;">
-        <button class="rfx-bot-btn rfx-resume-btn" id="rfx-resume-btn">Resume Bot</button>
-      </div>
     </div>`;
   }
 
@@ -735,12 +732,9 @@ function injectCards() {
   const startBtn = shadowRoot.getElementById("rfx-start-btn");
   const stopBtn = shadowRoot.getElementById("rfx-stop-btn");
   const resetBtn = shadowRoot.getElementById("rfx-reset-btn");
-  const resumeBtn = shadowRoot.getElementById("rfx-resume-btn");
-
   if (startBtn) startBtn.addEventListener("click", startBot);
   if (stopBtn) stopBtn.addEventListener("click", stopBot);
   if (resetBtn) resetBtn.addEventListener("click", resetBot);
-  if (resumeBtn) resumeBtn.addEventListener("click", resumeBot);
 
   // Gear / settings
   const gearBtn = shadowRoot.getElementById("rfx-gear-btn");
@@ -859,7 +853,12 @@ function toggleAiMode() {
 // ============================================================
 function startBot() {
   if (botRunning) return;
-  ensureAudioCtx(); // warm up audio on user gesture so alerts play instantly
+  ensureAudioCtx();
+  // Clear any pending alerts — user is resuming
+  if (alertedLoads.length > 0) {
+    alertedLoads = [];
+    console.log("[Bot] Alerts cleared on Start");
+  }
   botRunning = true;
   isFirstPoll = seenLoads.size === 0;
   chrome.runtime.sendMessage({ action: "botStarted" }).catch(() => {});
