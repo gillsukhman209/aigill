@@ -8,9 +8,38 @@ function formatDuration(ms) {
   return h > 0 ? `${h}h ${m}m` : `${m}m`;
 }
 
+function getAllStops(wo) {
+  const stops = [];
+  if (!wo.loads) return stops;
+  for (const load of wo.loads) {
+    if (!load.stops) continue;
+    for (const stop of load.stops) {
+      stops.push(stop);
+    }
+  }
+  // Sort by sequence number and deduplicate by location code
+  stops.sort((a, b) => (a.stopSequenceNumber || 0) - (b.stopSequenceNumber || 0));
+  const seen = new Set();
+  return stops.filter((s) => {
+    const key = s.location?.stopCode || s.location?.label || JSON.stringify(s.location);
+    if (seen.has(key)) return false;
+    seen.add(key);
+    return true;
+  });
+}
+
+function formatStop(stop) {
+  const loc = stop.location;
+  if (!loc) return "???";
+  const code = loc.label || loc.stopCode || "";
+  const city = loc.city || "";
+  const state = loc.state || "";
+  return `${code} (${city}, ${state})`;
+}
+
 function fetchLoads() {
   return new Promise((resolve) => {
-    updateStatus("Fetching loads...", false);
+    updateStatus("Fetching all pages...", false);
 
     const payload = {
       workOpportunityTypeList: ["ONE_WAY", "ROUND_TRIP", "HOSTLER_SHUTTLE"],
@@ -103,9 +132,17 @@ function fetchLoads() {
       }),
     };
 
-    // Listen for the result from MAIN world
+    // Listen for progress updates
+    function onProgress(e) {
+      const { page, fetched, total } = JSON.parse(e.detail);
+      updateStatus(`Fetching page ${page}... (${fetched}/${total} loads)`, false);
+    }
+    window.addEventListener("relay-fetcher-progress", onProgress);
+
+    // Listen for the final result from MAIN world
     function onResult(e) {
       window.removeEventListener("relay-fetcher-result", onResult);
+      window.removeEventListener("relay-fetcher-progress", onProgress);
       const { status, data, error } = JSON.parse(e.detail);
 
       if (error) {
@@ -115,11 +152,6 @@ function fetchLoads() {
         return;
       }
 
-      console.log("[Relay Fetcher] Response status:", status);
-      console.log("[Relay Fetcher] ========== FULL RAW RESPONSE ==========");
-      console.log(JSON.stringify(data, null, 2));
-      console.log("[Relay Fetcher] ========== END RAW RESPONSE ==========");
-
       if (data.errorCode) {
         console.error("[Relay Fetcher] API Error:", data.defaultErrorMessage);
         updateStatus(`Error: ${data.defaultErrorMessage}`, true);
@@ -128,8 +160,14 @@ function fetchLoads() {
       }
 
       const loads = data.workOpportunities || [];
+      const totalResults = data.totalResultsSize || loads.length;
+
+      console.log("[Relay Fetcher] ========== FULL RAW RESPONSE ==========");
+      console.log(JSON.stringify(data, null, 2));
+      console.log("[Relay Fetcher] ========== END RAW RESPONSE ==========");
+
       console.log("[Relay Fetcher] ========== LOAD SUMMARY ==========");
-      console.log(`[Relay Fetcher] Loads returned: ${loads.length} | Total available: ${data.totalResultsSize}`);
+      console.log(`[Relay Fetcher] Total loads fetched: ${loads.length} / ${totalResults} available`);
 
       loads.forEach((wo, i) => {
         const payout = wo.payout?.value ? `$${wo.payout.value.toFixed(2)}` : "N/A";
@@ -141,36 +179,36 @@ function fetchLoads() {
           perMile = `$${(wo.payout.value / wo.totalDistance.value).toFixed(2)}/mi`;
         }
 
-        let origin = "N/A", destination = "N/A", originCode = "", destCode = "";
-        if (wo.loads?.length > 0) {
-          const firstStop = wo.loads[0].stops?.[0];
-          if (firstStop?.location) {
-            origin = `${firstStop.location.city}, ${firstStop.location.state}`;
-            originCode = firstStop.location.label || "";
-          }
-          const lastLoad = wo.loads[wo.loads.length - 1];
-          const lastStop = lastLoad.stops?.[lastLoad.stops.length - 1];
-          if (lastStop?.location) {
-            destination = `${lastStop.location.city}, ${lastStop.location.state}`;
-            destCode = lastStop.location.label || "";
-          }
-        }
+        // Get ALL stops in order
+        const stops = getAllStops(wo);
+        const route = stops.map(formatStop).join(" -> ");
+
+        // Log each stop with details
+        const stopDetails = stops.map((s, si) => {
+          const loc = s.location || {};
+          const checkin = s.actions?.find((a) => a.type === "CHECKIN")?.plannedTime || "N/A";
+          const checkout = s.actions?.find((a) => a.type === "CHECKOUT")?.plannedTime || "N/A";
+          return `    Stop ${si + 1}: ${s.stopType} @ ${loc.label || "?"} (${loc.city}, ${loc.state}) | Loading: ${s.loadingType || s.unloadingType || "N/A"} | Checkin: ${checkin} | Checkout: ${checkout}`;
+        });
 
         console.log(
-          `[Relay Fetcher] #${i + 1} | ${payout} | ${perMile} | ${distance} | ${duration} | ${originCode} ${origin} -> ${destCode} ${destination} | ${wo.transitOperatorType} | ${wo.stopCount} stops`
+          `[Relay Fetcher] #${i + 1} | ${payout} | ${perMile} | ${distance} | ${duration} | ${wo.transitOperatorType} | ${wo.stopCount} stops\n` +
+          `  Route: ${route}\n` +
+          stopDetails.join("\n")
         );
       });
 
       console.log("[Relay Fetcher] ========== END SUMMARY ==========");
-      updateStatus(`${loads.length} loads fetched (${data.totalResultsSize} total). See console (F12).`, false);
-      resolve({ success: true, loadCount: loads.length, totalResults: data.totalResultsSize });
+      updateStatus(`All ${loads.length} loads fetched (${totalResults} total). See console (F12).`, false);
+      resolve({ success: true, loadCount: loads.length, totalResults });
     }
 
     window.addEventListener("relay-fetcher-result", onResult);
 
-    // Dispatch the fetch request to MAIN world (interceptor.js)
+    // Dispatch the fetch request to MAIN world (interceptor.js handles pagination)
+    // Send our default payload as fallback — interceptor will prefer the captured page payload
     window.dispatchEvent(new CustomEvent("relay-fetcher-fetch", {
-      detail: JSON.stringify(payload),
+      detail: JSON.stringify({ payload }),
     }));
   });
 }
@@ -224,7 +262,7 @@ function injectUI() {
       #relay-fetcher-status.error { background: rgba(200,0,0,0.85); }
       #relay-fetcher-status.visible { display: block; }
     </style>
-    <button id="relay-fetcher-btn">Fetch Loads</button>
+    <button id="relay-fetcher-btn">Fetch All Loads</button>
     <div id="relay-fetcher-status"></div>
   `;
   document.body.appendChild(container);
@@ -235,7 +273,7 @@ function injectUI() {
     btn.textContent = "Fetching...";
     await fetchLoads();
     btn.disabled = false;
-    btn.textContent = "Fetch Loads";
+    btn.textContent = "Fetch All Loads";
   });
 }
 
@@ -249,7 +287,6 @@ function updateStatus(text, isError) {
   }
 }
 
-// Inject UI once DOM is ready
 if (document.body) {
   injectUI();
 } else {
