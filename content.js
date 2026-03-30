@@ -472,7 +472,7 @@ function renderCard(wo, extraClass, changeBadge) {
         <div class="rfx-stop-name">${loc.label || loc.stopCode || "?"} · ${loc.city || "?"}, ${loc.state || "?"}</div>
         ${settings.showStopAddress ? `<div class="rfx-stop-addr">${[loc.line1, loc.line2].filter(Boolean).join(", ")}</div>` : ""}
         <div class="rfx-stop-meta">
-          <span class="rfx-stop-time">${fmtTimeShort(checkin, tz)}</span>
+          <span class="rfx-stop-time">${fmtTimeShort(checkin, tz)}${checkout ? ` → ${fmtTimeShort(checkout, tz)}` : ""}</span>
           ${dwell && settings.showDwellTime ? `<span class="rfx-stop-dwell">${dwell}</span>` : ""}
           ${settings.showLoadTypeBadge ? ltBadge : ""}
         </div>
