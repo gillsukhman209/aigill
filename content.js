@@ -34,6 +34,7 @@ const DEFAULT_SETTINGS = {
   showEquipment: true,
   showStopCount: true,
   fastBook: false,
+  showScanAnimation: true,
 };
 let settings = { ...DEFAULT_SETTINGS };
 function loadSettings() {
@@ -263,7 +264,7 @@ const CSS = `
 .rfx-status-text b { color: #0f1111; }
 .rfx-last-refresh { font-size: 12px; color: #888; margin-left: auto; }
 .rfx-bot-btn {
-  padding: 5px 14px; font-size: 12px; font-weight: 600; border-radius: 6px; cursor: pointer;
+  padding: 8px 22px; font-size: 14px; font-weight: 600; border-radius: 8px; cursor: pointer;
   font-family: inherit; border: none;
 }
 .rfx-start-btn { background: #067d62; color: #fff; }
@@ -272,9 +273,46 @@ const CSS = `
 .rfx-stop-btn { background: #cc3333; color: #fff; }
 .rfx-stop-btn:hover { background: #a82a2a; }
 .rfx-stop-btn:disabled { opacity: 0.4; cursor: not-allowed; }
-.rfx-resume-btn { background: #ff9900; color: #0f1111; font-size: 14px; padding: 8px 24px; }
-.rfx-resume-btn:hover { background: #e88b00; }
-.rfx-reset-btn { background: transparent; color: #888; border: 1px solid #d5d9d9; font-size: 11px; padding: 3px 10px; }
+
+/* Scanning overlay */
+.rfx-scanning-overlay {
+  position: relative; padding: 80px 20px; text-align: center;
+  background: radial-gradient(ellipse at center, #f0faf7 0%, #f7f7f7 70%);
+  border: 1px solid #d5d9d9; border-radius: 12px; margin-bottom: 14px; overflow: hidden;
+}
+.rfx-scanning-overlay::before {
+  content: ''; position: absolute; top: 0; left: -100%; width: 100%; height: 100%;
+  background: linear-gradient(90deg, transparent 0%, rgba(6,125,98,0.06) 40%, rgba(6,125,98,0.12) 50%, rgba(6,125,98,0.06) 60%, transparent 100%);
+  animation: rfxScanSweep 2.5s ease-in-out infinite;
+}
+@keyframes rfxScanSweep { 0% { left: -100%; } 100% { left: 100%; } }
+.rfx-scanning-radar {
+  position: relative; width: 80px; height: 80px; margin: 0 auto 20px;
+}
+.rfx-scanning-ring {
+  position: absolute; top: 50%; left: 50%; transform: translate(-50%, -50%);
+  border: 2px solid rgba(6,125,98,0.15); border-radius: 50%;
+  animation: rfxRadarPing 2s ease-out infinite;
+}
+.rfx-scanning-ring:nth-child(1) { width: 20px; height: 20px; animation-delay: 0s; }
+.rfx-scanning-ring:nth-child(2) { width: 40px; height: 40px; animation-delay: 0.4s; }
+.rfx-scanning-ring:nth-child(3) { width: 60px; height: 60px; animation-delay: 0.8s; }
+.rfx-scanning-ring:nth-child(4) { width: 80px; height: 80px; animation-delay: 1.2s; }
+@keyframes rfxRadarPing {
+  0% { border-color: rgba(6,125,98,0.4); transform: translate(-50%,-50%) scale(0.8); }
+  100% { border-color: rgba(6,125,98,0); transform: translate(-50%,-50%) scale(1.3); }
+}
+.rfx-scanning-dot {
+  position: absolute; top: 50%; left: 50%; width: 12px; height: 12px;
+  background: #067d62; border-radius: 50%; transform: translate(-50%, -50%);
+  box-shadow: 0 0 12px rgba(6,125,98,0.5);
+  animation: rfxDotPulse 1.5s ease-in-out infinite;
+}
+@keyframes rfxDotPulse { 0%,100% { box-shadow: 0 0 8px rgba(6,125,98,0.3); } 50% { box-shadow: 0 0 20px rgba(6,125,98,0.7); } }
+.rfx-scanning-text { font-size: 18px; font-weight: 700; color: #067d62; letter-spacing: 0.5px; }
+.rfx-scanning-sub { font-size: 13px; color: #888; margin-top: 8px; }
+.rfx-scanning-dots::after { content: ''; animation: rfxDots 1.5s steps(4,end) infinite; }
+@keyframes rfxDots { 0% { content: ''; } 25% { content: '.'; } 50% { content: '..'; } 75% { content: '...'; } }
 
 /* Alert section */
 .rfx-alert-section {
@@ -629,9 +667,6 @@ function injectCards() {
   // Find Amazon's load-list
   if (!amazonContainer) amazonContainer = document.querySelector(".load-list") || findLoadContainer();
 
-  // Don't inject until we have a place to put it
-  if (!amazonContainer && !ourHost) return;
-
   // Apply hide setting
   applyHideAmazonLoads();
 
@@ -639,8 +674,16 @@ function injectCards() {
   if (!ourHost) {
     ourHost = document.createElement("div");
     ourHost.id = "rfx-host";
-    // Insert right before the load-list
-    amazonContainer.parentElement.insertBefore(ourHost, amazonContainer);
+
+    if (amazonContainer) {
+      amazonContainer.parentElement.insertBefore(ourHost, amazonContainer);
+    } else {
+      // No load-list — insert into the active tab content area
+      const activeTab = document.getElementById("active-tab-body")
+        || document.querySelector(".base-container__body")
+        || document.body;
+      activeTab.prepend(ourHost);
+    }
     shadowRoot = ourHost.attachShadow({ mode: "open" });
   }
 
@@ -674,7 +717,6 @@ function injectCards() {
     <span class="rfx-last-refresh" id="rfx-last-refresh"></span>
     <button class="rfx-bot-btn rfx-start-btn" id="rfx-start-btn" ${botRunning ? "disabled" : ""}>Start</button>
     <button class="rfx-bot-btn rfx-stop-btn" id="rfx-stop-btn" ${!botRunning ? "disabled" : ""}>Stop</button>
-    <button class="rfx-bot-btn rfx-reset-btn" id="rfx-reset-btn">Reset</button>
     <button class="rfx-gear-btn" id="rfx-gear-btn" title="Settings">⚙</button>
   </div>`;
 
@@ -688,6 +730,7 @@ function injectCards() {
       <div class="rfx-settings-section-title">General</div>
       ${chk("hideAmazonLoads", "Hide Amazon's original load list when AI mode is on")}
       ${chk("fastBook", "Fast Book — auto-confirm booking (skips manual confirmation)")}
+      ${chk("showScanAnimation", "Show scanning animation when bot is running")}
     </div>
 
     <div class="rfx-settings-section">
@@ -742,16 +785,34 @@ function injectCards() {
     <span class="rfx-count">${sorted.length} loads</span>
   </div>`;
 
+  const scanningHtml = `<div class="rfx-scanning-overlay">
+    <div class="rfx-scanning-radar">
+      <div class="rfx-scanning-ring"></div>
+      <div class="rfx-scanning-ring"></div>
+      <div class="rfx-scanning-ring"></div>
+      <div class="rfx-scanning-ring"></div>
+      <div class="rfx-scanning-dot"></div>
+    </div>
+    <div class="rfx-scanning-text">Scanning for loads<span class="rfx-scanning-dots"></span></div>
+    <div class="rfx-scanning-sub">Monitoring every ${settings.pollMinSeconds}–${settings.pollMaxSeconds} seconds</div>
+  </div>`;
+
   let cardsHtml;
-  if (sorted.length > 0) {
+  if (botRunning && settings.showScanAnimation && alertedLoads.length === 0) {
+    // Bot running with animation on — show scanning overlay, hide load cards
+    cardsHtml = scanningHtml;
+  } else if (sorted.length > 0) {
     cardsHtml = sorted.map(wo => renderCard(wo, knownIds.has(wo.id) ? "" : "new-load")).join("");
   } else if (alertedLoads.length > 0) {
-    cardsHtml = ""; // all loads are in the alert section, don't show empty message
+    cardsHtml = "";
+  } else if (botRunning) {
+    cardsHtml = scanningHtml;
   } else {
-    cardsHtml = `<div class="rfx-empty">No loads yet. Click <b>Start</b> to begin polling or wait for the page to load results.</div>`;
+    cardsHtml = `<div class="rfx-empty">No loads yet. Click <b>Start</b> to begin scanning.</div>`;
   }
 
-  shadowRoot.innerHTML = `<style>${CSS}</style>${statusBar}${settingsPanel}${alertSection}${toolbar}${cardsHtml}`;
+  const showToolbar = !(botRunning && settings.showScanAnimation && alertedLoads.length === 0);
+  shadowRoot.innerHTML = `<style>${CSS}</style>${statusBar}${settingsPanel}${alertSection}${showToolbar ? toolbar : ""}${cardsHtml}`;
 
   for (const wo of sorted) knownIds.add(wo.id);
 
@@ -769,10 +830,8 @@ function injectCards() {
   });
   const startBtn = shadowRoot.getElementById("rfx-start-btn");
   const stopBtn = shadowRoot.getElementById("rfx-stop-btn");
-  const resetBtn = shadowRoot.getElementById("rfx-reset-btn");
   if (startBtn) startBtn.addEventListener("click", startBot);
   if (stopBtn) stopBtn.addEventListener("click", stopBot);
-  if (resetBtn) resetBtn.addEventListener("click", resetBot);
 
   // Gear / settings
   const gearBtn = shadowRoot.getElementById("rfx-gear-btn");
@@ -840,15 +899,54 @@ setInterval(updateLastRefresh, 1000);
 
 function applyHideAmazonLoads() {
   if (!aiModeActive) return;
+
+  // Always hide load-list when our UI is active (setting controls this)
   const hide = settings.hideAmazonLoads;
-  // Only hide the load-list itself — nothing else
   const loadList = document.querySelector(".load-list");
   if (loadList) loadList.style.display = hide ? "none" : "";
+
+  // Hide Amazon's empty state elements individually — never hide parent containers
+  if (ourHost) {
+    document.querySelectorAll("h1, h2, h3, h4, p, img, svg, a").forEach(el => {
+      if (el.closest("#rfx-host")) return;
+      const t = el.textContent || "";
+      // Hide "There are no matches" heading
+      if (/there are no matches/i.test(t) && t.length < 50) el.style.display = "none";
+      // Hide "Build on the above filters..." text
+      if (/build on the above filters/i.test(t)) el.style.display = "none";
+      // Hide "Create Post a Truck Order" link
+      if (/create post a truck order/i.test(t)) el.style.display = "none";
+    });
+    // Hide the truck illustration (it's an img or an svg inside a div near "no matches")
+    document.querySelectorAll("img, [role='img']").forEach(el => {
+      if (el.closest("#rfx-host")) return;
+      const src = el.src || el.getAttribute("src") || "";
+      const alt = el.alt || el.getAttribute("alt") || "";
+      if (/truck|no.?match|empty/i.test(src) || /truck|no.?match|empty/i.test(alt)) {
+        el.style.display = "none";
+      }
+      // Also hide the blue circle/dots decoration
+      if (el.parentElement && el.parentElement.children.length <= 2) {
+        const parent = el.parentElement;
+        const parentText = parent.textContent?.trim() || "";
+        if (parentText.length < 5) parent.style.display = "none"; // image-only container
+      }
+    });
+    // Hide pagination only — keep the summary panel (it contains the filter button + tags)
+    const pagination = document.querySelector(".pagination-bar");
+    if (pagination) pagination.style.display = "none";
+  }
 }
 
 function removeOurCards() {
   const loadList = document.querySelector(".load-list");
   if (loadList) loadList.style.display = "";
+  // Restore all siblings we hid
+  if (ourHost?.parentElement) {
+    for (const child of ourHost.parentElement.children) {
+      if (child !== ourHost) child.style.display = "";
+    }
+  }
   if (ourHost) { ourHost.remove(); ourHost = null; shadowRoot = null; }
   amazonContainer = null;
 }
@@ -1607,7 +1705,7 @@ window.addEventListener("relay-fetcher-auto-update", (e) => {
 // Keepalive handler
 chrome.runtime.onMessage.addListener((msg) => { if (msg.action === "keepalive") return; });
 
-// MutationObserver — injects our UI once .load-list appears, re-injects if removed
+// MutationObserver — injects our UI, re-injects if removed, hides Amazon content
 const observer = new MutationObserver((mutations) => {
   for (const m of mutations) {
     if (m.target.id === "rfx-host" || m.target.closest?.("#rfx-host")) return;
@@ -1624,6 +1722,9 @@ const observer = new MutationObserver((mutations) => {
 
   if (!ourHost) {
     injectCards();
+  } else {
+    // Host exists — make sure Amazon's content below it stays hidden
+    applyHideAmazonLoads();
   }
 });
 
