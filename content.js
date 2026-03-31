@@ -1506,6 +1506,9 @@ async function autoBookLoad(woId) {
   console.log(`[AutoBook] ★ Auto-booking load: ${woId}`);
   const wo = allLoads.find(w => w.id === woId);
 
+  // Refresh Amazon's UI so the load appears in the DOM
+  await clickAmazonRefresh();
+
   // Close any open panel
   document.dispatchEvent(new KeyboardEvent("keydown", { key: "Escape", bubbles: true }));
   await sleep(300);
@@ -1558,8 +1561,30 @@ async function autoBookLoad(woId) {
     }
   }
 
+  // Retry up to 3 times if not found
   if (!loadRow) {
-    console.warn("[AutoBook] Could not find load row for:", woId);
+    for (let retry = 1; retry <= 3; retry++) {
+      console.log(`[AutoBook] Load not found, retrying in 2s... (attempt ${retry}/3)`);
+      await sleep(2000);
+      const ll = document.querySelector(".load-list");
+      if (ll) {
+        const rows = ll.querySelectorAll(":scope > *");
+        for (const row of rows) {
+          const text = row.textContent || "";
+          const payText = wo?.payout?.value?.toFixed(2);
+          if (row.innerHTML?.includes(woId) || (payText && text.includes(payText))) {
+            loadRow = row;
+            console.log(`[AutoBook] Found on retry ${retry}`);
+            break;
+          }
+        }
+      }
+      if (loadRow) break;
+    }
+  }
+
+  if (!loadRow) {
+    console.warn("[AutoBook] Could not find load row after retries for:", woId);
     showToast("Auto-book: Could not find load in Amazon's list");
     return;
   }
@@ -1662,11 +1687,30 @@ function showToast(text) {
   setTimeout(() => toast.remove(), 5000);
 }
 
+async function clickAmazonRefresh() {
+  // Click Amazon's refresh button to force their UI to re-render with latest loads
+  const refreshBtn = document.querySelector("[aria-label='Refresh'], [title='Refresh'], button[class*='refresh']")
+    || Array.from(document.querySelectorAll("button, [role='button']")).find(b => {
+      const label = (b.getAttribute("aria-label") || b.title || "").toLowerCase();
+      return label.includes("refresh");
+    });
+  if (refreshBtn) {
+    console.log("[Booker] Clicking Amazon's refresh button...");
+    refreshBtn.click();
+    await sleep(1500);
+  } else {
+    console.log("[Booker] Could not find Amazon's refresh button");
+  }
+}
+
 async function bookLoad(woId) {
   const wo = allLoads.find(w => w.id === woId);
   console.log(`[Booker] Starting book flow for load ID: ${woId}`);
 
-  // Step 0 — Close any open panel by pressing Escape
+  // Step 0 — Refresh Amazon's UI so the load appears in the DOM
+  await clickAmazonRefresh();
+
+  // Close any open panel by pressing Escape
   console.log("[Booker] Closing any open panel...");
   document.dispatchEvent(new KeyboardEvent("keydown", { key: "Escape", bubbles: true }));
   await sleep(300);
@@ -1735,9 +1779,33 @@ async function bookLoad(woId) {
     }
   }
 
+  // Retry up to 3 times if not found (Amazon's DOM may not have rendered yet)
   if (!loadRow) {
-    console.warn("[Booker] Could not find load row in Amazon's DOM for ID:", woId);
-    showToast("Could not find load in Amazon's list — try scrolling the page first");
+    for (let retry = 1; retry <= 3; retry++) {
+      console.log(`[Booker] Load not found, retrying in 2s... (attempt ${retry}/3)`);
+      showToast(`Load not in Amazon's DOM yet — retrying (${retry}/3)...`);
+      await sleep(2000);
+      // Re-search all strategies
+      const ll = document.querySelector(".load-list");
+      if (ll) {
+        const rows = ll.querySelectorAll(":scope > *");
+        for (const row of rows) {
+          const text = row.textContent || "";
+          const payText = wo?.payout?.value?.toFixed(2);
+          if (row.innerHTML?.includes(woId) || (payText && text.includes(payText))) {
+            loadRow = row;
+            console.log(`[Booker] Found on retry ${retry}`);
+            break;
+          }
+        }
+      }
+      if (loadRow) break;
+    }
+  }
+
+  if (!loadRow) {
+    console.warn("[Booker] Could not find load row after retries for ID:", woId);
+    showToast("Could not find load in Amazon's list — try refreshing the page");
     bookingState.set(woId, "failed");
     if (aiModeActive) injectCards();
     return;
