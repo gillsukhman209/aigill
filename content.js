@@ -158,15 +158,15 @@ function playAlert() {
 // DETECTION LOGIC
 // ============================================================
 function detectChanges(newLoads) {
-  // Deduplicate by ID — if same load appears twice in one response, only process first occurrence
-  const deduped = [];
-  const seenInBatch = new Set();
+  // Deduplicate by ID — if same load appears twice, keep the one with higher payout
+  const dedupMap = new Map();
   for (const wo of newLoads) {
-    if (!seenInBatch.has(wo.id)) {
-      seenInBatch.add(wo.id);
-      deduped.push(wo);
+    const existing = dedupMap.get(wo.id);
+    if (!existing || (wo.payout?.value || 0) > (existing.payout?.value || 0)) {
+      dedupMap.set(wo.id, wo);
     }
   }
+  const deduped = Array.from(dedupMap.values());
   if (deduped.length !== newLoads.length) {
     console.log(`[Bot:Detect] Deduplicated: ${newLoads.length} → ${deduped.length} (${newLoads.length - deduped.length} duplicates removed)`);
   }
@@ -1904,11 +1904,17 @@ window.addEventListener("relay-fetcher-auto-update", (e) => {
     const { data } = JSON.parse(e.detail);
     if (data?.workOpportunities) {
       console.log(`[Bot:AutoUpdate] Amazon page search returned ${data.workOpportunities.length} loads. botRunning=${botRunning}`);
-      // Replace the display list
-      allLoads = data.workOpportunities;
+      // Deduplicate — keep highest payout per ID
+      const dedupMap = new Map();
+      for (const wo of data.workOpportunities) {
+        const existing = dedupMap.get(wo.id);
+        if (!existing || (wo.payout?.value || 0) > (existing.payout?.value || 0)) {
+          dedupMap.set(wo.id, wo);
+        }
+      }
+      allLoads = Array.from(dedupMap.values());
 
       if (!botRunning) {
-        // Bot is stopped — safe to reset detection state to match new search
         seenLoads.clear();
         for (const wo of allLoads) {
           seenLoads.set(wo.id, { version: wo.version || 1, payout: wo.payout?.value || 0, pickupTime: wo.firstPickupTime || "" });
