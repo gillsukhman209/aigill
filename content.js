@@ -33,6 +33,7 @@ const DEFAULT_SETTINGS = {
   showDriverType: true,
   showEquipment: true,
   showStopCount: true,
+  fastBook: false,
 };
 let settings = { ...DEFAULT_SETTINGS };
 function loadSettings() {
@@ -572,8 +573,6 @@ function renderCard(wo, extraClass, changeBadge) {
         ${settings.showBookButton ? (
           bState === "confirmed"
             ? `<button class="rfx-book-btn" style="background:#067d62;color:#fff;cursor:default" disabled>✅ Booked</button>`
-            : bState === "pending"
-            ? `<button class="rfx-book-btn pending" disabled>Confirm in Amazon →</button>`
             : `<button class="rfx-book-btn" data-wo-id="${wo.id}">BOOK</button>`
         ) : ""}
       </div>
@@ -708,6 +707,7 @@ function injectCards() {
     <div class="rfx-settings-section">
       <div class="rfx-settings-section-title">General</div>
       ${chk("hideAmazonLoads", "Hide Amazon's original load list when AI mode is on")}
+      ${chk("fastBook", "Fast Book — auto-confirm booking (skips manual confirmation)")}
     </div>
 
     <div class="rfx-settings-section">
@@ -1491,7 +1491,19 @@ async function bookLoad(woId) {
   await sleep(200);
   console.log("[Booker] Clicking Book button...");
   bookBtn.click();
-  console.log("[Booker] Book button clicked — waiting for confirmation panel...");
+  console.log("[Booker] Book button clicked.");
+
+  if (!settings.fastBook) {
+    // Fast Book is OFF — stop here, let user confirm manually
+    console.log("[Booker] Fast Book is OFF — waiting for manual confirmation.");
+    bookingState.set(woId, "pending");
+    if (aiModeActive) injectCards();
+    showToast("Book clicked — review and confirm in Amazon's panel");
+    return;
+  }
+
+  // Fast Book is ON — auto-confirm
+  console.log("[Booker] Fast Book is ON — auto-confirming...");
   await sleep(500);
 
   // Step 4 — Find and click the Confirm button
