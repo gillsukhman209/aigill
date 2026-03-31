@@ -23,5 +23,11 @@
   ],
   "action": {
     "default_popup": "popup.html"
-  }
+  },
+  "web_accessible_resources": [
+    {
+      "resources": ["Sounds/*"],
+      "matches": ["https://relay.amazon.com/*"]
+    }
+  ]
 }

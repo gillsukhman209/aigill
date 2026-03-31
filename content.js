@@ -128,32 +128,25 @@ function scoreColor(s) { return s >= 70 ? "#067d62" : s >= 40 ? "#b8860b" : "#cc
 function scoreBg(s) { return s >= 70 ? "#e6f7f2" : s >= 40 ? "#fef9e7" : "#fdecea"; }
 
 // ============================================================
-// SOUND — AudioContext created once, reused for instant playback
+// SOUND — mp3 files from Sounds folder
 // ============================================================
 let audioCtx = null;
 function ensureAudioCtx() {
-  if (!audioCtx) {
-    audioCtx = new AudioContext();
-  }
-  // Resume if suspended (browsers suspend until user gesture)
-  if (audioCtx.state === "suspended") {
-    audioCtx.resume();
-  }
+  if (!audioCtx) audioCtx = new AudioContext();
+  if (audioCtx.state === "suspended") audioCtx.resume();
 }
-function playAlert() {
+
+function playSound(filename) {
   try {
-    ensureAudioCtx();
-    const osc = audioCtx.createOscillator();
-    const gain = audioCtx.createGain();
-    osc.connect(gain);
-    gain.connect(audioCtx.destination);
-    osc.frequency.value = 880;
-    gain.gain.setValueAtTime(0.3, audioCtx.currentTime);
-    gain.gain.exponentialRampToValueAtTime(0.001, audioCtx.currentTime + 0.5);
-    osc.start(audioCtx.currentTime);
-    osc.stop(audioCtx.currentTime + 0.5);
-  } catch (e) { console.warn("[Bot] Audio alert failed:", e); }
+    const url = chrome.runtime.getURL(`Sounds/${filename}`);
+    const audio = new Audio(url);
+    audio.volume = 1.0;
+    audio.play().catch(e => console.warn("[Sound] Play failed:", e));
+  } catch (e) { console.warn("[Sound] Error:", e); }
 }
+
+function playAlert() { playSound("new_load.mp3"); }
+function playBookedSound() { playSound("successbook.mp3"); }
 
 // ============================================================
 // DETECTION LOGIC
@@ -762,6 +755,8 @@ function injectCards() {
     <button class="rfx-bot-btn rfx-start-btn" id="rfx-start-btn" ${botRunning ? "disabled" : ""}>Start</button>
     <button class="rfx-bot-btn rfx-stop-btn" id="rfx-stop-btn" ${!botRunning ? "disabled" : ""}>Stop</button>
     <button class="rfx-gear-btn" id="rfx-gear-btn" title="Settings">⚙</button>
+    <button class="rfx-gear-btn" id="rfx-test-newload" title="Test new load sound">🔔</button>
+    <button class="rfx-gear-btn" id="rfx-test-booked" title="Test booked sound">🔊</button>
     ${fastBookWarning}
   </div>`;
 
@@ -900,6 +895,12 @@ function injectCards() {
     const panel = shadowRoot.getElementById("rfx-settings-panel");
     if (panel) panel.classList.toggle("open", settingsOpen);
   });
+
+  // Debug sound test buttons
+  const testNewLoad = shadowRoot.getElementById("rfx-test-newload");
+  if (testNewLoad) testNewLoad.addEventListener("click", () => playAlert());
+  const testBooked = shadowRoot.getElementById("rfx-test-booked");
+  if (testBooked) testBooked.addEventListener("click", () => playBookedSound());
 
   // Settings checkboxes
   shadowRoot.querySelectorAll('.rfx-setting-row input[type="checkbox"]').forEach(cb => {
@@ -1209,16 +1210,7 @@ window.addEventListener("relay-fetcher-poll-result", (e) => {
 // ============================================================
 function playNegotiationSound() {
   try {
-    ensureAudioCtx();
-    const osc = audioCtx.createOscillator();
-    const gain = audioCtx.createGain();
-    osc.connect(gain);
-    gain.connect(audioCtx.destination);
-    osc.frequency.value = 440; // lower tone than alert
-    gain.gain.setValueAtTime(0.25, audioCtx.currentTime);
-    gain.gain.exponentialRampToValueAtTime(0.001, audioCtx.currentTime + 0.6);
-    osc.start(audioCtx.currentTime);
-    osc.stop(audioCtx.currentTime + 0.6);
+    playSound("successbook.mp3");
   } catch (e) {}
 }
 
@@ -1692,6 +1684,7 @@ async function autoBookLoad(woId) {
   bookingState.set(woId, "confirmed");
   if (aiModeActive) injectCards();
   showToast("Auto-book: Load booked successfully!");
+  playBookedSound();
 }
 
 // ============================================================
@@ -1938,6 +1931,7 @@ async function bookLoad(woId) {
   // Step 5 — Update our card UI
   bookingState.set(woId, "confirmed");
   if (aiModeActive) injectCards();
+  playBookedSound();
   showToast("Load booked successfully!");
 }
 
