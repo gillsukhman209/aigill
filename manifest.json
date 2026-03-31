@@ -11,14 +11,8 @@
   "content_scripts": [
     {
       "matches": ["https://relay.amazon.com/loadboard/*"],
-      "js": ["interceptor.js"],
-      "run_at": "document_start",
-      "world": "MAIN"
-    },
-    {
-      "matches": ["https://relay.amazon.com/loadboard/*"],
       "js": ["content.js"],
-      "run_at": "document_idle"
+      "run_at": "document_start"
     }
   ],
   "action": {
@@ -26,7 +20,7 @@
   },
   "web_accessible_resources": [
     {
-      "resources": ["Sounds/*"],
+      "resources": ["Sounds/*", "interceptor.js"],
       "matches": ["https://relay.amazon.com/*"]
     }
   ]

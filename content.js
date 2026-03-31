@@ -2,6 +2,17 @@
 // Custom UI + Bot polling + Detection logic
 
 // ============================================================
+// INJECT INTERCEPTOR INTO MAIN WORLD
+// Safari doesn't support "world": "MAIN" in manifest, so we inject manually
+// ============================================================
+(function injectInterceptor() {
+  const script = document.createElement("script");
+  script.src = chrome.runtime.getURL("interceptor.js");
+  script.onload = () => script.remove();
+  (document.documentElement || document.head || document.body).prepend(script);
+})();
+
+// ============================================================
 // STATE
 // ============================================================
 let allLoads = [];
@@ -271,6 +282,7 @@ const CSS = `
 .rfx-status-bar {
   display: flex; align-items: center; gap: 12px; padding: 12px 16px; margin-bottom: 14px;
   background: #f7f7f7; border: 1px solid #e7e7e7; border-radius: 10px; flex-wrap: wrap;
+  position: sticky; top: 0; z-index: 100;
 }
 .rfx-dot { width: 10px; height: 10px; border-radius: 50%; flex-shrink: 0; }
 .rfx-dot.green { background: #067d62; animation: rfxPulse 1.5s infinite; }
@@ -516,29 +528,64 @@ const CSS = `
 .rfx-range-row input[type="range"] { flex: 1; accent-color: #ff9900; }
 .rfx-range-val { font-size: 13px; font-weight: 600; color: #0f1111; min-width: 30px; text-align: right; }
 
-/* Responsive */
+/* Responsive — tablet */
 @media (max-width: 900px) {
   .rfx-right { min-width: 110px; }
   .rfx-payout { font-size: 18px; }
   .rfx-stat { font-size: 12px; }
 }
+
+/* Responsive — mobile */
 @media (max-width: 640px) {
-  .rfx-body { flex-direction: column; gap: 8px; }
-  .rfx-right { flex-direction: row; align-items: center; gap: 12px; min-width: 0; text-align: left; flex-wrap: wrap; }
-  .rfx-stats-group { flex-direction: row; gap: 8px; flex-wrap: wrap; align-items: center; }
-  .rfx-payout { font-size: 20px; }
-  .rfx-book-btn { margin-left: 0; }
-  .rfx-status-bar { gap: 6px; }
-  .rfx-toolbar { gap: 4px; }
-  .rfx-sort-btn { padding: 3px 8px; font-size: 11px; }
-  .rfx-card { padding: 10px 12px; }
-  .rfx-alert-section { padding: 8px; }
+  .rfx-status-bar {
+    position: sticky; top: 0; z-index: 100;
+    padding: 10px 12px; gap: 8px; border-radius: 0;
+    margin: 0 -16px 10px -16px; width: calc(100% + 32px);
+    border-left: none; border-right: none;
+  }
+  .rfx-status-text { font-size: 12px; }
+  .rfx-last-refresh { font-size: 11px; display: none; }
+  .rfx-bot-btn { padding: 10px 20px; font-size: 15px; min-height: 44px; }
+  .rfx-gear-btn { font-size: 20px; padding: 6px 10px; min-height: 44px; }
+  .rfx-body { flex-direction: column; gap: 6px; }
+  .rfx-right {
+    flex-direction: row; align-items: center; gap: 10px;
+    min-width: 0; text-align: left; flex-wrap: wrap;
+    border-top: 1px solid #f0f0f0; padding-top: 8px;
+  }
+  .rfx-stats-group { flex-direction: row; gap: 10px; flex-wrap: wrap; align-items: baseline; }
+  .rfx-payout { font-size: 22px; }
+  .rfx-stat { font-size: 13px; margin-top: 0; }
+  .rfx-book-btn { margin-left: auto; padding: 10px 20px; font-size: 15px; min-height: 44px; }
+  .rfx-card { padding: 12px; margin-bottom: 10px; }
+  .rfx-toolbar { gap: 4px; padding: 8px 0; }
+  .rfx-sort-btn { padding: 6px 10px; font-size: 12px; min-height: 36px; }
+  .rfx-count { font-size: 12px; }
+  .rfx-alert-section { padding: 10px; margin: 0 -4px 12px -4px; }
+  .rfx-stop-name { font-size: 14px; }
+  .rfx-stop-time { font-size: 13px; }
+  .rfx-badge { font-size: 11px; padding: 2px 8px; }
+  .rfx-footer { gap: 8px; padding-top: 8px; }
+  .rfx-tag { font-size: 13px; }
+  .rfx-score-row { margin-bottom: 8px; }
+  .rfx-version { font-size: 12px; }
+  .rfx-scanning-overlay { padding: 50px 16px; }
+  .rfx-settings-panel { padding: 12px; }
+  .rfx-setting-row label { font-size: 14px; }
+  .rfx-setting-row input[type="checkbox"] { width: 20px; height: 20px; }
+  .rfx-range-row label { font-size: 14px; }
+  .rfx-fastbook-warn { font-size: 11px; padding: 6px 10px; }
+  .rfx-autobook-warn { font-size: 12px; padding: 8px 12px; }
 }
+
+/* Responsive — small phone */
 @media (max-width: 400px) {
   .rfx-stop-addr { display: none; }
   .rfx-leg-dist { display: none; }
-  .rfx-stats-group { gap: 4px; }
-  .rfx-stat { font-size: 11px; }
+  .rfx-payout { font-size: 20px; }
+  .rfx-stat { font-size: 12px; }
+  .rfx-bot-btn { padding: 8px 16px; font-size: 14px; }
+  .rfx-sort-btn { padding: 5px 8px; font-size: 11px; }
 }
 `;
 
@@ -692,7 +739,7 @@ function findLoadContainer() {
 }
 
 // ============================================================
-// INJECT CARDS
+// INJECT INTO AMAZON'S LOAD CARDS
 // ============================================================
 function injectCards() {
   if (!aiModeActive) return;
@@ -700,18 +747,13 @@ function injectCards() {
   // Find Amazon's load-list
   if (!amazonContainer) amazonContainer = document.querySelector(".load-list") || findLoadContainer();
 
-  // Apply hide setting
-  applyHideAmazonLoads();
-
-  // Create our shadow host if needed
+  // Ensure our control panel (status bar + settings) exists above the load list
   if (!ourHost) {
     ourHost = document.createElement("div");
     ourHost.id = "rfx-host";
-
     if (amazonContainer) {
       amazonContainer.parentElement.insertBefore(ourHost, amazonContainer);
     } else {
-      // No load-list — insert into the active tab content area
       const activeTab = document.getElementById("active-tab-body")
         || document.querySelector(".base-container__body")
         || document.body;
@@ -720,33 +762,13 @@ function injectCards() {
     shadowRoot = ourHost.attachShadow({ mode: "open" });
   }
 
-  // Sort regular loads (exclude alerted ones)
-  const alertIds = new Set(alertedLoads.map(a => a.wo.id));
-  const regularLoads = allLoads.filter(wo => !alertIds.has(wo.id));
-  const sorted = [...regularLoads];
-  const dir = currentSortDir === "desc" ? -1 : 1;
-  sorted.sort((a, b) => {
-    let va, vb;
-    switch (currentSort) {
-      case "score": va = scoreLoad(a); vb = scoreLoad(b); break;
-      case "perhr": { const dA = (a.totalDuration || 1) / 3600000, dB = (b.totalDuration || 1) / 3600000; va = (a.payout?.value || 0) / dA; vb = (b.payout?.value || 0) / dB; break; }
-      case "permi": { va = (a.totalDistance?.value || 1) > 0 ? (a.payout?.value || 0) / a.totalDistance.value : 0; vb = (b.totalDistance?.value || 1) > 0 ? (b.payout?.value || 0) / b.totalDistance.value : 0; break; }
-      case "pay": va = a.payout?.value || 0; vb = b.payout?.value || 0; break;
-      case "dist": va = a.totalDistance?.value || 0; vb = b.totalDistance?.value || 0; break;
-      case "pickup": va = a.firstPickupTime ? new Date(a.firstPickupTime).getTime() : Infinity; vb = b.firstPickupTime ? new Date(b.firstPickupTime).getTime() : Infinity; break;
-      default: va = 0; vb = 0;
-    }
-    return (va - vb) * dir;
-  });
-
-  // Status bar
+  // --- Render control panel in shadow DOM ---
   let dotClass = "grey", statusText = "Stopped";
   if (botRunning) { dotClass = "green"; statusText = "Running"; }
   else if (alertedLoads.length > 0) { dotClass = "amber"; statusText = "PAUSED — New Load Detected"; }
 
   const fastBookWarning = settings.fastBook
-    ? `<span class="rfx-fastbook-warn">⚠ FAST BOOK ON — Clicking BOOK will auto-confirm!</span>`
-    : "";
+    ? `<span class="rfx-fastbook-warn">⚠ FAST BOOK ON — Clicking BOOK will auto-confirm!</span>` : "";
 
   const statusBar = `<div class="rfx-status-bar">
     <div class="rfx-dot ${dotClass}"></div>
@@ -759,12 +781,10 @@ function injectCards() {
     ${fastBookWarning}
   </div>`;
 
-  // Settings panel
   const chk = (key, label) => `<div class="rfx-setting-row"><input type="checkbox" id="rfx-s-${key}" ${settings[key] ? "checked" : ""} data-key="${key}"><label for="rfx-s-${key}">${label}</label></div>`;
 
   const settingsPanel = `<div class="rfx-settings-panel${settingsOpen ? " open" : ""}" id="rfx-settings-panel">
     <div class="rfx-settings-title">Settings</div>
-
     <div class="rfx-settings-section">
       <div class="rfx-settings-section-title">General</div>
       ${chk("hideAmazonLoads", "Hide Amazon's original load list when AI mode is on")}
@@ -772,31 +792,16 @@ function injectCards() {
       ${chk("autoBook", "Auto-Book — automatically book new loads when detected (clicks Book only, not Confirm)")}
       ${chk("showScanAnimation", "Show scanning animation when bot is running")}
     </div>
-
     <div class="rfx-settings-section">
       <div class="rfx-settings-section-title">Bot Speed</div>
-      <div class="rfx-range-row">
-        <label>Min interval</label>
-        <input type="range" id="rfx-s-pollMin" min="1" max="30" value="${settings.pollMinSeconds}" data-key="pollMinSeconds">
-        <span class="rfx-range-val" id="rfx-s-pollMin-val">${settings.pollMinSeconds}s</span>
-      </div>
-      <div class="rfx-range-row">
-        <label>Max interval</label>
-        <input type="range" id="rfx-s-pollMax" min="1" max="30" value="${settings.pollMaxSeconds}" data-key="pollMaxSeconds">
-        <span class="rfx-range-val" id="rfx-s-pollMax-val">${settings.pollMaxSeconds}s</span>
-      </div>
+      <div class="rfx-range-row"><label>Min interval</label><input type="range" id="rfx-s-pollMin" min="1" max="30" value="${settings.pollMinSeconds}" data-key="pollMinSeconds"><span class="rfx-range-val" id="rfx-s-pollMin-val">${settings.pollMinSeconds}s</span></div>
+      <div class="rfx-range-row"><label>Max interval</label><input type="range" id="rfx-s-pollMax" min="1" max="30" value="${settings.pollMaxSeconds}" data-key="pollMaxSeconds"><span class="rfx-range-val" id="rfx-s-pollMax-val">${settings.pollMaxSeconds}s</span></div>
     </div>
-
     <div class="rfx-settings-section">
       <div class="rfx-settings-section-title">Alerts</div>
-      <div class="rfx-range-row">
-        <label>Min price increase</label>
-        <input type="range" id="rfx-s-minPrice" min="0" max="200" step="5" value="${settings.minPriceIncrease}" data-key="minPriceIncrease">
-        <span class="rfx-range-val" id="rfx-s-minPrice-val">${settings.minPriceIncrease === 0 ? "Off" : "$" + settings.minPriceIncrease}</span>
-      </div>
+      <div class="rfx-range-row"><label>Min price increase</label><input type="range" id="rfx-s-minPrice" min="0" max="200" step="5" value="${settings.minPriceIncrease}" data-key="minPriceIncrease"><span class="rfx-range-val" id="rfx-s-minPrice-val">${settings.minPriceIncrease === 0 ? "Off" : "$" + settings.minPriceIncrease}</span></div>
       <div style="font-size:11px;color:#888;padding:2px 0 0 0;">Only alert on price increases above this amount. Set to 0 to alert on all changes.</div>
     </div>
-
     <div class="rfx-settings-section">
       <div class="rfx-settings-section-title">Card Display</div>
       ${chk("showScoreBar", "Score bar")}
@@ -816,78 +821,23 @@ function injectCards() {
     </div>
   </div>`;
 
-  // Alert section
-  let alertSection = "";
-  if (alertedLoads.length > 0) {
-    const alertCards = alertedLoads.map(a => renderCard(a.wo, "", { text: a.badge, cls: a.badgeClass })).join("");
-    alertSection = `<div class="rfx-alert-section">
-      <div class="rfx-alert-title">⚠ NEW LOAD DETECTED</div>
-      ${alertCards}
-    </div>`;
-  }
-
-  // Toolbar
-  const sortButtons = ["score", "perhr", "permi", "pay", "dist", "pickup"];
-  const sortLabels = { score: "Score", perhr: "$/hr", permi: "$/mi", pay: "Payout", dist: "Distance", pickup: "Pickup" };
-  const toolbar = `<div class="rfx-toolbar">
-    <span class="rfx-toolbar-label">Sort:</span>
-    ${sortButtons.map(s => `<button class="rfx-sort-btn${currentSort === s ? " active" : ""}" data-sort="${s}">${sortLabels[s]}${currentSort === s ? (currentSortDir === "desc" ? " ↓" : " ↑") : ""}</button>`).join("")}
-    <span class="rfx-count">${sorted.length} loads</span>
-  </div>`;
-
-  const scanningHtml = `<div class="rfx-scanning-overlay">
-    <div class="rfx-scanning-radar">
-      <div class="rfx-scanning-ring"></div>
-      <div class="rfx-scanning-ring"></div>
-      <div class="rfx-scanning-ring"></div>
-      <div class="rfx-scanning-ring"></div>
-      <div class="rfx-scanning-dot"></div>
-    </div>
-    <div class="rfx-scanning-text">Scanning for loads<span class="rfx-scanning-dots"></span></div>
-    <div class="rfx-scanning-sub">Monitoring every ${settings.pollMinSeconds}–${settings.pollMaxSeconds} seconds</div>
-  </div>`;
-
-  let cardsHtml;
-  if (botRunning && settings.showScanAnimation && alertedLoads.length === 0) {
-    // Bot running with animation on — show scanning overlay, hide load cards
-    cardsHtml = scanningHtml;
-  } else if (sorted.length > 0) {
-    cardsHtml = sorted.map(wo => renderCard(wo, knownIds.has(wo.id) ? "" : "new-load")).join("");
-  } else if (alertedLoads.length > 0) {
-    cardsHtml = "";
-  } else if (botRunning) {
-    cardsHtml = scanningHtml;
-  } else {
-    cardsHtml = `<div class="rfx-empty">No loads yet. Click <b>Start</b> to begin scanning.</div>`;
-  }
-
-  const showToolbar = !(botRunning && settings.showScanAnimation && alertedLoads.length === 0);
   const autoBookWarning = settings.autoBook
-    ? `<div class="rfx-autobook-warn">⚠ AUTO-BOOK ARMED — New loads will be booked automatically ⚠</div>`
-    : "";
+    ? `<div class="rfx-autobook-warn">⚠ AUTO-BOOK ARMED — New loads will be booked automatically ⚠</div>` : "";
 
-  shadowRoot.innerHTML = `<style>${CSS}</style>${statusBar}${autoBookWarning}${settingsPanel}${alertSection}${showToolbar ? toolbar : ""}${cardsHtml}`;
+  // Alert banner (text only — the actual cards are Amazon's styled cards below)
+  let alertBanner = "";
+  if (alertedLoads.length > 0) {
+    alertBanner = `<div class="rfx-alert-section"><div class="rfx-alert-title">⚠ ${alertedLoads.length} NEW LOAD${alertedLoads.length > 1 ? "S" : ""} DETECTED</div></div>`;
+  }
 
-  for (const wo of sorted) knownIds.add(wo.id);
+  shadowRoot.innerHTML = `<style>${CSS}</style>${statusBar}${autoBookWarning}${settingsPanel}${alertBanner}`;
 
-  // Bind listeners
-  shadowRoot.querySelectorAll(".rfx-sort-btn").forEach(btn => {
-    btn.addEventListener("click", () => {
-      const s = btn.dataset.sort;
-      if (currentSort === s) currentSortDir = currentSortDir === "desc" ? "asc" : "desc";
-      else { currentSort = s; currentSortDir = s === "pickup" ? "asc" : "desc"; }
-      injectCards();
-    });
-  });
-  shadowRoot.querySelectorAll(".rfx-book-btn").forEach(btn => {
-    btn.addEventListener("click", (e) => { e.stopPropagation(); bookLoad(btn.dataset.woId); });
-  });
+  // Bind control panel listeners
   const startBtn = shadowRoot.getElementById("rfx-start-btn");
   const stopBtn = shadowRoot.getElementById("rfx-stop-btn");
   if (startBtn) startBtn.addEventListener("click", startBot);
   if (stopBtn) stopBtn.addEventListener("click", stopBot);
 
-  // Gear / settings
   const gearBtn = shadowRoot.getElementById("rfx-gear-btn");
   if (gearBtn) gearBtn.addEventListener("click", () => {
     settingsOpen = !settingsOpen;
@@ -895,65 +845,305 @@ function injectCards() {
     if (panel) panel.classList.toggle("open", settingsOpen);
   });
 
-  // Amazon View toggle (inside status bar)
   const toggleAmazonBtn = shadowRoot.getElementById("rfx-toggle-amazon");
   if (toggleAmazonBtn) toggleAmazonBtn.addEventListener("click", toggleAiMode);
 
 
-  // Settings checkboxes
   shadowRoot.querySelectorAll('.rfx-setting-row input[type="checkbox"]').forEach(cb => {
     cb.addEventListener("change", () => {
       const key = cb.dataset.key;
       settings[key] = cb.checked;
-
-      // fastBook and autoBook are mutually exclusive
-      if (key === "fastBook" && cb.checked) {
-        settings.autoBook = false;
-      } else if (key === "autoBook" && cb.checked) {
-        settings.fastBook = false;
-      }
-
+      if (key === "fastBook" && cb.checked) settings.autoBook = false;
+      else if (key === "autoBook" && cb.checked) settings.fastBook = false;
       saveSettings();
-      applyHideAmazonLoads();
       injectCards();
     });
   });
 
-  // Settings range sliders
   shadowRoot.querySelectorAll('.rfx-range-row input[type="range"]').forEach(slider => {
     slider.addEventListener("input", () => {
       const key = slider.dataset.key;
       settings[key] = parseInt(slider.value);
-      // Ensure min <= max
-      if (key === "pollMinSeconds" && settings.pollMinSeconds > settings.pollMaxSeconds) {
-        settings.pollMaxSeconds = settings.pollMinSeconds;
-      }
-      if (key === "pollMaxSeconds" && settings.pollMaxSeconds < settings.pollMinSeconds) {
-        settings.pollMinSeconds = settings.pollMaxSeconds;
-      }
+      if (key === "pollMinSeconds" && settings.pollMinSeconds > settings.pollMaxSeconds) settings.pollMaxSeconds = settings.pollMinSeconds;
+      if (key === "pollMaxSeconds" && settings.pollMaxSeconds < settings.pollMinSeconds) settings.pollMinSeconds = settings.pollMaxSeconds;
       saveSettings();
       const valEl = shadowRoot.getElementById(slider.id + "-val");
-      if (valEl) {
-        if (key === "minPriceIncrease") {
-          valEl.textContent = parseInt(slider.value) === 0 ? "Off" : "$" + slider.value;
-        } else {
-          valEl.textContent = slider.value + "s";
-        }
-      }
-      // Update poll slider displays
+      if (valEl) valEl.textContent = key === "minPriceIncrease" ? (parseInt(slider.value) === 0 ? "Off" : "$" + slider.value) : slider.value + "s";
       const minVal = shadowRoot.getElementById("rfx-s-pollMin-val");
       const maxVal = shadowRoot.getElementById("rfx-s-pollMax-val");
-      const minSlider = shadowRoot.getElementById("rfx-s-pollMin");
-      const maxSlider = shadowRoot.getElementById("rfx-s-pollMax");
-      if (minVal && minSlider) minVal.textContent = settings.pollMinSeconds + "s";
-      if (maxVal && maxSlider) maxVal.textContent = settings.pollMaxSeconds + "s";
-      if (minSlider) minSlider.value = settings.pollMinSeconds;
-      if (maxSlider) maxSlider.value = settings.pollMaxSeconds;
+      if (minVal) minVal.textContent = settings.pollMinSeconds + "s";
+      if (maxVal) maxVal.textContent = settings.pollMaxSeconds + "s";
     });
   });
 
-  // Start the last-refresh timer
   updateLastRefresh();
+
+  // --- Now inject our content into Amazon's load cards ---
+  styleAmazonLoadCards();
+}
+
+// Style each Amazon load-card with our data
+function styleAmazonLoadCards() {
+  if (!amazonContainer) return;
+  const loadCards = amazonContainer.querySelectorAll(".load-card");
+  if (!loadCards.length) return;
+
+  // Inject our stylesheet into the page if not already done
+  if (!document.getElementById("rfx-inject-style")) {
+    const style = document.createElement("style");
+    style.id = "rfx-inject-style";
+    style.textContent = `
+      .load-card .rfx-injected { font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif; }
+      .load-card .rfx-card-inner { padding: 12px 16px; }
+      .load-card .rfx-card-body { display: flex; gap: 16px; }
+      .load-card .rfx-card-left { flex: 1; min-width: 0; }
+      .load-card .rfx-card-right { flex-shrink: 0; display: flex; flex-direction: column; align-items: flex-end; justify-content: space-between; min-width: 130px; text-align: right; gap: 8px; }
+      .load-card .rfx-i-payout { font-size: 22px; font-weight: 700; color: #067d62; line-height: 1.2; }
+      .load-card .rfx-i-stat { font-size: 13px; color: #565959; margin-top: 2px; }
+      .load-card .rfx-i-stat b { color: #0f1111; font-weight: 600; }
+      .load-card .rfx-i-score-row { display: flex; align-items: center; gap: 8px; margin-bottom: 8px; }
+      .load-card .rfx-i-score-bg { flex: 1; height: 5px; background: #e7e7e7; border-radius: 3px; overflow: hidden; max-width: 200px; }
+      .load-card .rfx-i-score-fill { height: 100%; border-radius: 3px; }
+      .load-card .rfx-i-score-label { font-size: 12px; font-weight: 700; min-width: 22px; }
+      .load-card .rfx-i-score-tag { font-size: 11px; padding: 1px 8px; border-radius: 4px; font-weight: 600; }
+      .load-card .rfx-i-stop { display: flex; align-items: flex-start; gap: 10px; margin-bottom: 4px; }
+      .load-card .rfx-i-stop-dot { width: 22px; height: 22px; border-radius: 50%; display: flex; align-items: center; justify-content: center; font-size: 11px; font-weight: 700; color: #fff; flex-shrink: 0; }
+      .load-card .rfx-i-stop-dot.pickup { background: #2563eb; }
+      .load-card .rfx-i-stop-dot.dropoff { background: #7c3aed; }
+      .load-card .rfx-i-stop-name { font-size: 14px; font-weight: 600; color: #0f1111; }
+      .load-card .rfx-i-stop-addr { font-size: 12px; color: #888; }
+      .load-card .rfx-i-stop-meta { display: flex; gap: 6px; align-items: center; margin-top: 2px; flex-wrap: wrap; }
+      .load-card .rfx-i-stop-time { font-size: 13px; color: #565959; }
+      .load-card .rfx-i-badge { font-size: 11px; padding: 2px 8px; border-radius: 4px; font-weight: 600; text-transform: uppercase; }
+      .load-card .rfx-i-badge.preloaded { background: #e6f7f2; color: #067d62; }
+      .load-card .rfx-i-badge.live { background: #fef3cd; color: #856404; }
+      .load-card .rfx-i-badge.drop { background: #e8f0fe; color: #1a56db; }
+      .load-card .rfx-i-leg { font-size: 12px; color: #888; padding: 2px 0 4px 32px; }
+      .load-card .rfx-i-footer { display: flex; align-items: center; gap: 10px; flex-wrap: wrap; padding-top: 8px; margin-top: 6px; border-top: 1px solid #f0f0f0; font-size: 13px; color: #565959; }
+      .load-card .rfx-i-footer b { color: #0f1111; }
+      .load-card .rfx-i-version { font-size: 11px; padding: 2px 6px; border-radius: 4px; font-weight: 600; }
+      .load-card .rfx-i-version.ok { background: #f0f0f0; color: #565959; }
+      .load-card .rfx-i-version.bad { background: #fdecea; color: #cc3333; }
+      .load-card .rfx-i-book { padding: 8px 20px; font-size: 14px; font-weight: 600; background: #ff9900; color: #0f1111; border: none; border-radius: 8px; cursor: pointer; font-family: inherit; }
+      .load-card .rfx-i-book:hover { background: #e88b00; }
+      .load-card.rfx-styled { border: 1px solid #d5d9d9; border-radius: 10px; margin-bottom: 10px; overflow: hidden; }
+      .load-card.rfx-styled .wo-tag { display: none; }
+      .load-card.rfx-version-warn { border-left: 3px solid #cc3333; }
+      .load-card.rfx-new-detected { border: 2px solid #ff9900 !important; box-shadow: 0 0 12px rgba(255,153,0,0.3); animation: rfxNewFlash 3s ease-out; }
+      @keyframes rfxNewFlash { 0%,50% { background: #fff5e0; } 100% { background: #fff; } }
+      @media (max-width: 640px) {
+        .load-card .rfx-card-body { flex-direction: column; gap: 6px; }
+        .load-card .rfx-card-right { flex-direction: row; align-items: center; gap: 10px; min-width: 0; text-align: left; flex-wrap: wrap; border-top: 1px solid #f0f0f0; padding-top: 8px; }
+        .load-card .rfx-i-payout { font-size: 20px; }
+        .load-card .rfx-i-book { min-height: 44px; }
+      }
+    `;
+    document.head.appendChild(style);
+  }
+
+  // Build maps for quick lookup
+  const loadMap = new Map();
+  for (const wo of allLoads) loadMap.set(wo.id, wo);
+  const alertedIds = new Map();
+  for (const a of alertedLoads) alertedIds.set(a.wo.id, a);
+
+  let matchCount = 0, noIdCount = 0, noDataCount = 0;
+
+  loadCards.forEach(card => {
+    // Extract the workOpportunity ID — it's on a child div inside load-card
+    let woId = null;
+
+    // Strategy 1: Find child div with UUID-like ID
+    const allDivs = card.querySelectorAll("div[id]");
+    for (const div of allDivs) {
+      if (div.id && div.id.length > 20 && div.id !== "PAST_BOOK" && div.id.includes("-")) {
+        woId = div.id;
+        break;
+      }
+    }
+
+    // Strategy 2: Check parent
+    if (!woId) {
+      const parent = card.parentElement;
+      if (parent?.id && parent.id.length > 20 && parent.id.includes("-")) woId = parent.id;
+    }
+
+    if (!woId) { noIdCount++; return; }
+
+    const wo = loadMap.get(woId);
+    if (!wo) { noDataCount++; return; }
+    matchCount++;
+
+    // Skip if already styled with same version
+    if (card.classList.contains("rfx-styled") && card.dataset.rfxVer === String(wo.version)) {
+      // Still check if this card needs alert highlighting
+      const alert = alertedIds.get(woId);
+      if (alert && !card.classList.contains("rfx-new-detected")) {
+        card.classList.add("rfx-new-detected");
+      }
+      return;
+    }
+
+    // Mark as styled
+    card.classList.add("rfx-styled");
+    card.dataset.rfxVer = String(wo.version);
+
+    const ver = wo.version || 1;
+    if (ver > 5) card.classList.add("rfx-version-warn");
+
+    // Check if this is an alerted (new/changed) load
+    const alert = alertedIds.get(woId);
+    if (alert) card.classList.add("rfx-new-detected");
+
+    // Hide ALL original content inside the load-card
+    for (const child of card.children) {
+      if (!child.classList.contains("rfx-injected")) {
+        child.style.display = "none";
+      }
+    }
+
+    // Remove any previous injection
+    const oldInject = card.querySelector(".rfx-injected");
+    if (oldInject) oldInject.remove();
+
+    // Build our content
+    const pay = wo.payout?.value || 0;
+    const dist = wo.totalDistance?.value || 0;
+    const durMs = wo.totalDuration || 0;
+    const durH = durMs / 3600000;
+    const perHr = durH > 0 ? pay / durH : 0;
+    const perMi = dist > 0 ? pay / dist : 0;
+    const score = scoreLoad(wo);
+    const sc = scoreColor(score);
+    const stops = getAllStops(wo);
+    const driver = wo.transitOperatorType === "TEAM_DRIVER" ? "Team" : "Solo";
+    const firstTz = stops[0]?.location?.timeZone || "America/Los_Angeles";
+
+    let vBadge = "";
+    if (settings.showVersionBadge) {
+      if (ver > 3) vBadge = `<span class="rfx-i-version bad">v${ver} ⚠</span>`;
+      else if (ver > 1) vBadge = `<span class="rfx-i-version ok">v${ver}</span>`;
+    }
+
+    // Stops HTML
+    let stopsHtml = "";
+    for (let i = 0; i < stops.length; i++) {
+      const s = stops[i], loc = s.location || {};
+      const dotCls = s.stopType === "PICKUP" ? "pickup" : "dropoff";
+      const checkin = s.actions?.find(a => a.type === "CHECKIN")?.plannedTime;
+      const checkout = s.actions?.find(a => a.type === "CHECKOUT")?.plannedTime;
+      const tz = loc.timeZone || firstTz;
+      let dwell = "";
+      if (checkin && checkout) { const d = new Date(checkout) - new Date(checkin); if (d > 0) dwell = fmtDur(d); }
+      const lt = s.loadingType || s.unloadingType || "";
+      let ltBadge = "";
+      if (lt && settings.showLoadTypeBadge) {
+        const c = lt === "PRELOADED" ? "preloaded" : lt === "LIVE" ? "live" : "drop";
+        ltBadge = `<span class="rfx-i-badge ${c}">${lt}</span>`;
+      }
+
+      stopsHtml += `<div class="rfx-i-stop">
+        <div class="rfx-i-stop-dot ${dotCls}">${i + 1}</div>
+        <div>
+          <div class="rfx-i-stop-name">${loc.label || loc.stopCode || "?"} · ${loc.city || "?"}, ${loc.state || "?"}</div>
+          ${settings.showStopAddress ? `<div class="rfx-i-stop-addr">${[loc.line1, loc.line2].filter(Boolean).join(", ")}</div>` : ""}
+          <div class="rfx-i-stop-meta">
+            <span class="rfx-i-stop-time">${fmtTimeShort(checkin, tz)}${checkout ? ` → ${fmtTimeShort(checkout, tz)}` : ""}</span>
+            ${dwell && settings.showDwellTime ? `<span style="font-size:12px;color:#888">${dwell}</span>` : ""}
+            ${ltBadge}
+          </div>
+        </div>
+      </div>`;
+      if (i < stops.length - 1 && settings.showLegDistance && loc.latitude && loc.longitude) {
+        const nL = stops[i + 1]?.location;
+        if (nL?.latitude && nL?.longitude) {
+          const ld = (haversine(loc.latitude, loc.longitude, nL.latitude, nL.longitude) * 1.25).toFixed(1);
+          stopsHtml += `<div class="rfx-i-leg">↓ ~${ld} mi</div>`;
+        }
+      }
+    }
+
+    // Stats
+    let statsHtml = `<span class="rfx-i-payout">${fmt$(pay)}</span>`;
+    if (settings.showPerHr) statsHtml += `<div class="rfx-i-stat"><b>${fmt$(perHr)}</b>/hr</div>`;
+    if (settings.showPerMi) statsHtml += `<div class="rfx-i-stat"><b>${fmt$(perMi)}</b>/mi</div>`;
+    const distDur = [];
+    if (settings.showDistance) distDur.push(`<b>${dist.toFixed(1)}</b> mi`);
+    if (settings.showDuration) distDur.push(`<b>${fmtDur(durMs)}</b>`);
+    if (distDur.length) statsHtml += `<div class="rfx-i-stat">${distDur.join(" · ")}</div>`;
+    statsHtml += vBadge;
+
+    // Footer
+    let footer = `<b>${fmtTime(wo.firstPickupTime, firstTz)}</b>`;
+    if (settings.showDriverType) footer += ` <span>${driver}</span>`;
+    if (settings.showEquipment) footer += ` <span>53' Trailer</span>`;
+    if (settings.showStopCount) footer += ` <span>${wo.stopCount || stops.length} stops</span>`;
+
+    // BOOK button — clicks the load-card to open Amazon's panel
+    const bookBtn = settings.showBookButton ? `<button class="rfx-i-book" data-wo-id="${woId}">BOOK</button>` : "";
+
+    // Alert badge if this is a new/changed load
+    let alertBadge = "";
+    if (alert) {
+      const badgeCls = alert.badgeClass || "badge-new";
+      alertBadge = `<span class="rfx-i-badge" style="background:${badgeCls === "badge-new" || badgeCls === "badge-price-up" ? "#067d62" : badgeCls === "badge-price-down" ? "#cc3333" : badgeCls === "badge-time" ? "#b8860b" : "#565959"};color:#fff;margin-bottom:8px;display:inline-block;">${alert.badge}</span>`;
+    }
+
+    const inject = document.createElement("div");
+    inject.className = "rfx-injected";
+    inject.innerHTML = `<div class="rfx-card-inner">
+      ${alertBadge}
+      ${settings.showScoreBar ? `<div class="rfx-i-score-row">
+        <div class="rfx-i-score-bg"><div class="rfx-i-score-fill" style="width:${score}%;background:${sc}"></div></div>
+        <span class="rfx-i-score-label" style="color:${sc}">${score}</span>
+        <span class="rfx-i-score-tag" style="background:${scoreBg(score)};color:${sc}">${score >= 70 ? "Great" : score >= 40 ? "OK" : "Low"}</span>
+      </div>` : ""}
+      <div class="rfx-card-body">
+        <div class="rfx-card-left">${stopsHtml}<div class="rfx-i-footer">${footer}</div></div>
+        <div class="rfx-card-right"><div>${statsHtml}</div>${bookBtn}</div>
+      </div>
+    </div>`;
+
+    card.appendChild(inject);
+
+    // Bind BOOK button — clicks the load-card itself to open Amazon's panel
+    const btn = inject.querySelector(".rfx-i-book");
+    if (btn) {
+      btn.addEventListener("click", (e) => {
+        e.stopPropagation();
+        e.preventDefault();
+        bookLoadDirect(woId, card);
+      });
+    }
+  });
+
+  console.log(`[StyleCards] ${loadCards.length} cards, ${matchCount} matched, ${noIdCount} no ID, ${noDataCount} no data`);
+  if (matchCount === 0 && loadCards.length > 0) {
+    const domIds = [];
+    loadCards.forEach(card => {
+      card.querySelectorAll("div[id]").forEach(d => {
+        if (d.id.length > 10 && d.id !== "PAST_BOOK") domIds.push(d.id.substring(0, 15));
+      });
+    });
+    const dataIds = Array.from(loadMap.keys()).slice(0, 5).map(id => id.substring(0, 15));
+    console.log(`[StyleCards] DOM IDs: ${domIds.slice(0, 5).join(", ")}`);
+    console.log(`[StyleCards] Data IDs: ${dataIds.join(", ")}`);
+  }
+
+  // Move alerted (new/changed) load cards to the top of the list
+  if (alertedLoads.length > 0 && amazonContainer) {
+    const alertedCards = amazonContainer.querySelectorAll(".load-card.rfx-new-detected");
+    // Insert in reverse order so first alerted card ends up on top
+    for (let i = alertedCards.length - 1; i >= 0; i--) {
+      const card = alertedCards[i];
+      const parent = card.parentElement; // The div wrapping the load-card
+      if (parent && parent.parentElement === amazonContainer) {
+        amazonContainer.insertBefore(parent, amazonContainer.firstChild);
+      } else if (card.parentElement === amazonContainer) {
+        amazonContainer.insertBefore(card, amazonContainer.firstChild);
+      }
+    }
+  }
 }
 
 function updateLastRefresh() {
@@ -1015,12 +1205,23 @@ function applyHideAmazonLoads() {
 function removeOurCards() {
   const loadList = document.querySelector(".load-list");
   if (loadList) loadList.style.display = "";
-  // Restore all siblings we hid
-  if (ourHost?.parentElement) {
-    for (const child of ourHost.parentElement.children) {
-      if (child !== ourHost) child.style.display = "";
+
+  // Restore Amazon's load cards to original state
+  document.querySelectorAll(".load-card.rfx-styled").forEach(card => {
+    card.classList.remove("rfx-styled", "rfx-version-warn", "rfx-new-detected");
+    delete card.dataset.rfxVer;
+    const inject = card.querySelector(".rfx-injected");
+    if (inject) inject.remove();
+    // Restore all hidden children
+    for (const child of card.children) {
+      child.style.display = "";
     }
-  }
+  });
+
+  // Remove injected stylesheet
+  const style = document.getElementById("rfx-inject-style");
+  if (style) style.remove();
+
   if (ourHost) { ourHost.remove(); ourHost = null; shadowRoot = null; }
   amazonContainer = null;
 }
@@ -1201,6 +1402,11 @@ window.addEventListener("relay-fetcher-poll-result", (e) => {
         if (botTimer) { clearTimeout(botTimer); botTimer = null; }
         alertedLoads.push(...alerts);
         playAlert();
+        // Refresh Amazon's DOM so new load cards appear
+        forceAmazonRefresh().then(() => {
+          amazonContainer = document.querySelector(".load-list") || findLoadContainer();
+          if (aiModeActive) styleAmazonLoadCards();
+        });
       }
     } else {
       console.log(`[Bot:Poll] No alerts this cycle.`);
@@ -1528,86 +1734,16 @@ async function autoBookLoad(woId) {
   console.log(`[AutoBook] ★ Auto-booking load: ${woId}`);
   const wo = allLoads.find(w => w.id === woId);
 
-  // Refresh Amazon's UI so the load appears in the DOM
-  await forceAmazonRefresh();
-
   // Close any open panel
   document.dispatchEvent(new KeyboardEvent("keydown", { key: "Escape", bubbles: true }));
-  await sleep(300);
+  await sleep(200);
 
-  // Find the load row in Amazon's DOM (same strategies as bookLoad)
-  let loadRow = null;
-
-  const dataEls = document.querySelectorAll("[data-work-opportunity-id], [data-wo-id], [data-id]");
-  for (const el of dataEls) {
-    for (const attr of el.attributes) {
-      if (attr.value === woId) { loadRow = el; break; }
-    }
-    if (loadRow) break;
-  }
+  // Refresh and search — up to 5 attempts
+  const loadRow = await refreshUntilFound(woId, wo, 5);
 
   if (!loadRow) {
-    const candidates = document.querySelectorAll("a[href], [id], [aria-label]");
-    for (const el of candidates) {
-      if (el.closest("#rfx-host")) continue;
-      if (el.href?.includes(woId) || el.id?.includes(woId) || el.getAttribute("aria-label")?.includes(woId)) {
-        loadRow = el; break;
-      }
-    }
-  }
-
-  if (!loadRow && wo) {
-    const payText = wo.payout?.value?.toFixed(2);
-    const loadList = document.querySelector(".load-list");
-    if (loadList && payText) {
-      const rows = loadList.querySelectorAll(":scope > div, :scope > a, :scope > li");
-      for (const row of rows) {
-        const text = row.textContent || "";
-        if (text.includes(payText)) {
-          const firstStop = wo.loads?.[0]?.stops?.[0]?.location?.city;
-          if (!firstStop || text.toUpperCase().includes(firstStop.toUpperCase())) {
-            loadRow = row; break;
-          }
-        }
-      }
-    }
-  }
-
-  if (!loadRow) {
-    const loadList = document.querySelector(".load-list");
-    if (loadList) {
-      const rows = loadList.querySelectorAll(":scope > *");
-      for (const row of rows) {
-        if (row.innerHTML?.includes(woId)) { loadRow = row; break; }
-      }
-    }
-  }
-
-  // Retry up to 3 times if not found
-  if (!loadRow) {
-    for (let retry = 1; retry <= 3; retry++) {
-      console.log(`[AutoBook] Load not found, retrying in 1s... (attempt ${retry}/3)`);
-      await sleep(1000);
-      const ll = document.querySelector(".load-list");
-      if (ll) {
-        const rows = ll.querySelectorAll(":scope > *");
-        for (const row of rows) {
-          const text = row.textContent || "";
-          const payText = wo?.payout?.value?.toFixed(2);
-          if (row.innerHTML?.includes(woId) || (payText && text.includes(payText))) {
-            loadRow = row;
-            console.log(`[AutoBook] Found on retry ${retry}`);
-            break;
-          }
-        }
-      }
-      if (loadRow) break;
-    }
-  }
-
-  if (!loadRow) {
-    console.warn("[AutoBook] Could not find load row after retries for:", woId);
-    showToast("Auto-book: Could not find load in Amazon's list");
+    console.warn("[AutoBook] Could not find load after 5 refresh attempts for:", woId);
+    showToast("Auto-book: Could not find load after multiple refreshes");
     return;
   }
 
@@ -1638,57 +1774,54 @@ async function autoBookLoad(woId) {
     return;
   }
 
-  await sleep(200);
-  console.log("[AutoBook] ★ Clicking Book button...");
-  bookBtn.click();
-  console.log("[AutoBook] Book clicked — waiting for confirmation panel...");
-  await sleep(500);
+  // === BOOKING DISABLED FOR SAFETY — uncomment to enable ===
+  // await sleep(200);
+  // console.log("[AutoBook] ★ Clicking Book button...");
+  // bookBtn.click();
+  // console.log("[AutoBook] Book clicked — waiting for confirmation panel...");
+  // await sleep(500);
+  //
+  // console.log("[AutoBook] Searching for Confirm button...");
+  // let confirmBtn = null;
+  // const confirmArea = document.querySelector("#confirmation-expander, [data-id='confirmation-expander']");
+  // if (confirmArea) {
+  //   const btns = confirmArea.querySelectorAll("button, [role='button']");
+  //   for (const btn of btns) {
+  //     const txt = (btn.textContent || "").trim().toLowerCase();
+  //     if (txt.includes("book") || txt.includes("confirm") || txt.includes("yes") || txt.includes("accept")) {
+  //       confirmBtn = btn; break;
+  //     }
+  //   }
+  // }
+  // if (!confirmBtn) {
+  //   const allBtns2 = document.querySelectorAll("button, [role='button']");
+  //   for (const btn of allBtns2) {
+  //     if (btn.closest("#rfx-host")) continue;
+  //     if (btn === bookBtn) continue;
+  //     const txt = (btn.textContent || "").trim().toLowerCase();
+  //     if (txt === "confirm" || txt === "yes" || txt === "book this trip" || txt === "confirm booking" || txt.includes("yes") || txt.includes("confirm")) {
+  //       confirmBtn = btn; break;
+  //     }
+  //   }
+  // }
+  // if (!confirmBtn) {
+  //   bookingState.set(woId, "pending");
+  //   if (aiModeActive) injectCards();
+  //   showToast("Auto-book: Book clicked but could not find Confirm — confirm manually");
+  //   return;
+  // }
+  // await sleep(200);
+  // console.log("[AutoBook] ★★★ Clicking Confirm button — BOOKING LOAD");
+  // confirmBtn.click();
+  // console.log("[AutoBook] ✅ LOAD BOOKED:", woId);
+  // bookingState.set(woId, "confirmed");
+  // if (aiModeActive) injectCards();
+  // showToast("Auto-book: Load booked successfully!");
+  // playBookedSound();
+  // === END BOOKING DISABLED ===
 
-  // Find and click Confirm
-  console.log("[AutoBook] Searching for Confirm button...");
-  let confirmBtn = null;
-
-  const confirmArea = document.querySelector("#confirmation-expander, [data-id='confirmation-expander']");
-  if (confirmArea) {
-    const btns = confirmArea.querySelectorAll("button, [role='button']");
-    for (const btn of btns) {
-      const txt = (btn.textContent || "").trim().toLowerCase();
-      if (txt.includes("book") || txt.includes("confirm") || txt.includes("yes") || txt.includes("accept")) {
-        confirmBtn = btn;
-        break;
-      }
-    }
-  }
-
-  if (!confirmBtn) {
-    const allBtns2 = document.querySelectorAll("button, [role='button']");
-    for (const btn of allBtns2) {
-      if (btn.closest("#rfx-host")) continue;
-      if (btn === bookBtn) continue;
-      const txt = (btn.textContent || "").trim().toLowerCase();
-      if (txt === "confirm" || txt === "yes" || txt === "book this trip" || txt === "confirm booking" || txt.includes("yes") || txt.includes("confirm")) {
-        confirmBtn = btn;
-        break;
-      }
-    }
-  }
-
-  if (!confirmBtn) {
-    console.warn("[AutoBook] Could not find Confirm button — load is pending manual confirmation");
-    bookingState.set(woId, "pending");
-    if (aiModeActive) injectCards();
-    showToast("Auto-book: Book clicked but could not find Confirm — confirm manually");
-    return;
-  }
-
-  await sleep(200);
-  console.log("[AutoBook] ★★★ Clicking Confirm button — BOOKING LOAD");
-  confirmBtn.click();
-  console.log("[AutoBook] ✅ LOAD BOOKED:", woId);
-  bookingState.set(woId, "confirmed");
-  if (aiModeActive) injectCards();
-  showToast("Auto-book: Load booked successfully!");
-  playBookedSound();
+  console.log("[AutoBook] Book/Confirm DISABLED for safety. Found load but did not click.");
+  showToast("Auto-book: Found load but booking is disabled for safety");
 }
 
 // ============================================================
@@ -1765,109 +1898,133 @@ async function forceAmazonRefresh() {
   }
 }
 
-async function bookLoad(woId) {
-  const wo = allLoads.find(w => w.id === woId);
-  console.log(`[Booker] Starting book flow for load ID: ${woId}`);
+// Direct book — we already have the load-card element, no searching needed
+async function bookLoadDirect(woId, loadCard) {
+  console.log(`[Booker] Direct book for load: ${woId}`);
 
-  // Step 0 — Refresh Amazon's UI so the load appears in the DOM
-  await forceAmazonRefresh();
-
-  // Close any open panel by pressing Escape
-  console.log("[Booker] Closing any open panel...");
+  // Close any open panel
   document.dispatchEvent(new KeyboardEvent("keydown", { key: "Escape", bubbles: true }));
-  await sleep(300);
+  await sleep(200);
 
-  // Step 1 — Find the matching load row in Amazon's DOM
-  console.log("[Booker] Searching for load row in Amazon's DOM...");
-  let loadRow = null;
+  // Click the load card to open Amazon's detail panel
+  // The hidden elements still have React handlers attached — clicking works even with display:none
+  console.log("[Booker] Clicking load card to open panel...");
+  const clickTarget = loadCard.querySelector(".wo-tag") || loadCard.querySelector("div[id]") || loadCard;
+  clickTarget.click();
+  await sleep(500);
 
-  // Strategy 1: data attributes containing the load ID
-  const dataEls = document.querySelectorAll("[data-work-opportunity-id], [data-wo-id], [data-id]");
-  for (const el of dataEls) {
-    for (const attr of el.attributes) {
-      if (attr.value === woId) { loadRow = el; break; }
-    }
-    if (loadRow) break;
-  }
-  if (loadRow) console.log("[Booker] Found via data attribute");
-
-  // Strategy 2: href, id, or aria-label containing the ID
-  if (!loadRow) {
-    const candidates = document.querySelectorAll("a[href], [id], [aria-label]");
-    for (const el of candidates) {
-      if (el.closest("#rfx-host")) continue;
-      if (el.href?.includes(woId) || el.id?.includes(woId) || el.getAttribute("aria-label")?.includes(woId)) {
-        loadRow = el;
-        console.log("[Booker] Found via href/id/aria-label");
+  // Find the Book button in the panel
+  console.log("[Booker] Searching for Book button...");
+  let bookBtn = null;
+  const allButtons = document.querySelectorAll("button, [role='button']");
+  for (const btn of allButtons) {
+    if (btn.closest("#rfx-host") || btn.closest(".rfx-injected")) continue;
+    const txt = (btn.textContent || "").trim().toLowerCase();
+    const label = (btn.getAttribute("aria-label") || "").toLowerCase();
+    if (txt === "book" || txt === "book load" || txt === "book this load" || label.includes("book")) {
+      if (!txt.includes("confirm") && !txt.includes("accept")) {
+        bookBtn = btn;
+        console.log(`[Booker] Found Book button: "${btn.textContent.trim()}"`);
         break;
       }
     }
   }
 
-  // Strategy 3: Match by payout and pickup time in text content
-  if (!loadRow && wo) {
+  if (!bookBtn) {
+    console.warn("[Booker] Could not find Book button in panel");
+    showToast("Panel opened but could not find Book button");
+    return;
+  }
+
+  // === BOOKING DISABLED FOR SAFETY — uncomment to enable ===
+  // await sleep(200);
+  // bookBtn.click();
+  // console.log("[Booker] Book clicked");
+  //
+  // if (settings.fastBook) {
+  //   await sleep(500);
+  //   let confirmBtn = null;
+  //   const confirmArea = document.querySelector("#confirmation-expander, [data-id='confirmation-expander']");
+  //   if (confirmArea) {
+  //     for (const btn of confirmArea.querySelectorAll("button, [role='button']")) {
+  //       const txt = (btn.textContent || "").trim().toLowerCase();
+  //       if (txt.includes("book") || txt.includes("confirm") || txt.includes("yes")) { confirmBtn = btn; break; }
+  //     }
+  //   }
+  //   if (confirmBtn) {
+  //     await sleep(200);
+  //     confirmBtn.click();
+  //     console.log("[Booker] ✅ CONFIRMED");
+  //     bookingState.set(woId, "confirmed");
+  //     if (aiModeActive) injectCards();
+  //     playBookedSound();
+  //     showToast("Load booked!");
+  //     return;
+  //   }
+  // }
+  // bookingState.set(woId, "pending");
+  // if (aiModeActive) injectCards();
+  // showToast("Book clicked — confirm in panel");
+  // === END BOOKING DISABLED ===
+
+  console.log("[Booker] Book/Confirm DISABLED for safety. Found Book button but did not click.");
+  showToast("Booking disabled for safety — found Book button");
+}
+
+function findLoadInDOM(woId, wo) {
+  const dataEls = document.querySelectorAll("[data-work-opportunity-id], [data-wo-id], [data-id]");
+  for (const el of dataEls) {
+    for (const attr of el.attributes) { if (attr.value === woId) return el; }
+  }
+  const candidates = document.querySelectorAll("a[href], [id], [aria-label]");
+  for (const el of candidates) {
+    if (el.closest("#rfx-host")) continue;
+    if (el.href?.includes(woId) || el.id?.includes(woId) || el.getAttribute("aria-label")?.includes(woId)) return el;
+  }
+  if (wo) {
     const payText = wo.payout?.value?.toFixed(2);
-    const loadList = document.querySelector(".load-list");
-    if (loadList && payText) {
-      const rows = loadList.querySelectorAll(":scope > div, :scope > a, :scope > li");
-      console.log(`[Booker] Strategy 3: searching ${rows.length} rows for payout $${payText}`);
-      for (const row of rows) {
+    const ll = document.querySelector(".load-list");
+    if (ll && payText) {
+      for (const row of ll.querySelectorAll(":scope > div, :scope > a, :scope > li")) {
         const text = row.textContent || "";
         if (text.includes(payText)) {
-          // Cross-reference with first stop city
-          const firstStop = wo.loads?.[0]?.stops?.[0]?.location?.city;
-          if (!firstStop || text.toUpperCase().includes(firstStop.toUpperCase())) {
-            loadRow = row;
-            console.log("[Booker] Found via payout + city text match");
-            break;
-          }
+          const city = wo.loads?.[0]?.stops?.[0]?.location?.city;
+          if (!city || text.toUpperCase().includes(city.toUpperCase())) return row;
         }
       }
     }
   }
+  const ll = document.querySelector(".load-list");
+  if (ll) { for (const row of ll.querySelectorAll(":scope > *")) { if (row.innerHTML?.includes(woId)) return row; } }
+  return null;
+}
 
-  // Strategy 4: Search inside load-list children for any element containing the ID in innerHTML
-  if (!loadRow) {
-    const loadList = document.querySelector(".load-list");
-    if (loadList) {
-      const rows = loadList.querySelectorAll(":scope > *");
-      for (const row of rows) {
-        if (row.innerHTML?.includes(woId)) {
-          loadRow = row;
-          console.log("[Booker] Found via innerHTML search in load-list");
-          break;
-        }
-      }
-    }
+async function refreshUntilFound(woId, wo, maxAttempts) {
+  for (let attempt = 1; attempt <= maxAttempts; attempt++) {
+    console.log(`[Booker] Refresh + search attempt ${attempt}/${maxAttempts}`);
+    showToast(`Looking for load... (${attempt}/${maxAttempts})`);
+    await forceAmazonRefresh();
+    const row = findLoadInDOM(woId, wo);
+    if (row) { console.log(`[Booker] Found load on attempt ${attempt}`); return row; }
+    if (attempt < maxAttempts) await sleep(500);
   }
+  return null;
+}
 
-  // Retry up to 3 times if not found (Amazon's DOM may not have rendered yet)
-  if (!loadRow) {
-    for (let retry = 1; retry <= 3; retry++) {
-      console.log(`[Booker] Load not found, retrying in 1s... (attempt ${retry}/3)`);
-      showToast(`Load not in Amazon's DOM yet — retrying (${retry}/3)...`);
-      await sleep(2000);
-      // Re-search all strategies
-      const ll = document.querySelector(".load-list");
-      if (ll) {
-        const rows = ll.querySelectorAll(":scope > *");
-        for (const row of rows) {
-          const text = row.textContent || "";
-          const payText = wo?.payout?.value?.toFixed(2);
-          if (row.innerHTML?.includes(woId) || (payText && text.includes(payText))) {
-            loadRow = row;
-            console.log(`[Booker] Found on retry ${retry}`);
-            break;
-          }
-        }
-      }
-      if (loadRow) break;
-    }
-  }
+async function bookLoad(woId) {
+  const wo = allLoads.find(w => w.id === woId);
+  console.log(`[Booker] Starting book flow for load ID: ${woId}`);
+
+  // Close any open panel
+  document.dispatchEvent(new KeyboardEvent("keydown", { key: "Escape", bubbles: true }));
+  await sleep(200);
+
+  // Refresh Amazon's UI and search — up to 5 attempts
+  const loadRow = await refreshUntilFound(woId, wo, 5);
 
   if (!loadRow) {
-    console.warn("[Booker] Could not find load row after retries for ID:", woId);
-    showToast("Could not find load in Amazon's list — try refreshing the page");
+    console.warn("[Booker] Could not find load after 5 refresh attempts for ID:", woId);
+    showToast("Could not find load after multiple refreshes");
     bookingState.set(woId, "failed");
     if (aiModeActive) injectCards();
     return;
@@ -1907,75 +2064,64 @@ async function bookLoad(woId) {
     return;
   }
 
-  await sleep(200);
-  console.log("[Booker] Clicking Book button...");
-  bookBtn.click();
-  console.log("[Booker] Book button clicked.");
+  // === BOOKING DISABLED FOR SAFETY — uncomment to enable ===
+  // await sleep(200);
+  // console.log("[Booker] Clicking Book button...");
+  // bookBtn.click();
+  // console.log("[Booker] Book button clicked.");
+  //
+  // if (!settings.fastBook) {
+  //   console.log("[Booker] Fast Book is OFF — waiting for manual confirmation.");
+  //   bookingState.set(woId, "pending");
+  //   if (aiModeActive) injectCards();
+  //   showToast("Book clicked — review and confirm in Amazon's panel");
+  //   return;
+  // }
+  //
+  // console.log("[Booker] Fast Book is ON — auto-confirming...");
+  // await sleep(500);
+  //
+  // console.log("[Booker] Searching for Confirm button...");
+  // let confirmBtn = null;
+  // const confirmArea = document.querySelector("#confirmation-expander, [data-id='confirmation-expander']");
+  // if (confirmArea) {
+  //   const btns = confirmArea.querySelectorAll("button, [role='button']");
+  //   for (const btn of btns) {
+  //     const txt = (btn.textContent || "").trim().toLowerCase();
+  //     if (txt.includes("book") || txt.includes("confirm") || txt.includes("yes") || txt.includes("accept")) {
+  //       confirmBtn = btn; break;
+  //     }
+  //   }
+  // }
+  // if (!confirmBtn) {
+  //   const allBtns2 = document.querySelectorAll("button, [role='button']");
+  //   for (const btn of allBtns2) {
+  //     if (btn.closest("#rfx-host")) continue;
+  //     if (btn === bookBtn) continue;
+  //     const txt = (btn.textContent || "").trim().toLowerCase();
+  //     if (txt === "confirm" || txt === "yes" || txt === "book this trip" || txt === "confirm booking" || txt.includes("yes") || txt.includes("confirm")) {
+  //       confirmBtn = btn; break;
+  //     }
+  //   }
+  // }
+  // if (!confirmBtn) {
+  //   bookingState.set(woId, "pending");
+  //   if (aiModeActive) injectCards();
+  //   showToast("Book clicked but could not find Confirm — confirm manually");
+  //   return;
+  // }
+  // await sleep(200);
+  // console.log("[Booker] Clicking Confirm button...");
+  // confirmBtn.click();
+  // console.log("[Booker] ✅ BOOKING CONFIRMED for load:", woId);
+  // bookingState.set(woId, "confirmed");
+  // if (aiModeActive) injectCards();
+  // playBookedSound();
+  // showToast("Load booked successfully!");
+  // === END BOOKING DISABLED ===
 
-  if (!settings.fastBook) {
-    // Fast Book is OFF — stop here, let user confirm manually
-    console.log("[Booker] Fast Book is OFF — waiting for manual confirmation.");
-    bookingState.set(woId, "pending");
-    if (aiModeActive) injectCards();
-    showToast("Book clicked — review and confirm in Amazon's panel");
-    return;
-  }
-
-  // Fast Book is ON — auto-confirm
-  console.log("[Booker] Fast Book is ON — auto-confirming...");
-  await sleep(500);
-
-  // Step 4 — Find and click the Confirm button
-  console.log("[Booker] Searching for Confirm button...");
-  let confirmBtn = null;
-
-  // Look for the confirmation expander area and find a button inside it
-  const confirmArea = document.querySelector("#confirmation-expander, [data-id='confirmation-expander']");
-  if (confirmArea) {
-    const btns = confirmArea.querySelectorAll("button, [role='button']");
-    for (const btn of btns) {
-      const txt = (btn.textContent || "").trim().toLowerCase();
-      if (txt.includes("book") || txt.includes("confirm") || txt.includes("yes") || txt.includes("accept")) {
-        confirmBtn = btn;
-        console.log(`[Booker] Found Confirm button in confirmation-expander: "${btn.textContent.trim()}"`);
-        break;
-      }
-    }
-  }
-
-  // Fallback: search all buttons for confirm-like text
-  if (!confirmBtn) {
-    const allBtns2 = document.querySelectorAll("button, [role='button']");
-    for (const btn of allBtns2) {
-      if (btn.closest("#rfx-host")) continue;
-      if (btn === bookBtn) continue;
-      const txt = (btn.textContent || "").trim().toLowerCase();
-      if (txt === "confirm" || txt === "yes" || txt === "book this trip" || txt === "confirm booking" || txt.includes("yes") || txt.includes("confirm")) {
-        confirmBtn = btn;
-        console.log(`[Booker] Found Confirm button via fallback: "${btn.textContent.trim()}"`);
-        break;
-      }
-    }
-  }
-
-  if (!confirmBtn) {
-    console.warn("[Booker] Could not find Confirm button");
-    bookingState.set(woId, "pending");
-    if (aiModeActive) injectCards();
-    showToast("Book clicked but could not find Confirm button — confirm manually");
-    return;
-  }
-
-  await sleep(200);
-  console.log("[Booker] Clicking Confirm button...");
-  confirmBtn.click();
-  console.log("[Booker] ✅ BOOKING CONFIRMED for load:", woId);
-
-  // Step 5 — Update our card UI
-  bookingState.set(woId, "confirmed");
-  if (aiModeActive) injectCards();
-  playBookedSound();
-  showToast("Load booked successfully!");
+  console.log("[Booker] Book/Confirm DISABLED for safety. Found Book button but did not click.");
+  showToast("Booking is disabled for safety — found the load but did not book");
 }
 
 // ============================================================
@@ -2082,7 +2228,16 @@ const observer = new MutationObserver((mutations) => {
   if (!ourHost) {
     injectCards();
   } else {
-    // Host exists — make sure Amazon's content below it stays hidden
+    // Only re-style if there are NEW unstyled load cards in the DOM
+    const loadList = document.querySelector(".load-list");
+    if (loadList && allLoads.length > 0) {
+      const unstyled = loadList.querySelectorAll(".load-card:not(.rfx-styled)");
+      if (unstyled.length > 0) {
+        console.log(`[Observer] ${unstyled.length} unstyled cards found, re-styling`);
+        amazonContainer = loadList;
+        styleAmazonLoadCards();
+      }
+    }
     applyHideAmazonLoads();
   }
 });
