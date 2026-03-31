@@ -8,7 +8,7 @@ let allLoads = [];
 let knownIds = new Set();
 let currentSort = "score";
 let currentSortDir = "desc";
-let aiModeActive = false;
+let aiModeActive = true;
 let amazonContainer = null;
 let ourHost = null;
 let shadowRoot = null;
@@ -584,10 +584,14 @@ function renderCard(wo, extraClass, changeBadge) {
 // FIND AMAZON'S LOAD CONTAINER
 // ============================================================
 function findLoadContainer() {
+  // Try the known class first
+  const loadList = document.querySelector(".load-list");
+  if (loadList) return loadList;
+
+  // Fallback: heuristic search
   const allEls = document.querySelectorAll("div, a, li, tr");
   const loadRows = [];
   for (const el of allEls) {
-    // Skip our own injected elements
     if (el.closest("#rfx-host") || el.id === "rfx-host") continue;
     const t = el.textContent || "";
     if (t.length < 2000 && /\$\d+\.\d{2}/.test(t) && /\d+\.?\d*\s*mi/i.test(t) && el.children.length >= 2) {
@@ -622,10 +626,12 @@ function findLoadContainer() {
 function injectCards() {
   if (!aiModeActive) return;
 
-  // Only search for Amazon's container if we don't have a host yet
-  if (!ourHost) {
-    if (!amazonContainer) amazonContainer = findLoadContainer();
-  }
+  // Find Amazon's load-list
+  if (!amazonContainer) amazonContainer = document.querySelector(".load-list") || findLoadContainer();
+
+  // Don't inject until we have a place to put it
+  if (!amazonContainer && !ourHost) return;
+
   // Apply hide setting
   applyHideAmazonLoads();
 
@@ -633,34 +639,8 @@ function injectCards() {
   if (!ourHost) {
     ourHost = document.createElement("div");
     ourHost.id = "rfx-host";
-
-    // Insert our UI next to Amazon's load list (keep sidebar/filters visible)
-    if (amazonContainer) {
-      amazonContainer.parentElement.insertBefore(ourHost, amazonContainer);
-    } else {
-      // No Amazon container (0 loads) — find the "no matches" area and replace it
-      const noMatches = Array.from(document.querySelectorAll("h1, h2, h3, h4, div, p")).find(
-        el => /no matches|no results/i.test(el.textContent) && el.textContent.length < 200
-      );
-      if (noMatches) {
-        const container = noMatches.closest("div") || noMatches.parentElement;
-        container.style.display = "none";
-        ourHost._hiddenNoMatches = container;
-        container.parentElement.insertBefore(ourHost, container.nextSibling);
-      } else {
-        document.body.appendChild(ourHost);
-      }
-    }
-    ourHost.style.padding = "0 16px";
-    ourHost.style.width = "100%";
-    // Remove width constraints on all ancestors up to the main layout
-    let p = ourHost.parentElement;
-    for (let i = 0; i < 6 && p && p !== document.body; i++) {
-      p.style.maxWidth = "none";
-      p.style.width = "100%";
-      p.style.flex = "1";
-      p = p.parentElement;
-    }
+    // Insert right before the load-list
+    amazonContainer.parentElement.insertBefore(ourHost, amazonContainer);
     shadowRoot = ourHost.attachShadow({ mode: "open" });
   }
 
@@ -768,7 +748,7 @@ function injectCards() {
   } else if (alertedLoads.length > 0) {
     cardsHtml = ""; // all loads are in the alert section, don't show empty message
   } else {
-    cardsHtml = `<div class="rfx-empty">No loads yet. Click <b>Start</b> to begin polling or <b>Fetch All</b> to load results.</div>`;
+    cardsHtml = `<div class="rfx-empty">No loads yet. Click <b>Start</b> to begin polling or wait for the page to load results.</div>`;
   }
 
   shadowRoot.innerHTML = `<style>${CSS}</style>${statusBar}${settingsPanel}${alertSection}${toolbar}${cardsHtml}`;
@@ -867,28 +847,17 @@ function applyHideAmazonLoads() {
 }
 
 function removeOurCards() {
-  if (amazonContainer) amazonContainer.style.display = "";
   const loadList = document.querySelector(".load-list");
   if (loadList) loadList.style.display = "";
-  // Restore parent width overrides
-  if (ourHost) {
-    let p = ourHost.parentElement;
-    for (let i = 0; i < 6 && p && p !== document.body; i++) {
-      p.style.maxWidth = "";
-      p.style.width = "";
-      p.style.flex = "";
-      p = p.parentElement;
-    }
-  }
-  if (ourHost?._hiddenNoMatches) ourHost._hiddenNoMatches.style.display = "";
   if (ourHost) { ourHost.remove(); ourHost = null; shadowRoot = null; }
+  amazonContainer = null;
 }
 
 function toggleAiMode() {
   aiModeActive = !aiModeActive;
   const btn = document.querySelector("#rfx-toggle-btn button");
   if (aiModeActive) {
-    if (btn) btn.textContent = "Amazon UI";
+    if (btn) btn.textContent = "Amazon View";
     injectCards();
   } else {
     if (btn) btn.textContent = "AI Loads";
@@ -1638,15 +1607,23 @@ window.addEventListener("relay-fetcher-auto-update", (e) => {
 // Keepalive handler
 chrome.runtime.onMessage.addListener((msg) => { if (msg.action === "keepalive") return; });
 
-// MutationObserver for SPA navigation — only fires when we don't have a host yet
+// MutationObserver — injects our UI once .load-list appears, re-injects if removed
 const observer = new MutationObserver((mutations) => {
-  // Ignore mutations from our own elements
   for (const m of mutations) {
     if (m.target.id === "rfx-host" || m.target.closest?.("#rfx-host")) return;
   }
-  if (aiModeActive && !ourHost && !amazonContainer) {
-    amazonContainer = findLoadContainer();
-    if (amazonContainer) injectCards();
+  if (!aiModeActive) return;
+
+  // Check if our host got disconnected (Amazon re-rendered the page)
+  if (ourHost && !document.contains(ourHost)) {
+    console.log("[Relay Fetcher] Host disconnected — re-injecting");
+    ourHost = null;
+    shadowRoot = null;
+    amazonContainer = null;
+  }
+
+  if (!ourHost) {
+    injectCards();
   }
 });
 
@@ -1657,36 +1634,25 @@ function init() {
   const toggleWrap = document.createElement("div");
   toggleWrap.id = "rfx-toggle-btn";
   toggleWrap.innerHTML = `<style>
-    #rfx-toggle-btn button, #rfx-fetch-btn button {
+    #rfx-toggle-btn button {
       position: fixed; z-index: 1000000;
       padding: 8px 16px; font-size: 13px; font-weight: 600;
       border-radius: 6px; cursor: pointer; box-shadow: 0 1px 4px rgba(0,0,0,0.15);
       font-family: "Amazon Ember", -apple-system, sans-serif; border: none;
+      top: 12px; left: 12px; background: #232f3e; color: #fff;
     }
-    #rfx-toggle-btn button { top: 12px; left: 12px; background: #232f3e; color: #fff; }
     #rfx-toggle-btn button:hover { background: #37475a; }
-    #rfx-fetch-btn button { top: 12px; left: 110px; background: #fff; color: #232f3e; border: 1px solid #d5d9d9; }
-    #rfx-fetch-btn button:hover { background: #f7fafa; }
-  </style><button>AI Loads</button>`;
+  </style><button>Amazon View</button>`;
   document.body.appendChild(toggleWrap);
   toggleWrap.querySelector("button").addEventListener("click", toggleAiMode);
-
-  const fetchWrap = document.createElement("div");
-  fetchWrap.id = "rfx-fetch-btn";
-  fetchWrap.innerHTML = `<button>Fetch All</button>`;
-  document.body.appendChild(fetchWrap);
-  fetchWrap.querySelector("button").addEventListener("click", async () => {
-    const b = fetchWrap.querySelector("button");
-    b.disabled = true;
-    await fetchAllLoads();
-    b.disabled = false;
-    b.textContent = "Fetch All";
-  });
 
   observer.observe(document.body, { childList: true, subtree: true });
 
   // Start watching for chat modal
   setupChatObserver();
+
+  // Auto-inject our UI on page load
+  injectCards();
 }
 
 if (document.body) init();
