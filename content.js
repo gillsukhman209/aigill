@@ -755,8 +755,7 @@ function injectCards() {
     <button class="rfx-bot-btn rfx-start-btn" id="rfx-start-btn" ${botRunning ? "disabled" : ""}>Start</button>
     <button class="rfx-bot-btn rfx-stop-btn" id="rfx-stop-btn" ${!botRunning ? "disabled" : ""}>Stop</button>
     <button class="rfx-gear-btn" id="rfx-gear-btn" title="Settings">⚙</button>
-    <button class="rfx-gear-btn" id="rfx-test-newload" title="Test new load sound">🔔</button>
-    <button class="rfx-gear-btn" id="rfx-test-booked" title="Test booked sound">🔊</button>
+    <button class="rfx-bot-btn" id="rfx-toggle-amazon" style="background:#232f3e;color:#fff;font-size:12px;padding:5px 12px;">Amazon View</button>
     ${fastBookWarning}
   </div>`;
 
@@ -896,11 +895,10 @@ function injectCards() {
     if (panel) panel.classList.toggle("open", settingsOpen);
   });
 
-  // Debug sound test buttons
-  const testNewLoad = shadowRoot.getElementById("rfx-test-newload");
-  if (testNewLoad) testNewLoad.addEventListener("click", () => playAlert());
-  const testBooked = shadowRoot.getElementById("rfx-test-booked");
-  if (testBooked) testBooked.addEventListener("click", () => playBookedSound());
+  // Amazon View toggle (inside status bar)
+  const toggleAmazonBtn = shadowRoot.getElementById("rfx-toggle-amazon");
+  if (toggleAmazonBtn) toggleAmazonBtn.addEventListener("click", toggleAiMode);
+
 
   // Settings checkboxes
   shadowRoot.querySelectorAll('.rfx-setting-row input[type="checkbox"]').forEach(cb => {
@@ -1029,13 +1027,23 @@ function removeOurCards() {
 
 function toggleAiMode() {
   aiModeActive = !aiModeActive;
-  const btn = document.querySelector("#rfx-toggle-btn button");
+  const backBtnWrap = document.getElementById("rfx-back-btn");
   if (aiModeActive) {
-    if (btn) btn.textContent = "Amazon View";
+    if (backBtnWrap) backBtnWrap.style.display = "none";
     injectCards();
   } else {
-    if (btn) btn.textContent = "AI Loads";
     removeOurCards();
+    // Insert the "AI Loads" button where the load list is
+    if (backBtnWrap) {
+      const loadList = document.querySelector(".load-list");
+      if (loadList) {
+        loadList.parentElement.insertBefore(backBtnWrap, loadList);
+      } else {
+        const activeTab = document.getElementById("active-tab-body");
+        if (activeTab) activeTab.prepend(backBtnWrap);
+      }
+      backBtnWrap.style.display = "block";
+    }
   }
 }
 
@@ -2048,27 +2056,21 @@ const observer = new MutationObserver((mutations) => {
 // INIT
 // ============================================================
 function init() {
-  const toggleWrap = document.createElement("div");
-  toggleWrap.id = "rfx-toggle-btn";
-  toggleWrap.innerHTML = `<style>
-    #rfx-toggle-btn button {
-      position: fixed; z-index: 1000000;
-      padding: 8px 16px; font-size: 13px; font-weight: 600;
-      border-radius: 6px; cursor: pointer; box-shadow: 0 1px 4px rgba(0,0,0,0.15);
-      font-family: "Amazon Ember", -apple-system, sans-serif; border: none;
-      top: 12px; left: 12px; background: #232f3e; color: #fff;
-    }
-    #rfx-toggle-btn button:hover { background: #37475a; }
-  </style><button>Amazon View</button>`;
-  document.body.appendChild(toggleWrap);
-  toggleWrap.querySelector("button").addEventListener("click", toggleAiMode);
+  // Persistent "AI Loads" button — injected into the same area as the load list
+  const backBtn = document.createElement("div");
+  backBtn.id = "rfx-back-btn";
+  backBtn.style.cssText = "display:none; padding:12px 0;";
+  backBtn.innerHTML = `<button style="
+    padding:10px 24px; font-size:14px; font-weight:600;
+    border-radius:8px; cursor:pointer; box-shadow:0 1px 4px rgba(0,0,0,0.15);
+    font-family:'Amazon Ember',-apple-system,sans-serif; border:none;
+    background:#232f3e; color:#fff;
+  ">AI Loads</button>`;
+  backBtn.querySelector("button").addEventListener("click", toggleAiMode);
+  document.body.appendChild(backBtn);
 
   observer.observe(document.body, { childList: true, subtree: true });
-
-  // Start watching for chat modal
   setupChatObserver();
-
-  // Auto-inject our UI on page load
   injectCards();
 }
 
