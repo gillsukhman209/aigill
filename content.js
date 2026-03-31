@@ -1036,9 +1036,9 @@ function startBot() {
     console.log("[Bot] Alerts cleared on Start");
   }
   botRunning = true;
-  isFirstPoll = seenLoads.size === 0;
+  isFirstPoll = true; // Always treat first poll as baseline — no alerts
   chrome.runtime.sendMessage({ action: "botStarted" }).catch(() => {});
-  console.log(`[Bot] ▶ Started. isFirstPoll=${isFirstPoll}, seenLoads=${seenLoads.size}, allLoads=${allLoads.length}`);
+  console.log(`[Bot] ▶ Started. isFirstPoll=true (forced), seenLoads=${seenLoads.size}, allLoads=${allLoads.length}`);
   doPoll(); // immediate first poll
   scheduleNext();
   if (aiModeActive) injectCards();
