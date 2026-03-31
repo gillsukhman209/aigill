@@ -870,7 +870,16 @@ function injectCards() {
   // Settings checkboxes
   shadowRoot.querySelectorAll('.rfx-setting-row input[type="checkbox"]').forEach(cb => {
     cb.addEventListener("change", () => {
-      settings[cb.dataset.key] = cb.checked;
+      const key = cb.dataset.key;
+      settings[key] = cb.checked;
+
+      // fastBook and autoBook are mutually exclusive
+      if (key === "fastBook" && cb.checked) {
+        settings.autoBook = false;
+      } else if (key === "autoBook" && cb.checked) {
+        settings.fastBook = false;
+      }
+
       saveSettings();
       applyHideAmazonLoads();
       injectCards();
