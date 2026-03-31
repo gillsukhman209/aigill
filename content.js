@@ -1194,8 +1194,7 @@ window.addEventListener("relay-fetcher-poll-result", (e) => {
         botRunning = false;
         if (botTimer) { clearTimeout(botTimer); botTimer = null; }
         if (aiModeActive) injectCards();
-        // Give UI a moment to render, then book
-        setTimeout(() => autoBookLoad(target.wo.id), 500);
+        setTimeout(() => autoBookLoad(target.wo.id), 100);
       } else {
         console.log(`[Bot:Poll] ★★★ ${alerts.length} ALERTS — stopping bot, playing sound`);
         botRunning = false;
@@ -1530,7 +1529,7 @@ async function autoBookLoad(woId) {
   const wo = allLoads.find(w => w.id === woId);
 
   // Refresh Amazon's UI so the load appears in the DOM
-  await clickAmazonRefresh();
+  await forceAmazonRefresh();
 
   // Close any open panel
   document.dispatchEvent(new KeyboardEvent("keydown", { key: "Escape", bubbles: true }));
@@ -1587,8 +1586,8 @@ async function autoBookLoad(woId) {
   // Retry up to 3 times if not found
   if (!loadRow) {
     for (let retry = 1; retry <= 3; retry++) {
-      console.log(`[AutoBook] Load not found, retrying in 2s... (attempt ${retry}/3)`);
-      await sleep(2000);
+      console.log(`[AutoBook] Load not found, retrying in 1s... (attempt ${retry}/3)`);
+      await sleep(1000);
       const ll = document.querySelector(".load-list");
       if (ll) {
         const rows = ll.querySelectorAll(":scope > *");
@@ -1615,7 +1614,7 @@ async function autoBookLoad(woId) {
   console.log("[AutoBook] Found load row, clicking...");
   const clickTarget = loadRow.querySelector("a") || loadRow.querySelector("[role='button']") || loadRow;
   clickTarget.click();
-  await sleep(1000);
+  await sleep(500);
 
   // Find the Book button
   console.log("[AutoBook] Searching for Book button...");
@@ -1711,19 +1710,58 @@ function showToast(text) {
   setTimeout(() => toast.remove(), 5000);
 }
 
-async function clickAmazonRefresh() {
-  // Click Amazon's refresh button to force their UI to re-render with latest loads
-  const refreshBtn = document.querySelector("[aria-label='Refresh'], [title='Refresh'], button[class*='refresh']")
-    || Array.from(document.querySelectorAll("button, [role='button']")).find(b => {
-      const label = (b.getAttribute("aria-label") || b.title || "").toLowerCase();
-      return label.includes("refresh");
-    });
-  if (refreshBtn) {
-    console.log("[Booker] Clicking Amazon's refresh button...");
-    refreshBtn.click();
-    await sleep(1500);
+async function forceAmazonRefresh() {
+  console.log("[Booker] Forcing Amazon UI refresh...");
+
+  let clicked = false;
+
+  // Strategy 1: Find the button next to "Next Refresh" text
+  const allEls = document.querySelectorAll("p, span, div");
+  for (const el of allEls) {
+    if (/next refresh/i.test(el.textContent) && el.textContent.length < 30) {
+      // The refresh button is a sibling or nearby button
+      const parent = el.closest("div") || el.parentElement;
+      const btn = parent?.querySelector("button") || parent?.parentElement?.querySelector("button");
+      if (btn) {
+        btn.click(); clicked = true;
+        console.log("[Booker] Clicked refresh button near 'Next Refresh' text");
+        break;
+      }
+    }
+  }
+
+  // Strategy 2: Find button with popover-offset attribute (from the HTML structure)
+  if (!clicked) {
+    const btns = document.querySelectorAll("button[popover-offset], button[mdn-popover-offset]");
+    for (const btn of btns) {
+      if (btn.closest("#rfx-host")) continue;
+      // The refresh button is near the bottom of the page, has an SVG icon
+      if (btn.querySelector("svg, span[style*='display: none']")) {
+        btn.click(); clicked = true;
+        console.log("[Booker] Clicked refresh button via popover-offset");
+        break;
+      }
+    }
+  }
+
+  // Strategy 3: Generic selectors
+  if (!clicked) {
+    const selectors = ["[aria-label='Refresh']", "[title='Refresh']"];
+    for (const sel of selectors) {
+      const btn = document.querySelector(sel);
+      if (btn) { btn.click(); clicked = true; console.log("[Booker] Clicked refresh via:", sel); break; }
+    }
+  }
+
+  if (clicked) {
+    await sleep(500);
+    for (let i = 0; i < 3; i++) {
+      const loadList = document.querySelector(".load-list");
+      if (loadList && loadList.children.length > 0) break;
+      await sleep(300);
+    }
   } else {
-    console.log("[Booker] Could not find Amazon's refresh button");
+    await sleep(1000);
   }
 }
 
@@ -1732,7 +1770,7 @@ async function bookLoad(woId) {
   console.log(`[Booker] Starting book flow for load ID: ${woId}`);
 
   // Step 0 — Refresh Amazon's UI so the load appears in the DOM
-  await clickAmazonRefresh();
+  await forceAmazonRefresh();
 
   // Close any open panel by pressing Escape
   console.log("[Booker] Closing any open panel...");
@@ -1806,7 +1844,7 @@ async function bookLoad(woId) {
   // Retry up to 3 times if not found (Amazon's DOM may not have rendered yet)
   if (!loadRow) {
     for (let retry = 1; retry <= 3; retry++) {
-      console.log(`[Booker] Load not found, retrying in 2s... (attempt ${retry}/3)`);
+      console.log(`[Booker] Load not found, retrying in 1s... (attempt ${retry}/3)`);
       showToast(`Load not in Amazon's DOM yet — retrying (${retry}/3)...`);
       await sleep(2000);
       // Re-search all strategies
@@ -1840,7 +1878,7 @@ async function bookLoad(woId) {
   // Find the clickable element — might be the row itself, an anchor, or a child
   const clickTarget = loadRow.querySelector("a") || loadRow.querySelector("[role='button']") || loadRow;
   clickTarget.click();
-  await sleep(1000);
+  await sleep(500);
 
   // Step 3 — Find and click the Book button inside the detail panel
   console.log("[Booker] Searching for Book button in detail panel...");
