@@ -1217,8 +1217,8 @@ window.addEventListener("relay-fetcher-poll-result", (e) => {
 // NEGOTIATION
 // ============================================================
 function playNegotiationSound() {
+  // Disabled — no sound on negotiation complete
   try {
-    playSound("successbook.mp3");
   } catch (e) {}
 }
 
@@ -1299,7 +1299,6 @@ function runNegotiationRound(woId, version, majorVersion) {
       console.log(`[Negotiator] Amazon ended negotiation (status=${chatStatus}). Best: ${fmt$(state.bestPay)}`);
       state.status = "done";
       negotiationState.set(woId, state);
-      playNegotiationSound();
       updateChatNegUI(woId);
       return;
     }
@@ -1320,8 +1319,7 @@ function runNegotiationRound(woId, version, majorVersion) {
         console.log(`[Negotiator] Price stopped moving at ${fmt$(updatedPrice)}. Best: ${fmt$(state.bestPay)}`);
         state.status = "done";
         negotiationState.set(woId, state);
-        playNegotiationSound();
-        updateChatNegUI(woId);
+          updateChatNegUI(woId);
         return;
       }
     } else {
@@ -1336,7 +1334,6 @@ function runNegotiationRound(woId, version, majorVersion) {
       console.log(`[Negotiator] Safety cap reached (5 rounds). Best: ${fmt$(state.bestPay)}`);
       state.status = "done";
       negotiationState.set(woId, state);
-      playNegotiationSound();
       updateChatNegUI(woId);
       return;
     }
