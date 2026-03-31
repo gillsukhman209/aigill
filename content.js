@@ -44,8 +44,10 @@ function saveSettings() {
 loadSettings();
 
 // Negotiation state
-// key: woId, value: { status: 'idle'|'running'|'done'|'ineligible', round, prices: [num], originalPay, bestPay, resolveRound }
 const negotiationState = new Map();
+
+// Booking state — key: woId, value: 'idle'|'pending'|'failed'
+const bookingState = new Map();
 
 // Bot state
 let botRunning = false;
@@ -399,6 +401,23 @@ const CSS = `
 @keyframes rfxNegPulse { 0%,100% { opacity: 1; } 50% { opacity: 0.6; } }
 .rfx-neg-pulsing { animation: rfxNegPulse 1s infinite; }
 
+/* Booking */
+.rfx-book-btn.pending {
+  background: #b8860b; color: #fff; cursor: default;
+}
+.rfx-card.booking-pending {
+  border-color: #ff9900;
+  animation: rfxBookPulse 2s infinite;
+}
+@keyframes rfxBookPulse { 0%,100% { box-shadow: 0 0 0 0 rgba(255,153,0,0); } 50% { box-shadow: 0 0 8px 2px rgba(255,153,0,0.3); } }
+.rfx-toast {
+  position: fixed; bottom: 20px; left: 50%; transform: translateX(-50%);
+  background: #232f3e; color: #fff; padding: 10px 20px; border-radius: 8px;
+  font-size: 14px; z-index: 9999999; box-shadow: 0 4px 12px rgba(0,0,0,0.3);
+  font-family: inherit; animation: rfxToastIn 0.3s;
+}
+@keyframes rfxToastIn { from { opacity: 0; transform: translateX(-50%) translateY(10px); } to { opacity: 1; transform: translateX(-50%) translateY(0); } }
+
 .rfx-empty { text-align: center; color: #888; padding: 40px 20px; font-size: 14px; }
 
 /* Settings */
@@ -462,10 +481,12 @@ function renderCard(wo, extraClass, changeBadge) {
   const stops = getAllStops(wo);
   const driver = wo.transitOperatorType === "TEAM_DRIVER" ? "Team" : "Solo";
   const firstTz = stops[0]?.location?.timeZone || "America/Los_Angeles";
+  const bState = bookingState.get(wo.id) || "idle";
   const cls = [
     "rfx-card",
     ver > 5 ? "version-warn" : "",
     goneLoads.has(wo.id) ? "gone" : "",
+    bState === "pending" ? "booking-pending" : "",
     extraClass || "",
   ].filter(Boolean).join(" ");
 
@@ -548,7 +569,13 @@ function renderCard(wo, extraClass, changeBadge) {
       </div>
       <div class="rfx-right">
         <div class="rfx-stats-group">${statsHtml}</div>
-        ${settings.showBookButton ? `<button class="rfx-book-btn" data-wo-id="${wo.id}">BOOK</button>` : ""}
+        ${settings.showBookButton ? (
+          bState === "confirmed"
+            ? `<button class="rfx-book-btn" style="background:#067d62;color:#fff;cursor:default" disabled>✅ Booked</button>`
+            : bState === "pending"
+            ? `<button class="rfx-book-btn pending" disabled>Confirm in Amazon →</button>`
+            : `<button class="rfx-book-btn" data-wo-id="${wo.id}">BOOK</button>`
+        ) : ""}
       </div>
     </div>
   </div>`;
@@ -1328,16 +1355,195 @@ window.addEventListener("relay-fetcher-chat-intercepted", (e) => {
 });
 
 // ============================================================
-// BOOK
+// BOOK — multi-step DOM automation
 // ============================================================
-function bookLoad(woId) {
-  const allEls = document.querySelectorAll("a, div[role='button'], button, [data-testid]");
-  for (const el of allEls) {
-    if (el.innerHTML?.includes(woId) || el.href?.includes(woId)) {
-      el.click(); return;
+function sleep(ms) { return new Promise(r => setTimeout(r, ms)); }
+
+function showToast(text) {
+  // Remove existing toast
+  const old = document.getElementById("rfx-toast");
+  if (old) old.remove();
+  const toast = document.createElement("div");
+  toast.id = "rfx-toast";
+  toast.className = "rfx-toast";
+  // Toast is outside shadow DOM so it's always visible
+  toast.style.cssText = "position:fixed;bottom:20px;left:50%;transform:translateX(-50%);background:#232f3e;color:#fff;padding:10px 20px;border-radius:8px;font-size:14px;z-index:9999999;box-shadow:0 4px 12px rgba(0,0,0,0.3);font-family:-apple-system,sans-serif;";
+  toast.textContent = text;
+  document.body.appendChild(toast);
+  setTimeout(() => toast.remove(), 5000);
+}
+
+async function bookLoad(woId) {
+  const wo = allLoads.find(w => w.id === woId);
+  console.log(`[Booker] Starting book flow for load ID: ${woId}`);
+
+  // Step 0 — Close any open panel by pressing Escape
+  console.log("[Booker] Closing any open panel...");
+  document.dispatchEvent(new KeyboardEvent("keydown", { key: "Escape", bubbles: true }));
+  await sleep(300);
+
+  // Step 1 — Find the matching load row in Amazon's DOM
+  console.log("[Booker] Searching for load row in Amazon's DOM...");
+  let loadRow = null;
+
+  // Strategy 1: data attributes containing the load ID
+  const dataEls = document.querySelectorAll("[data-work-opportunity-id], [data-wo-id], [data-id]");
+  for (const el of dataEls) {
+    for (const attr of el.attributes) {
+      if (attr.value === woId) { loadRow = el; break; }
+    }
+    if (loadRow) break;
+  }
+  if (loadRow) console.log("[Booker] Found via data attribute");
+
+  // Strategy 2: href, id, or aria-label containing the ID
+  if (!loadRow) {
+    const candidates = document.querySelectorAll("a[href], [id], [aria-label]");
+    for (const el of candidates) {
+      if (el.closest("#rfx-host")) continue;
+      if (el.href?.includes(woId) || el.id?.includes(woId) || el.getAttribute("aria-label")?.includes(woId)) {
+        loadRow = el;
+        console.log("[Booker] Found via href/id/aria-label");
+        break;
+      }
     }
   }
-  window.open(`https://relay.amazon.com/loadboard/loads/${woId}`, "_blank");
+
+  // Strategy 3: Match by payout and pickup time in text content
+  if (!loadRow && wo) {
+    const payText = wo.payout?.value?.toFixed(2);
+    const loadList = document.querySelector(".load-list");
+    if (loadList && payText) {
+      const rows = loadList.querySelectorAll(":scope > div, :scope > a, :scope > li");
+      console.log(`[Booker] Strategy 3: searching ${rows.length} rows for payout $${payText}`);
+      for (const row of rows) {
+        const text = row.textContent || "";
+        if (text.includes(payText)) {
+          // Cross-reference with first stop city
+          const firstStop = wo.loads?.[0]?.stops?.[0]?.location?.city;
+          if (!firstStop || text.toUpperCase().includes(firstStop.toUpperCase())) {
+            loadRow = row;
+            console.log("[Booker] Found via payout + city text match");
+            break;
+          }
+        }
+      }
+    }
+  }
+
+  // Strategy 4: Search inside load-list children for any element containing the ID in innerHTML
+  if (!loadRow) {
+    const loadList = document.querySelector(".load-list");
+    if (loadList) {
+      const rows = loadList.querySelectorAll(":scope > *");
+      for (const row of rows) {
+        if (row.innerHTML?.includes(woId)) {
+          loadRow = row;
+          console.log("[Booker] Found via innerHTML search in load-list");
+          break;
+        }
+      }
+    }
+  }
+
+  if (!loadRow) {
+    console.warn("[Booker] Could not find load row in Amazon's DOM for ID:", woId);
+    showToast("Could not find load in Amazon's list — try scrolling the page first");
+    bookingState.set(woId, "failed");
+    if (aiModeActive) injectCards();
+    return;
+  }
+
+  // Step 2 — Click the load row to open the detail panel
+  console.log("[Booker] Clicking load row to open detail panel...");
+  // Find the clickable element — might be the row itself, an anchor, or a child
+  const clickTarget = loadRow.querySelector("a") || loadRow.querySelector("[role='button']") || loadRow;
+  clickTarget.click();
+  await sleep(1000);
+
+  // Step 3 — Find and click the Book button inside the detail panel
+  console.log("[Booker] Searching for Book button in detail panel...");
+  let bookBtn = null;
+
+  // Search all buttons on the page for one that says "Book"
+  const allButtons = document.querySelectorAll("button, [role='button']");
+  for (const btn of allButtons) {
+    if (btn.closest("#rfx-host")) continue; // skip our own buttons
+    const txt = (btn.textContent || "").trim().toLowerCase();
+    const label = (btn.getAttribute("aria-label") || "").toLowerCase();
+    // Match "Book" but NOT "Book Now", "Booked", "Book and Confirm", etc. — just "Book" or "Book load"
+    if (txt === "book" || txt === "book load" || txt === "book this load" || label.includes("book")) {
+      // Make sure it's not a confirm/accept button
+      if (!txt.includes("confirm") && !txt.includes("accept")) {
+        bookBtn = btn;
+        console.log(`[Booker] Found Book button: "${btn.textContent.trim()}"`);
+        break;
+      }
+    }
+  }
+
+  if (!bookBtn) {
+    console.warn("[Booker] Could not find Book button in the detail panel");
+    showToast("Load panel opened but could not find the Book button");
+    return;
+  }
+
+  await sleep(200);
+  console.log("[Booker] Clicking Book button...");
+  bookBtn.click();
+  console.log("[Booker] Book button clicked — waiting for confirmation panel...");
+  await sleep(500);
+
+  // Step 4 — Find and click the Confirm button
+  console.log("[Booker] Searching for Confirm button...");
+  let confirmBtn = null;
+
+  // Look for the confirmation expander area and find a button inside it
+  const confirmArea = document.querySelector("#confirmation-expander, [data-id='confirmation-expander']");
+  if (confirmArea) {
+    const btns = confirmArea.querySelectorAll("button, [role='button']");
+    for (const btn of btns) {
+      const txt = (btn.textContent || "").trim().toLowerCase();
+      if (txt.includes("book") || txt.includes("confirm") || txt.includes("yes") || txt.includes("accept")) {
+        confirmBtn = btn;
+        console.log(`[Booker] Found Confirm button in confirmation-expander: "${btn.textContent.trim()}"`);
+        break;
+      }
+    }
+  }
+
+  // Fallback: search all buttons for confirm-like text
+  if (!confirmBtn) {
+    const allBtns2 = document.querySelectorAll("button, [role='button']");
+    for (const btn of allBtns2) {
+      if (btn.closest("#rfx-host")) continue;
+      if (btn === bookBtn) continue;
+      const txt = (btn.textContent || "").trim().toLowerCase();
+      if (txt === "confirm" || txt === "yes" || txt === "book this trip" || txt === "confirm booking" || txt.includes("yes") || txt.includes("confirm")) {
+        confirmBtn = btn;
+        console.log(`[Booker] Found Confirm button via fallback: "${btn.textContent.trim()}"`);
+        break;
+      }
+    }
+  }
+
+  if (!confirmBtn) {
+    console.warn("[Booker] Could not find Confirm button");
+    bookingState.set(woId, "pending");
+    if (aiModeActive) injectCards();
+    showToast("Book clicked but could not find Confirm button — confirm manually");
+    return;
+  }
+
+  await sleep(200);
+  console.log("[Booker] Clicking Confirm button...");
+  confirmBtn.click();
+  console.log("[Booker] ✅ BOOKING CONFIRMED for load:", woId);
+
+  // Step 5 — Update our card UI
+  bookingState.set(woId, "confirmed");
+  if (aiModeActive) injectCards();
+  showToast("Load booked successfully!");
 }
 
 // ============================================================
