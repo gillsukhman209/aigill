@@ -35,6 +35,7 @@ const DEFAULT_SETTINGS = {
   showStopCount: true,
   fastBook: false,
   showScanAnimation: true,
+  autoBook: false,
 };
 let settings = { ...DEFAULT_SETTINGS };
 function loadSettings() {
@@ -280,6 +281,14 @@ const CSS = `
   width: 100%; margin-top: 6px; justify-content: center;
 }
 @keyframes rfxWarnPulse { 0%,100% { opacity: 1; } 50% { opacity: 0.7; } }
+.rfx-autobook-warn {
+  display: flex; align-items: center; justify-content: center; gap: 6px;
+  background: #8b0000; color: #fff; font-size: 13px; font-weight: 700;
+  padding: 8px 16px; border-radius: 8px; margin-bottom: 10px;
+  animation: rfxAutoBookPulse 1.5s infinite;
+  text-transform: uppercase; letter-spacing: 0.5px;
+}
+@keyframes rfxAutoBookPulse { 0%,100% { background: #8b0000; } 50% { background: #cc0000; } }
 
 /* Scanning overlay */
 .rfx-scanning-overlay {
@@ -742,6 +751,7 @@ function injectCards() {
       <div class="rfx-settings-section-title">General</div>
       ${chk("hideAmazonLoads", "Hide Amazon's original load list when AI mode is on")}
       ${chk("fastBook", "Fast Book — auto-confirm booking (skips manual confirmation)")}
+      ${chk("autoBook", "Auto-Book — automatically book new loads when detected (clicks Book only, not Confirm)")}
       ${chk("showScanAnimation", "Show scanning animation when bot is running")}
     </div>
 
@@ -824,7 +834,11 @@ function injectCards() {
   }
 
   const showToolbar = !(botRunning && settings.showScanAnimation && alertedLoads.length === 0);
-  shadowRoot.innerHTML = `<style>${CSS}</style>${statusBar}${settingsPanel}${alertSection}${showToolbar ? toolbar : ""}${cardsHtml}`;
+  const autoBookWarning = settings.autoBook
+    ? `<div class="rfx-autobook-warn">⚠ AUTO-BOOK ARMED — New loads will be booked automatically ⚠</div>`
+    : "";
+
+  shadowRoot.innerHTML = `<style>${CSS}</style>${statusBar}${autoBookWarning}${settingsPanel}${alertSection}${showToolbar ? toolbar : ""}${cardsHtml}`;
 
   for (const wo of sorted) knownIds.add(wo.id);
 
@@ -980,8 +994,20 @@ function toggleAiMode() {
 // ============================================================
 function startBot() {
   if (botRunning) return;
+
+  // If auto-book is on, ask for confirmation first
+  if (settings.autoBook) {
+    const confirmed = window.confirm(
+      "⚠ AUTO-BOOK IS ENABLED ⚠\n\n" +
+      "The bot will automatically BOOK AND CONFIRM any new load it detects.\n\n" +
+      "This WILL commit you to the load. There is no undo.\n\n" +
+      "Make sure your Amazon filters are set correctly — only loads matching your filters will appear.\n\n" +
+      "Are you sure you want to start?"
+    );
+    if (!confirmed) return;
+  }
+
   ensureAudioCtx();
-  // Clear any pending alerts — user is resuming
   if (alertedLoads.length > 0) {
     alertedLoads = [];
     console.log("[Bot] Alerts cleared on Start");
@@ -1097,11 +1123,28 @@ window.addEventListener("relay-fetcher-poll-result", (e) => {
     console.log(`[Bot:Poll] allLoads after merge: ${allLoads.length}`);
 
     if (alerts.length > 0) {
-      console.log(`[Bot:Poll] ★★★ ${alerts.length} ALERTS — stopping bot, playing sound`);
-      botRunning = false;
-      if (botTimer) { clearTimeout(botTimer); botTimer = null; }
-      alertedLoads.push(...alerts);
-      playAlert();
+      // Check for auto-book — only for NEW loads (not price changes etc.)
+      const newLoads = alerts.filter(a => a.badge === "NEW");
+
+      if (settings.autoBook && newLoads.length > 0) {
+        console.log(`[Bot:Poll] ★★★ AUTO-BOOK: ${newLoads.length} new loads — booking first one`);
+        playAlert();
+        // Book the first new load (click Book only, not Confirm)
+        const target = newLoads[0];
+        alertedLoads.push(...alerts);
+        // Stop bot while booking
+        botRunning = false;
+        if (botTimer) { clearTimeout(botTimer); botTimer = null; }
+        if (aiModeActive) injectCards();
+        // Give UI a moment to render, then book
+        setTimeout(() => autoBookLoad(target.wo.id), 500);
+      } else {
+        console.log(`[Bot:Poll] ★★★ ${alerts.length} ALERTS — stopping bot, playing sound`);
+        botRunning = false;
+        if (botTimer) { clearTimeout(botTimer); botTimer = null; }
+        alertedLoads.push(...alerts);
+        playAlert();
+      }
     } else {
       console.log(`[Bot:Poll] No alerts this cycle.`);
     }
@@ -1434,7 +1477,151 @@ window.addEventListener("relay-fetcher-chat-intercepted", (e) => {
 });
 
 // ============================================================
-// BOOK — multi-step DOM automation
+// AUTO-BOOK — clicks Book only, never Confirm
+// ============================================================
+async function autoBookLoad(woId) {
+  console.log(`[AutoBook] ★ Auto-booking load: ${woId}`);
+  const wo = allLoads.find(w => w.id === woId);
+
+  // Close any open panel
+  document.dispatchEvent(new KeyboardEvent("keydown", { key: "Escape", bubbles: true }));
+  await sleep(300);
+
+  // Find the load row in Amazon's DOM (same strategies as bookLoad)
+  let loadRow = null;
+
+  const dataEls = document.querySelectorAll("[data-work-opportunity-id], [data-wo-id], [data-id]");
+  for (const el of dataEls) {
+    for (const attr of el.attributes) {
+      if (attr.value === woId) { loadRow = el; break; }
+    }
+    if (loadRow) break;
+  }
+
+  if (!loadRow) {
+    const candidates = document.querySelectorAll("a[href], [id], [aria-label]");
+    for (const el of candidates) {
+      if (el.closest("#rfx-host")) continue;
+      if (el.href?.includes(woId) || el.id?.includes(woId) || el.getAttribute("aria-label")?.includes(woId)) {
+        loadRow = el; break;
+      }
+    }
+  }
+
+  if (!loadRow && wo) {
+    const payText = wo.payout?.value?.toFixed(2);
+    const loadList = document.querySelector(".load-list");
+    if (loadList && payText) {
+      const rows = loadList.querySelectorAll(":scope > div, :scope > a, :scope > li");
+      for (const row of rows) {
+        const text = row.textContent || "";
+        if (text.includes(payText)) {
+          const firstStop = wo.loads?.[0]?.stops?.[0]?.location?.city;
+          if (!firstStop || text.toUpperCase().includes(firstStop.toUpperCase())) {
+            loadRow = row; break;
+          }
+        }
+      }
+    }
+  }
+
+  if (!loadRow) {
+    const loadList = document.querySelector(".load-list");
+    if (loadList) {
+      const rows = loadList.querySelectorAll(":scope > *");
+      for (const row of rows) {
+        if (row.innerHTML?.includes(woId)) { loadRow = row; break; }
+      }
+    }
+  }
+
+  if (!loadRow) {
+    console.warn("[AutoBook] Could not find load row for:", woId);
+    showToast("Auto-book: Could not find load in Amazon's list");
+    return;
+  }
+
+  console.log("[AutoBook] Found load row, clicking...");
+  const clickTarget = loadRow.querySelector("a") || loadRow.querySelector("[role='button']") || loadRow;
+  clickTarget.click();
+  await sleep(1000);
+
+  // Find the Book button
+  console.log("[AutoBook] Searching for Book button...");
+  let bookBtn = null;
+  const allButtons = document.querySelectorAll("button, [role='button']");
+  for (const btn of allButtons) {
+    if (btn.closest("#rfx-host")) continue;
+    const txt = (btn.textContent || "").trim().toLowerCase();
+    const label = (btn.getAttribute("aria-label") || "").toLowerCase();
+    if (txt === "book" || txt === "book load" || txt === "book this load" || label.includes("book")) {
+      if (!txt.includes("confirm") && !txt.includes("accept")) {
+        bookBtn = btn;
+        break;
+      }
+    }
+  }
+
+  if (!bookBtn) {
+    console.warn("[AutoBook] Could not find Book button");
+    showToast("Auto-book: Could not find Book button");
+    return;
+  }
+
+  await sleep(200);
+  console.log("[AutoBook] ★ Clicking Book button...");
+  bookBtn.click();
+  console.log("[AutoBook] Book clicked — waiting for confirmation panel...");
+  await sleep(500);
+
+  // Find and click Confirm
+  console.log("[AutoBook] Searching for Confirm button...");
+  let confirmBtn = null;
+
+  const confirmArea = document.querySelector("#confirmation-expander, [data-id='confirmation-expander']");
+  if (confirmArea) {
+    const btns = confirmArea.querySelectorAll("button, [role='button']");
+    for (const btn of btns) {
+      const txt = (btn.textContent || "").trim().toLowerCase();
+      if (txt.includes("book") || txt.includes("confirm") || txt.includes("yes") || txt.includes("accept")) {
+        confirmBtn = btn;
+        break;
+      }
+    }
+  }
+
+  if (!confirmBtn) {
+    const allBtns2 = document.querySelectorAll("button, [role='button']");
+    for (const btn of allBtns2) {
+      if (btn.closest("#rfx-host")) continue;
+      if (btn === bookBtn) continue;
+      const txt = (btn.textContent || "").trim().toLowerCase();
+      if (txt === "confirm" || txt === "yes" || txt === "book this trip" || txt === "confirm booking" || txt.includes("yes") || txt.includes("confirm")) {
+        confirmBtn = btn;
+        break;
+      }
+    }
+  }
+
+  if (!confirmBtn) {
+    console.warn("[AutoBook] Could not find Confirm button — load is pending manual confirmation");
+    bookingState.set(woId, "pending");
+    if (aiModeActive) injectCards();
+    showToast("Auto-book: Book clicked but could not find Confirm — confirm manually");
+    return;
+  }
+
+  await sleep(200);
+  console.log("[AutoBook] ★★★ Clicking Confirm button — BOOKING LOAD");
+  confirmBtn.click();
+  console.log("[AutoBook] ✅ LOAD BOOKED:", woId);
+  bookingState.set(woId, "confirmed");
+  if (aiModeActive) injectCards();
+  showToast("Auto-book: Load booked successfully!");
+}
+
+// ============================================================
+// BOOK — multi-step DOM automation (manual)
 // ============================================================
 function sleep(ms) { return new Promise(r => setTimeout(r, ms)); }
 
