@@ -834,25 +834,15 @@ setInterval(updateLastRefresh, 1000);
 function applyHideAmazonLoads() {
   if (!aiModeActive) return;
   const hide = settings.hideAmazonLoads;
-  // Target Amazon's known elements by class/id
-  const selectors = [
-    ".load-list",
-    ".pagination-bar",
-    "#search-results-summary-panel",
-    ".search-results-summary__panel",
-  ];
-  for (const sel of selectors) {
-    const el = document.querySelector(sel);
-    if (el) el.style.display = hide ? "none" : "";
-  }
+  // Only hide the load-list itself — nothing else
+  const loadList = document.querySelector(".load-list");
+  if (loadList) loadList.style.display = hide ? "none" : "";
 }
 
 function removeOurCards() {
   if (amazonContainer) amazonContainer.style.display = "";
-  [".load-list", ".pagination-bar", "#search-results-summary-panel", ".search-results-summary__panel"].forEach(sel => {
-    const el = document.querySelector(sel);
-    if (el) el.style.display = "";
-  });
+  const loadList = document.querySelector(".load-list");
+  if (loadList) loadList.style.display = "";
   // Restore parent width overrides
   if (ourHost) {
     let p = ourHost.parentElement;
