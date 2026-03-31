@@ -36,6 +36,7 @@ const DEFAULT_SETTINGS = {
   fastBook: false,
   showScanAnimation: true,
   autoBook: false,
+  minPriceIncrease: 0,
 };
 let settings = { ...DEFAULT_SETTINGS };
 function loadSettings() {
@@ -210,7 +211,16 @@ function detectChanges(newLoads) {
 
       if (payChanged || verChanged || timeChanged) {
         let badge, badgeClass;
+        const priceIncrease = newPay - prev.payout;
+
         if (payChanged && newPay > prev.payout) {
+          // Check min price increase threshold
+          if (settings.minPriceIncrease > 0 && priceIncrease < settings.minPriceIncrease) {
+            console.log(`[Bot:Detect] — SKIPPED price increase: ${shortId}... +$${priceIncrease.toFixed(2)} below min $${settings.minPriceIncrease}`);
+            seenLoads.set(wo.id, { version: newVer, payout: newPay, pickupTime: newPickup });
+            missingCounts.delete(wo.id);
+            continue;
+          }
           badge = `PRICE UP ${fmt$(prev.payout)} → ${fmt$(newPay)}`;
           badgeClass = "badge-price-up";
         } else if (payChanged && newPay < prev.payout) {
@@ -784,6 +794,16 @@ function injectCards() {
     </div>
 
     <div class="rfx-settings-section">
+      <div class="rfx-settings-section-title">Alerts</div>
+      <div class="rfx-range-row">
+        <label>Min price increase</label>
+        <input type="range" id="rfx-s-minPrice" min="0" max="200" step="5" value="${settings.minPriceIncrease}" data-key="minPriceIncrease">
+        <span class="rfx-range-val" id="rfx-s-minPrice-val">${settings.minPriceIncrease === 0 ? "Off" : "$" + settings.minPriceIncrease}</span>
+      </div>
+      <div style="font-size:11px;color:#888;padding:2px 0 0 0;">Only alert on price increases above this amount. Set to 0 to alert on all changes.</div>
+    </div>
+
+    <div class="rfx-settings-section">
       <div class="rfx-settings-section-title">Card Display</div>
       ${chk("showScoreBar", "Score bar")}
       ${chk("showPerHr", "$/hr")}
@@ -914,8 +934,14 @@ function injectCards() {
       }
       saveSettings();
       const valEl = shadowRoot.getElementById(slider.id + "-val");
-      if (valEl) valEl.textContent = slider.value + "s";
-      // Update the other slider's display too
+      if (valEl) {
+        if (key === "minPriceIncrease") {
+          valEl.textContent = parseInt(slider.value) === 0 ? "Off" : "$" + slider.value;
+        } else {
+          valEl.textContent = slider.value + "s";
+        }
+      }
+      // Update poll slider displays
       const minVal = shadowRoot.getElementById("rfx-s-pollMin-val");
       const maxVal = shadowRoot.getElementById("rfx-s-pollMax-val");
       const minSlider = shadowRoot.getElementById("rfx-s-pollMin");
