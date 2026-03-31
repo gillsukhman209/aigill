@@ -273,6 +273,13 @@ const CSS = `
 .rfx-stop-btn { background: #cc3333; color: #fff; }
 .rfx-stop-btn:hover { background: #a82a2a; }
 .rfx-stop-btn:disabled { opacity: 0.4; cursor: not-allowed; }
+.rfx-fastbook-warn {
+  display: inline-flex; align-items: center; gap: 4px;
+  background: #cc3333; color: #fff; font-size: 12px; font-weight: 600;
+  padding: 4px 12px; border-radius: 6px; animation: rfxWarnPulse 2s infinite;
+  width: 100%; margin-top: 6px; justify-content: center;
+}
+@keyframes rfxWarnPulse { 0%,100% { opacity: 1; } 50% { opacity: 0.7; } }
 
 /* Scanning overlay */
 .rfx-scanning-overlay {
@@ -711,6 +718,10 @@ function injectCards() {
   if (botRunning) { dotClass = "green"; statusText = "Running"; }
   else if (alertedLoads.length > 0) { dotClass = "amber"; statusText = "PAUSED — New Load Detected"; }
 
+  const fastBookWarning = settings.fastBook
+    ? `<span class="rfx-fastbook-warn">⚠ FAST BOOK ON — Clicking BOOK will auto-confirm!</span>`
+    : "";
+
   const statusBar = `<div class="rfx-status-bar">
     <div class="rfx-dot ${dotClass}"></div>
     <span class="rfx-status-text"><b>${statusText}</b></span>
@@ -718,6 +729,7 @@ function injectCards() {
     <button class="rfx-bot-btn rfx-start-btn" id="rfx-start-btn" ${botRunning ? "disabled" : ""}>Start</button>
     <button class="rfx-bot-btn rfx-stop-btn" id="rfx-stop-btn" ${!botRunning ? "disabled" : ""}>Stop</button>
     <button class="rfx-gear-btn" id="rfx-gear-btn" title="Settings">⚙</button>
+    ${fastBookWarning}
   </div>`;
 
   // Settings panel
