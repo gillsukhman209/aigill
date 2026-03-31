@@ -158,6 +158,20 @@ function playAlert() {
 // DETECTION LOGIC
 // ============================================================
 function detectChanges(newLoads) {
+  // Deduplicate by ID — if same load appears twice in one response, only process first occurrence
+  const deduped = [];
+  const seenInBatch = new Set();
+  for (const wo of newLoads) {
+    if (!seenInBatch.has(wo.id)) {
+      seenInBatch.add(wo.id);
+      deduped.push(wo);
+    }
+  }
+  if (deduped.length !== newLoads.length) {
+    console.log(`[Bot:Detect] Deduplicated: ${newLoads.length} → ${deduped.length} (${newLoads.length - deduped.length} duplicates removed)`);
+  }
+  newLoads = deduped;
+
   console.log(`[Bot:Detect] --- Detection run --- isFirstPoll=${isFirstPoll}, seenLoads=${seenLoads.size}, incoming=${newLoads.length}`);
 
   if (isFirstPoll) {
