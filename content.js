@@ -46,6 +46,8 @@ const DEFAULT_SETTINGS = {
   showDriverType: true,
   showEquipment: true,
   showStopCount: true,
+  showStopCode: true,
+  showExtraStopMeta: true,
   fastBook: false,
   showScanAnimation: true,
   autoBook: false,
@@ -118,6 +120,54 @@ function getAllStops(wo) {
     if (seen.has(k)) return false;
     seen.add(k); return true;
   });
+}
+
+function getLoadsForStop(wo, stop) {
+  const matches = [];
+  for (const load of wo.loads || []) {
+    if ((load.stops || []).some(s =>
+      (s.stopSequenceNumber || 0) === (stop.stopSequenceNumber || 0) &&
+      (s.location?.stopCode || "") === (stop.location?.stopCode || "")
+    )) {
+      matches.push(load);
+    }
+  }
+  return matches;
+}
+
+function uniqTruthy(values) {
+  return [...new Set(values.filter(Boolean))];
+}
+
+function titleCaseValue(value) {
+  return String(value || "")
+    .toLowerCase()
+    .split(/[_\s]+/)
+    .filter(Boolean)
+    .map(part => part.charAt(0).toUpperCase() + part.slice(1))
+    .join(" ");
+}
+
+function getDisplaySettingsSignature() {
+  return [
+    settings.showScoreBar,
+    settings.showPerHr,
+    settings.showPerMi,
+    settings.showDistance,
+    settings.showDuration,
+    settings.showVersionBadge,
+    settings.showStopAddress,
+    settings.showLegDistance,
+    settings.showDwellTime,
+    settings.showLoadTypeBadge,
+    settings.showBookButton,
+    settings.showDriverType,
+    settings.showEquipment,
+    settings.showStopCount,
+    settings.showStopCode,
+    settings.showExtraStopMeta,
+    settings.fastBook,
+  ].map(Boolean).join("");
 }
 
 // ============================================================
@@ -635,6 +685,9 @@ function renderCard(wo, extraClass, changeBadge) {
       const c = lt === "PRELOADED" ? "preloaded" : lt === "LIVE" ? "live" : "drop";
       ltBadge = `<span class="rfx-badge ${c}">${lt}</span>`;
     }
+    const cityState = `${loc.city || "?"}, ${loc.state || "?"}`;
+    const stopLabel = loc.label || loc.stopCode || "";
+    const stopName = settings.showStopCode && stopLabel ? `${stopLabel} · ${cityState}` : cityState;
     const conn = i < stops.length - 1;
     stopsHtml += `<div class="rfx-stop">
       <div class="rfx-stop-line">
@@ -642,7 +695,7 @@ function renderCard(wo, extraClass, changeBadge) {
         ${conn ? '<div class="rfx-stop-conn"></div>' : ""}
       </div>
       <div class="rfx-stop-info">
-        <div class="rfx-stop-name">${loc.label || loc.stopCode || "?"} · ${loc.city || "?"}, ${loc.state || "?"}</div>
+        <div class="rfx-stop-name">${stopName}</div>
         ${settings.showStopAddress ? `<div class="rfx-stop-addr">${[loc.line1, loc.line2].filter(Boolean).join(", ")}</div>` : ""}
         <div class="rfx-stop-meta">
           <span class="rfx-stop-time">${fmtTimeShort(checkin, tz)}${checkout ? ` → ${fmtTimeShort(checkout, tz)}` : ""}</span>
@@ -820,6 +873,8 @@ function injectCards() {
       ${chk("showDriverType", "Driver type (Solo/Team)")}
       ${chk("showEquipment", "Equipment (53' Trailer)")}
       ${chk("showStopCount", "Stop count")}
+      ${chk("showStopCode", "Stop code (SCK6, KSCK)")}
+      ${chk("showExtraStopMeta", "Extra stop metadata (Loaded, Asset, Container)")}
     </div>
   </div>`;
 
@@ -922,6 +977,7 @@ function styleAmazonLoadCards() {
       .load-card .rfx-i-badge.preloaded { background: #e6f7f2; color: #067d62; }
       .load-card .rfx-i-badge.live { background: #fef3cd; color: #856404; }
       .load-card .rfx-i-badge.drop { background: #e8f0fe; color: #1a56db; }
+      .load-card .rfx-i-extra { font-size: 11px; padding: 2px 6px; border-radius: 4px; background: #f3f4f6; color: #374151; font-weight: 500; }
       .load-card .rfx-i-leg { font-size: 12px; color: #888; padding: 2px 0 4px 32px; }
       .load-card .rfx-i-footer { display: flex; align-items: center; gap: 10px; flex-wrap: wrap; padding-top: 8px; margin-top: 6px; border-top: 1px solid #f0f0f0; font-size: 13px; color: #565959; }
       .load-card .rfx-i-footer b { color: #0f1111; }
@@ -978,9 +1034,10 @@ function styleAmazonLoadCards() {
     if (!wo) { noDataCount++; return; }
     matchCount++;
     const bState = bookingState.get(woId) || "idle";
+    const displaySig = getDisplaySettingsSignature();
 
     // Skip if already styled with same version
-    if (card.classList.contains("rfx-styled") && card.dataset.rfxVer === String(wo.version) && card.dataset.rfxBookState === bState && card.dataset.rfxFastBook === String(settings.fastBook)) {
+    if (card.classList.contains("rfx-styled") && card.dataset.rfxVer === String(wo.version) && card.dataset.rfxBookState === bState && card.dataset.rfxDisplaySig === displaySig) {
       // Still check if this card needs alert highlighting
       const alert = alertedIds.get(woId);
       if (alert && !card.classList.contains("rfx-new-detected")) {
@@ -993,7 +1050,7 @@ function styleAmazonLoadCards() {
     card.classList.add("rfx-styled");
     card.dataset.rfxVer = String(wo.version);
     card.dataset.rfxBookState = bState;
-    card.dataset.rfxFastBook = String(settings.fastBook);
+    card.dataset.rfxDisplaySig = displaySig;
 
     const ver = wo.version || 1;
     if (ver > 5) card.classList.add("rfx-version-warn");
@@ -1048,16 +1105,31 @@ function styleAmazonLoadCards() {
         const c = lt === "PRELOADED" ? "preloaded" : lt === "LIVE" ? "live" : "drop";
         ltBadge = `<span class="rfx-i-badge ${c}">${lt}</span>`;
       }
+      const stopLoads = getLoadsForStop(wo, s);
+      const loadTypes = uniqTruthy(stopLoads.map(load => load.loadType)).map(titleCaseValue);
+      const assetOwners = uniqTruthy((s.trailerDetails || []).map(t => t.assetOwner));
+      const containerOwners = uniqTruthy((s.stopRequirements || []).map(r => r.containerOwner));
+      const category = s.stopCategory ? titleCaseValue(s.stopCategory) : "";
+      const cityState = `${loc.city || "?"}, ${loc.state || "?"}`;
+      const stopLabel = loc.label || loc.stopCode || "";
+      const stopName = settings.showStopCode && stopLabel ? `${stopLabel} · ${cityState}` : cityState;
+      const extraMeta = settings.showExtraStopMeta ? [
+        ...loadTypes.map(v => `<span class="rfx-i-extra">${v}</span>`),
+        category ? `<span class="rfx-i-extra">${category}</span>` : "",
+        ...assetOwners.map(v => `<span class="rfx-i-extra">Asset ${v}</span>`),
+        ...containerOwners.map(v => `<span class="rfx-i-extra">Container ${v}</span>`),
+      ].filter(Boolean).join("") : "";
 
       stopsHtml += `<div class="rfx-i-stop">
         <div class="rfx-i-stop-dot ${dotCls}">${i + 1}</div>
         <div>
-          <div class="rfx-i-stop-name">${loc.label || loc.stopCode || "?"} · ${loc.city || "?"}, ${loc.state || "?"}</div>
+          <div class="rfx-i-stop-name">${stopName}</div>
           ${settings.showStopAddress ? `<div class="rfx-i-stop-addr">${[loc.line1, loc.line2].filter(Boolean).join(", ")}</div>` : ""}
           <div class="rfx-i-stop-meta">
             <span class="rfx-i-stop-time">${fmtTimeShort(checkin, tz)}${checkout ? ` → ${fmtTimeShort(checkout, tz)}` : ""}</span>
             ${dwell && settings.showDwellTime ? `<span style="font-size:12px;color:#888">${dwell}</span>` : ""}
             ${ltBadge}
+            ${extraMeta}
           </div>
         </div>
       </div>`;
@@ -1247,7 +1319,7 @@ function refreshStyledCards() {
   document.querySelectorAll(".load-card.rfx-styled").forEach(card => {
     delete card.dataset.rfxVer;
     delete card.dataset.rfxBookState;
-    delete card.dataset.rfxFastBook;
+    delete card.dataset.rfxDisplaySig;
   });
   if (!amazonContainer) amazonContainer = document.querySelector(".load-list") || findLoadContainer();
   styleAmazonLoadCards();
