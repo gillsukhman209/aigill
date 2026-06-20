@@ -4,10 +4,43 @@
   let capturedCsrfToken = null;
   let lastSearchPayload = null;
   const _origFetch = window.fetch;
+  const _origXHROpen = XMLHttpRequest.prototype.open;
+  const _origXHRSend = XMLHttpRequest.prototype.send;
+
+  function isSimilarRequest(url) {
+    try {
+      const u = new URL(url, window.location.href);
+      return u.hostname.includes("amazon.") && /(^|\/)similar(\/|$|\?)/i.test(u.pathname + u.search);
+    } catch {
+      return /amazon\..*similar|\/similar(?:\/|\?|$)/i.test(String(url || ""));
+    }
+  }
+
+  XMLHttpRequest.prototype.open = function (method, url, ...rest) {
+    this.__relayFetcherBlockedSimilar = isSimilarRequest(url);
+    this.__relayFetcherBlockedUrl = url;
+    return _origXHROpen.call(this, method, url, ...rest);
+  };
+
+  XMLHttpRequest.prototype.send = function (...args) {
+    if (this.__relayFetcherBlockedSimilar) {
+      console.log("[Relay Interceptor] Blocked similar XHR:", this.__relayFetcherBlockedUrl);
+      try {
+        this.abort();
+      } catch (e) {}
+      return;
+    }
+    return _origXHRSend.apply(this, args);
+  };
 
   window.fetch = async function (...args) {
     const [resource, config] = args;
     const url = typeof resource === "string" ? resource : resource?.url || "";
+
+    if (isSimilarRequest(url)) {
+      console.log("[Relay Interceptor] Blocked similar fetch:", url);
+      return new Response(null, { status: 204, statusText: "Blocked by Relay Fetcher" });
+    }
 
     if (config?.headers) {
       let token = null;
@@ -89,6 +122,7 @@
     }
 
     const allLoads = [];
+    let carrierDetails = null, searchAuditId = null;
     let nextToken = 0, totalResults = 0, pageNum = 0;
 
     try {
@@ -102,6 +136,8 @@
           body: JSON.stringify(payload),
         });
         const data = await response.json();
+        carrierDetails = data.carrierDetails || carrierDetails;
+        searchAuditId = data.searchAuditId || searchAuditId;
         if (data.errorCode) {
           window.dispatchEvent(new CustomEvent("relay-fetcher-result", {
             detail: JSON.stringify({ status: response.status, data }),
@@ -118,7 +154,7 @@
         nextToken = data.nextItemToken;
       }
       window.dispatchEvent(new CustomEvent("relay-fetcher-result", {
-        detail: JSON.stringify({ status: 200, data: { workOpportunities: allLoads, totalResultsSize: totalResults } }),
+        detail: JSON.stringify({ status: 200, data: { workOpportunities: allLoads, totalResultsSize: totalResults, carrierDetails, searchAuditId } }),
       }));
     } catch (err) {
       window.dispatchEvent(new CustomEvent("relay-fetcher-result", {
@@ -201,6 +237,47 @@
       }));
     } catch (err) {
       window.dispatchEvent(new CustomEvent("relay-fetcher-negotiate-result", {
+        detail: JSON.stringify({ woId: req.woId, error: err.message }),
+      }));
+    }
+  });
+
+  // Direct booking request — mirrors Amazon's confirm booking endpoint.
+  window.addEventListener("relay-fetcher-book-direct", async (e) => {
+    const req = JSON.parse(e.detail);
+    let csrfToken = capturedCsrfToken;
+    if (!csrfToken) {
+      const cookies = document.cookie.split(";");
+      for (const c of cookies) {
+        const t = c.trim(); const eq = t.indexOf("=");
+        if (eq === -1) continue;
+        const n = t.substring(0, eq), v = t.substring(eq + 1);
+        if (n === "x-csrf-token" || n === "csrf-token" || n === "anti-csrftoken-a2z") {
+          csrfToken = decodeURIComponent(v); break;
+        }
+      }
+    }
+
+    try {
+      const response = await _origFetch(req.url, {
+        method: "POST",
+        headers: { "Content-Type": "application/json", ...(csrfToken ? { "x-csrf-token": csrfToken } : {}) },
+        credentials: "include",
+        body: JSON.stringify(req.payload),
+      });
+
+      let data = null;
+      const text = await response.text();
+      if (text) {
+        try { data = JSON.parse(text); }
+        catch { data = { raw: text }; }
+      }
+
+      window.dispatchEvent(new CustomEvent("relay-fetcher-book-direct-result", {
+        detail: JSON.stringify({ woId: req.woId, status: response.status, ok: response.ok, data }),
+      }));
+    } catch (err) {
+      window.dispatchEvent(new CustomEvent("relay-fetcher-book-direct-result", {
         detail: JSON.stringify({ woId: req.woId, error: err.message }),
       }));
     }

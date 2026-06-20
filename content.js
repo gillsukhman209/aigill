@@ -23,6 +23,8 @@ let aiModeActive = true;
 let amazonContainer = null;
 let ourHost = null;
 let shadowRoot = null;
+let carrierDetails = null;
+let currentSearchAuditId = null;
 
 // Settings (persisted to localStorage)
 const SETTINGS_KEY = "rfx_settings";
@@ -768,7 +770,7 @@ function injectCards() {
   else if (alertedLoads.length > 0) { dotClass = "amber"; statusText = "PAUSED — New Load Detected"; }
 
   const fastBookWarning = settings.fastBook
-    ? `<span class="rfx-fastbook-warn">⚠ FAST BOOK ON — Clicking BOOK will auto-confirm!</span>` : "";
+    ? `<span class="rfx-fastbook-warn">⚠ FAST BOOK ON — Clicking FASTBOOK will auto-confirm!</span>` : "";
 
   const statusBar = `<div class="rfx-status-bar">
     <div class="rfx-dot ${dotClass}"></div>
@@ -857,6 +859,7 @@ function injectCards() {
       else if (key === "autoBook" && cb.checked) settings.fastBook = false;
       saveSettings();
       injectCards();
+      refreshStyledCards();
     });
   });
 
@@ -873,6 +876,7 @@ function injectCards() {
       const maxVal = shadowRoot.getElementById("rfx-s-pollMax-val");
       if (minVal) minVal.textContent = settings.pollMinSeconds + "s";
       if (maxVal) maxVal.textContent = settings.pollMaxSeconds + "s";
+      refreshStyledCards();
     });
   });
 
@@ -973,9 +977,10 @@ function styleAmazonLoadCards() {
     const wo = loadMap.get(woId);
     if (!wo) { noDataCount++; return; }
     matchCount++;
+    const bState = bookingState.get(woId) || "idle";
 
     // Skip if already styled with same version
-    if (card.classList.contains("rfx-styled") && card.dataset.rfxVer === String(wo.version)) {
+    if (card.classList.contains("rfx-styled") && card.dataset.rfxVer === String(wo.version) && card.dataset.rfxBookState === bState && card.dataset.rfxFastBook === String(settings.fastBook)) {
       // Still check if this card needs alert highlighting
       const alert = alertedIds.get(woId);
       if (alert && !card.classList.contains("rfx-new-detected")) {
@@ -987,6 +992,8 @@ function styleAmazonLoadCards() {
     // Mark as styled
     card.classList.add("rfx-styled");
     card.dataset.rfxVer = String(wo.version);
+    card.dataset.rfxBookState = bState;
+    card.dataset.rfxFastBook = String(settings.fastBook);
 
     const ver = wo.version || 1;
     if (ver > 5) card.classList.add("rfx-version-warn");
@@ -1079,8 +1086,14 @@ function styleAmazonLoadCards() {
     if (settings.showEquipment) footer += ` <span>53' Trailer</span>`;
     if (settings.showStopCount) footer += ` <span>${wo.stopCount || stops.length} stops</span>`;
 
-    // BOOK button — clicks the load-card to open Amazon's panel
-    const bookBtn = settings.showBookButton ? `<button class="rfx-i-book" data-wo-id="${woId}">BOOK</button>` : "";
+    // BOOK/FASTBOOK button — FASTBOOK sends Amazon's confirm-book request directly.
+    const bookBtn = settings.showBookButton ? (
+      bState === "confirmed"
+        ? `<button class="rfx-i-book" style="background:#067d62;color:#fff;cursor:default" disabled>Booked</button>`
+        : bState === "pending"
+          ? `<button class="rfx-i-book" style="background:#b8860b;color:#fff;cursor:default" disabled>Booking...</button>`
+          : `<button class="rfx-i-book" data-wo-id="${woId}">${settings.fastBook ? (bState === "failed" ? "RETRY FASTBOOK" : "FASTBOOK") : "BOOK"}</button>`
+    ) : "";
 
     // Alert badge if this is a new/changed load
     let alertBadge = "";
@@ -1106,13 +1119,17 @@ function styleAmazonLoadCards() {
 
     card.appendChild(inject);
 
-    // Bind BOOK button — clicks the load-card itself to open Amazon's panel
+    // Bind BOOK button. Only Fast Book sends Amazon's confirm-book request directly.
     const btn = inject.querySelector(".rfx-i-book");
     if (btn) {
       btn.addEventListener("click", (e) => {
         e.stopPropagation();
         e.preventDefault();
-        bookLoadDirect(woId, card);
+        if (settings.fastBook) {
+          bookLoadDirectFromSearch(woId);
+        } else {
+          bookLoadDirect(woId, card);
+        }
       });
     }
   });
@@ -1224,6 +1241,16 @@ function removeOurCards() {
 
   if (ourHost) { ourHost.remove(); ourHost = null; shadowRoot = null; }
   amazonContainer = null;
+}
+
+function refreshStyledCards() {
+  document.querySelectorAll(".load-card.rfx-styled").forEach(card => {
+    delete card.dataset.rfxVer;
+    delete card.dataset.rfxBookState;
+    delete card.dataset.rfxFastBook;
+  });
+  if (!amazonContainer) amazonContainer = document.querySelector(".load-list") || findLoadContainer();
+  styleAmazonLoadCards();
 }
 
 function toggleAiMode() {
@@ -1369,6 +1396,8 @@ window.addEventListener("relay-fetcher-poll-result", (e) => {
     }
 
     const loads = data?.workOpportunities || [];
+    carrierDetails = data?.carrierDetails || carrierDetails;
+    currentSearchAuditId = data?.searchAuditId || currentSearchAuditId;
     console.log(`[Bot:Poll] Response: status=${status}, loads=${loads.length}, totalResults=${data?.totalResultsSize}`);
 
     // Run detection even on 0 loads (handles first-poll seeding and disappearances)
@@ -1843,6 +1872,84 @@ function showToast(text) {
   setTimeout(() => toast.remove(), 5000);
 }
 
+function getLoadSearchIndex(woId) {
+  const index = allLoads.findIndex(w => w.id === woId);
+  return index >= 0 ? index : 0;
+}
+
+function buildBookingPayload(wo) {
+  return {
+    isCallFromRA: false,
+    totalCost: {
+      value: wo.payout?.value || 0,
+      unit: wo.payout?.unit || "USD",
+    },
+    isCarrierEligibleForOneDayPayment: !!carrierDetails?.isCarrierEligibleForOneDayPayment,
+    searchURL: "",
+    auditContextMap: JSON.stringify({
+      rlbChannel: "EXACT_MATCH",
+      searchResultIndex: String(getLoadSearchIndex(wo.id)),
+      userAgent: navigator.userAgent,
+    }),
+  };
+}
+
+function bookLoadDirectFromSearch(woId) {
+  const wo = allLoads.find(w => w.id === woId);
+  if (!wo) {
+    console.warn("[DirectBook] Could not find load in search results:", woId);
+    showToast("Direct book: load data not found. Refresh search first.");
+    return;
+  }
+
+  const missing = [];
+  if (!wo.id) missing.push("id");
+  if (wo.version == null) missing.push("version");
+  if (wo.majorVersion == null) missing.push("majorVersion");
+  if (wo.workOpportunityOptionId == null) missing.push("workOpportunityOptionId");
+  if (!wo.payout?.value) missing.push("payout");
+  if (missing.length) {
+    console.warn("[DirectBook] Missing required fields:", missing, wo);
+    showToast(`Direct book: missing ${missing.join(", ")}`);
+    return;
+  }
+
+  const url = `https://relay.amazon.com/api/loadboard/${wo.id}/${wo.version}/option/${wo.workOpportunityOptionId}/majorVersion/${wo.majorVersion}`;
+  const payload = buildBookingPayload(wo);
+
+  console.log("[DirectBook] Sending direct booking request:", { url, payload, wo });
+  bookingState.set(woId, "pending");
+  if (aiModeActive) injectCards();
+  showToast(`Booking ${fmt$(wo.payout.value)} load directly...`);
+
+  window.dispatchEvent(new CustomEvent("relay-fetcher-book-direct", {
+    detail: JSON.stringify({ woId, url, payload }),
+  }));
+}
+
+window.addEventListener("relay-fetcher-book-direct-result", (e) => {
+  try {
+    const { woId, status, ok, data, error } = JSON.parse(e.detail);
+    if (error || !ok) {
+      console.error("[DirectBook] Failed:", { woId, status, error, data });
+      bookingState.set(woId, "failed");
+      showToast(`Direct book failed${status ? ` (${status})` : ""}`);
+      if (aiModeActive) injectCards();
+      return;
+    }
+
+    console.log("[DirectBook] Booked:", { woId, status, data });
+    bookingState.set(woId, "confirmed");
+    alertedLoads = alertedLoads.filter(a => a.wo.id !== woId);
+    seenLoads.delete(woId);
+    playBookedSound();
+    showToast("Load booked successfully!");
+    if (aiModeActive) injectCards();
+  } catch (err) {
+    console.error("[DirectBook] Result handler error:", err);
+  }
+});
+
 async function forceAmazonRefresh() {
   console.log("[Booker] Forcing Amazon UI refresh...");
 
@@ -1907,11 +2014,17 @@ async function bookLoadDirect(woId, loadCard) {
   await sleep(200);
 
   // Click the load card to open Amazon's detail panel
-  // The hidden elements still have React handlers attached — clicking works even with display:none
   console.log("[Booker] Clicking load card to open panel...");
   const clickTarget = loadCard.querySelector(".wo-tag") || loadCard.querySelector("div[id]") || loadCard;
   clickTarget.click();
   await sleep(500);
+
+  // Re-hide Amazon's content (React may have re-rendered and restored it)
+  for (const child of loadCard.children) {
+    if (!child.classList.contains("rfx-injected")) {
+      child.style.display = "none";
+    }
+  }
 
   // Find the Book button in the panel
   console.log("[Booker] Searching for Book button...");
@@ -2138,6 +2251,8 @@ function fetchAllLoads() {
       const { data, error } = JSON.parse(e.detail);
       if (btn) btn.textContent = "Fetch All";
       if (error || data?.errorCode) { resolve(); return; }
+      carrierDetails = data?.carrierDetails || carrierDetails;
+      currentSearchAuditId = data?.searchAuditId || currentSearchAuditId;
       allLoads = data?.workOpportunities || [];
       // Populate seenLoads map so detection works correctly from here
       for (const wo of allLoads) {
@@ -2180,6 +2295,8 @@ window.addEventListener("relay-fetcher-auto-update", (e) => {
   try {
     const { data } = JSON.parse(e.detail);
     if (data?.workOpportunities) {
+      carrierDetails = data?.carrierDetails || carrierDetails;
+      currentSearchAuditId = data?.searchAuditId || currentSearchAuditId;
       console.log(`[Bot:AutoUpdate] Amazon page search returned ${data.workOpportunities.length} loads. botRunning=${botRunning}`);
       // Deduplicate — keep highest payout per ID
       const dedupMap = new Map();
