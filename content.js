@@ -41,15 +41,15 @@ const DEFAULT_SETTINGS = {
   showStopAddress: true,
   showLegDistance: true,
   showDwellTime: true,
+  showCheckoutTime: false,
   showLoadTypeBadge: true,
-  showBookButton: true,
+  showPostedAge: true,
   showDriverType: true,
   showEquipment: true,
   showStopCount: true,
   showStopCode: true,
   showExtraStopMeta: true,
   fastBook: false,
-  showScanAnimation: true,
   autoBook: false,
   minPriceIncrease: 0,
 };
@@ -103,6 +103,33 @@ function fmtTimeShort(iso, tz) {
   if (!iso) return "";
   try { return new Date(iso).toLocaleTimeString("en-US", { hour: "numeric", minute: "2-digit", timeZone: tz || "America/Los_Angeles" }); } catch { return ""; }
 }
+function fmtStopDateTime(iso, tz) {
+  if (!iso) return "";
+  try {
+    const d = new Date(iso);
+    const date = d.toLocaleDateString("en-US", { month: "numeric", day: "numeric", timeZone: tz || "America/Los_Angeles" });
+    const time = d.toLocaleTimeString("en-US", { hour: "numeric", minute: "2-digit", timeZone: tz || "America/Los_Angeles" }).toLowerCase();
+    return `${date} ${time}`;
+  } catch { return ""; }
+}
+function fmtStopTimeWindow(checkin, checkout, tz) {
+  const start = fmtStopDateTime(checkin, tz);
+  if (!start) return "";
+  if (!settings.showCheckoutTime || !checkout) return start;
+  const end = fmtStopDateTime(checkout, tz);
+  return end ? `${start} → ${end}` : start;
+}
+function fmtAge(iso) {
+  if (!iso) return "";
+  const ms = Date.now() - new Date(iso).getTime();
+  if (!Number.isFinite(ms) || ms < 0) return "";
+  const min = Math.floor(ms / 60000);
+  if (min < 1) return "just posted";
+  if (min < 60) return `posted ${min}m ago`;
+  const hr = Math.floor(min / 60);
+  if (hr < 24) return `posted ${hr}h ${min % 60}m ago`;
+  return `posted ${Math.floor(hr / 24)}d ago`;
+}
 function haversine(lat1, lon1, lat2, lon2) {
   const R = 3959, r = Math.PI / 180;
   const dLat = (lat2 - lat1) * r, dLon = (lon2 - lon1) * r;
@@ -135,6 +162,31 @@ function getLoadsForStop(wo, stop) {
   return matches;
 }
 
+function isSameStop(a, b) {
+  const aLoc = a.location || {};
+  const bLoc = b.location || {};
+  if ((a.stopSequenceNumber || 0) !== (b.stopSequenceNumber || 0)) return false;
+  if (aLoc.stopCode && bLoc.stopCode) return aLoc.stopCode === bLoc.stopCode;
+  if (aLoc.label && bLoc.label) return aLoc.label === bLoc.label;
+  return [aLoc.line1, aLoc.city, aLoc.state].join("|") === [bLoc.line1, bLoc.city, bLoc.state].join("|");
+}
+
+function getPickupLoadTypesForStop(wo, stop) {
+  const types = [];
+  for (const load of wo.loads || []) {
+    if ((load.stops || []).some(s => s.stopType === "PICKUP" && isSameStop(s, stop))) {
+      types.push(load.loadType);
+    }
+  }
+  return uniqTruthy(types).map(titleCaseValue);
+}
+
+function hasPreloadedStop(wo) {
+  return (wo.loads || []).some(load =>
+    (load.stops || []).some(stop => stop.loadingType === "PRELOADED")
+  );
+}
+
 function uniqTruthy(values) {
   return [...new Set(values.filter(Boolean))];
 }
@@ -159,8 +211,9 @@ function getDisplaySettingsSignature() {
     settings.showStopAddress,
     settings.showLegDistance,
     settings.showDwellTime,
+    settings.showCheckoutTime,
     settings.showLoadTypeBadge,
-    settings.showBookButton,
+    settings.showPostedAge,
     settings.showDriverType,
     settings.showEquipment,
     settings.showStopCount,
@@ -371,58 +424,6 @@ const CSS = `
 }
 @keyframes rfxAutoBookPulse { 0%,100% { background: #8b0000; } 50% { background: #cc0000; } }
 
-/* Scanning overlay */
-.rfx-scanning-overlay {
-  position: relative; padding: 80px 20px; text-align: center;
-  background: radial-gradient(ellipse at center, #f0faf7 0%, #f7f7f7 70%);
-  border: 1px solid #d5d9d9; border-radius: 12px; margin-bottom: 14px; overflow: hidden;
-}
-.rfx-scanning-overlay::before {
-  content: ''; position: absolute; top: 0; left: -100%; width: 100%; height: 100%;
-  background: linear-gradient(90deg, transparent 0%, rgba(6,125,98,0.06) 40%, rgba(6,125,98,0.12) 50%, rgba(6,125,98,0.06) 60%, transparent 100%);
-  animation: rfxScanSweep 2.5s ease-in-out infinite;
-}
-@keyframes rfxScanSweep { 0% { left: -100%; } 100% { left: 100%; } }
-.rfx-scanning-radar {
-  position: relative; width: 80px; height: 80px; margin: 0 auto 20px;
-}
-.rfx-scanning-ring {
-  position: absolute; top: 50%; left: 50%; transform: translate(-50%, -50%);
-  border: 2px solid rgba(6,125,98,0.15); border-radius: 50%;
-  animation: rfxRadarPing 2s ease-out infinite;
-}
-.rfx-scanning-ring:nth-child(1) { width: 20px; height: 20px; animation-delay: 0s; }
-.rfx-scanning-ring:nth-child(2) { width: 40px; height: 40px; animation-delay: 0.4s; }
-.rfx-scanning-ring:nth-child(3) { width: 60px; height: 60px; animation-delay: 0.8s; }
-.rfx-scanning-ring:nth-child(4) { width: 80px; height: 80px; animation-delay: 1.2s; }
-@keyframes rfxRadarPing {
-  0% { border-color: rgba(6,125,98,0.4); transform: translate(-50%,-50%) scale(0.8); }
-  100% { border-color: rgba(6,125,98,0); transform: translate(-50%,-50%) scale(1.3); }
-}
-.rfx-scanning-dot {
-  position: absolute; top: 50%; left: 50%; width: 12px; height: 12px;
-  background: #067d62; border-radius: 50%; transform: translate(-50%, -50%);
-  box-shadow: 0 0 12px rgba(6,125,98,0.5);
-  animation: rfxDotPulse 1.5s ease-in-out infinite;
-}
-@keyframes rfxDotPulse { 0%,100% { box-shadow: 0 0 8px rgba(6,125,98,0.3); } 50% { box-shadow: 0 0 20px rgba(6,125,98,0.7); } }
-.rfx-scanning-text { font-size: 18px; font-weight: 700; color: #067d62; letter-spacing: 0.5px; }
-.rfx-scanning-sub { font-size: 13px; color: #888; margin-top: 8px; }
-.rfx-scanning-dots::after { content: ''; animation: rfxDots 1.5s steps(4,end) infinite; }
-@keyframes rfxDots { 0% { content: ''; } 25% { content: '.'; } 50% { content: '..'; } 75% { content: '...'; } }
-
-/* Alert section */
-.rfx-alert-section {
-  border: 2px solid #ff9900; border-radius: 10px; padding: 12px; margin-bottom: 12px;
-  background: linear-gradient(135deg, #fffbf0 0%, #fff5e0 100%);
-  box-shadow: 0 0 15px rgba(255,153,0,0.25);
-  animation: rfxGlow 2s infinite alternate;
-}
-@keyframes rfxGlow { 0% { box-shadow: 0 0 10px rgba(255,153,0,0.2); } 100% { box-shadow: 0 0 25px rgba(255,153,0,0.45); } }
-.rfx-alert-title {
-  font-size: 15px; font-weight: 700; color: #b8860b; margin-bottom: 8px;
-  display: flex; align-items: center; gap: 6px;
-}
 .rfx-alert-card {
   background: #fff; border: 2px solid #ff9900; border-radius: 8px;
   padding: 12px 16px; margin-bottom: 8px;
@@ -458,10 +459,8 @@ const CSS = `
   transition: box-shadow 0.15s, border-color 0.15s, opacity 0.5s;
 }
 .rfx-card:hover { box-shadow: 0 2px 8px rgba(0,0,0,0.1); border-color: #b0b0b0; }
-.rfx-card.version-warn { border-left: 4px solid #cc3333; }
-.rfx-card.new-load { animation: rfxFlash 2s ease-out; }
+.rfx-card.new-load { background: #fff5e0; border-color: #ff9900; box-shadow: 0 0 12px rgba(255,153,0,0.25); }
 .rfx-card.gone { opacity: 0.4; }
-@keyframes rfxFlash { 0% { background: #e6f7e6; } 100% { background: #fff; } }
 
 .rfx-body { display: flex; gap: 24px; }
 .rfx-left { flex: 1; min-width: 0; }
@@ -492,6 +491,8 @@ const CSS = `
 .rfx-stop-conn { width: 2px; flex: 1; background: #d5d9d9; min-height: 14px; }
 .rfx-stop-info { flex: 1; padding-bottom: 8px; }
 .rfx-stop-name { font-size: 14px; font-weight: 600; color: #0f1111; line-height: 1.4; }
+.rfx-stop-head { display: flex; align-items: baseline; justify-content: space-between; gap: 10px; }
+.rfx-stop-datetime { font-size: 13px; color: #565959; white-space: nowrap; font-weight: 500; display: inline-flex; align-items: baseline; gap: 8px; flex-wrap: wrap; }
 .rfx-stop-addr { font-size: 12px; color: #888; margin-top: 2px; }
 .rfx-stop-meta { display: flex; gap: 8px; align-items: center; margin-top: 4px; flex-wrap: wrap; }
 .rfx-stop-time { font-size: 13px; color: #565959; }
@@ -613,7 +614,6 @@ const CSS = `
   .rfx-toolbar { gap: 4px; padding: 8px 0; }
   .rfx-sort-btn { padding: 6px 10px; font-size: 12px; min-height: 36px; }
   .rfx-count { font-size: 12px; }
-  .rfx-alert-section { padding: 10px; margin: 0 -4px 12px -4px; }
   .rfx-stop-name { font-size: 14px; }
   .rfx-stop-time { font-size: 13px; }
   .rfx-badge { font-size: 11px; padding: 2px 8px; }
@@ -621,7 +621,6 @@ const CSS = `
   .rfx-tag { font-size: 13px; }
   .rfx-score-row { margin-bottom: 8px; }
   .rfx-version { font-size: 12px; }
-  .rfx-scanning-overlay { padding: 50px 16px; }
   .rfx-settings-panel { padding: 12px; }
   .rfx-setting-row label { font-size: 14px; }
   .rfx-setting-row input[type="checkbox"] { width: 20px; height: 20px; }
@@ -655,7 +654,6 @@ function renderCard(wo, extraClass, changeBadge) {
   const bState = bookingState.get(wo.id) || "idle";
   const cls = [
     "rfx-card",
-    ver > 5 ? "version-warn" : "",
     goneLoads.has(wo.id) ? "gone" : "",
     bState === "pending" ? "booking-pending" : "",
     extraClass || "",
@@ -669,6 +667,11 @@ function renderCard(wo, extraClass, changeBadge) {
 
   let badgeHtml = changeBadge ? `<span class="rfx-change-badge ${changeBadge.cls}">${changeBadge.text}</span>` : "";
   if (goneLoads.has(wo.id)) badgeHtml = `<span class="rfx-change-badge badge-gone">GONE</span>`;
+  const firstStopDetails = [
+    settings.showDriverType ? driver : "",
+    settings.showEquipment ? "53' Trailer" : "",
+    settings.showLoadTypeBadge && hasPreloadedStop(wo) ? "Preloaded" : "",
+  ].filter(Boolean).map(v => `<span class="rfx-tag">${v}</span>`).join("");
 
   let stopsHtml = "";
   for (let i = 0; i < stops.length; i++) {
@@ -679,15 +682,10 @@ function renderCard(wo, extraClass, changeBadge) {
     const tz = loc.timeZone || firstTz;
     let dwell = "";
     if (checkin && checkout) { const d = new Date(checkout) - new Date(checkin); if (d > 0) dwell = fmtDur(d); }
-    const lt = s.loadingType || s.unloadingType || "";
-    let ltBadge = "";
-    if (lt) {
-      const c = lt === "PRELOADED" ? "preloaded" : lt === "LIVE" ? "live" : "drop";
-      ltBadge = `<span class="rfx-badge ${c}">${lt}</span>`;
-    }
     const cityState = `${loc.city || "?"}, ${loc.state || "?"}`;
     const stopLabel = loc.label || loc.stopCode || "";
     const stopName = settings.showStopCode && stopLabel ? `${stopLabel} · ${cityState}` : cityState;
+    const stopDateTime = fmtStopTimeWindow(checkin, checkout, tz);
     const conn = i < stops.length - 1;
     stopsHtml += `<div class="rfx-stop">
       <div class="rfx-stop-line">
@@ -695,12 +693,13 @@ function renderCard(wo, extraClass, changeBadge) {
         ${conn ? '<div class="rfx-stop-conn"></div>' : ""}
       </div>
       <div class="rfx-stop-info">
-        <div class="rfx-stop-name">${stopName}</div>
+        <div class="rfx-stop-head">
+          <div class="rfx-stop-name">${stopName}</div>
+          ${stopDateTime ? `<span class="rfx-stop-datetime">${stopDateTime}${i === 0 && firstStopDetails ? ` ${firstStopDetails}` : ""}</span>` : ""}
+        </div>
         ${settings.showStopAddress ? `<div class="rfx-stop-addr">${[loc.line1, loc.line2].filter(Boolean).join(", ")}</div>` : ""}
         <div class="rfx-stop-meta">
-          <span class="rfx-stop-time">${fmtTimeShort(checkin, tz)}${checkout ? ` → ${fmtTimeShort(checkout, tz)}` : ""}</span>
           ${dwell && settings.showDwellTime ? `<span class="rfx-stop-dwell">${dwell}</span>` : ""}
-          ${settings.showLoadTypeBadge ? ltBadge : ""}
         </div>
       </div>
     </div>`;
@@ -724,9 +723,9 @@ function renderCard(wo, extraClass, changeBadge) {
   statsHtml += vBadge;
 
   // Build footer tags conditionally
-  let footerTags = `<span class="rfx-tag"><b>${fmtTime(wo.firstPickupTime, firstTz)}</b></span>`;
-  if (settings.showDriverType) footerTags += `<span class="rfx-tag">${driver}</span>`;
-  if (settings.showEquipment) footerTags += `<span class="rfx-tag">53' Trailer</span>`;
+  let footerTags = "";
+  const postedAge = fmtAge(wo.createdAtTime);
+  if (settings.showPostedAge && postedAge) footerTags += `<span class="rfx-tag">${postedAge}</span>`;
   if (settings.showStopCount) footerTags += `<span class="rfx-tag">${wo.stopCount || stops.length} stops</span>`;
 
   return `<div class="${cls}" data-id="${wo.id}">
@@ -739,15 +738,15 @@ function renderCard(wo, extraClass, changeBadge) {
           <span class="rfx-score-tag" style="background:${scoreBg(score)};color:${sc}">${score >= 70 ? "Great" : score >= 40 ? "OK" : "Low"}</span>
         </div>` : ""}
         <div class="rfx-stops">${stopsHtml}</div>
-        <div class="rfx-footer">${footerTags}</div>
+        ${footerTags ? `<div class="rfx-footer">${footerTags}</div>` : ""}
       </div>
       <div class="rfx-right">
         <div class="rfx-stats-group">${statsHtml}</div>
-        ${settings.showBookButton ? (
+        ${
           bState === "confirmed"
             ? `<button class="rfx-book-btn" style="background:#067d62;color:#fff;cursor:default" disabled>✅ Booked</button>`
             : `<button class="rfx-book-btn" data-wo-id="${wo.id}">BOOK</button>`
-        ) : ""}
+        }
       </div>
     </div>
   </div>`;
@@ -845,7 +844,6 @@ function injectCards() {
       ${chk("hideAmazonLoads", "Hide Amazon's original load list when AI mode is on")}
       ${chk("fastBook", "Fast Book — auto-confirm booking (skips manual confirmation)")}
       ${chk("autoBook", "Auto-Book — automatically book new loads when detected (clicks Book only, not Confirm)")}
-      ${chk("showScanAnimation", "Show scanning animation when bot is running")}
     </div>
     <div class="rfx-settings-section">
       <div class="rfx-settings-section-title">Bot Speed</div>
@@ -859,35 +857,30 @@ function injectCards() {
     </div>
     <div class="rfx-settings-section">
       <div class="rfx-settings-section-title">Card Display</div>
+      ${chk("showDistance", "Distance")}
+      ${chk("showStopAddress", "Street addresses")}
+      ${chk("showDwellTime", "Time at stop")}
+      ${chk("showCheckoutTime", "Checkout time")}
+      ${chk("showLoadTypeBadge", "Preloaded badge")}
+      ${chk("showDriverType", "Driver type (Solo/Team)")}
+      ${chk("showEquipment", "Equipment (53' Trailer)")}
+      ${chk("showPostedAge", "Posted age")}
+      ${chk("showDuration", "Duration")}
+      ${chk("showExtraStopMeta", "Loaded/empty badge")}
       ${chk("showScoreBar", "Score bar")}
       ${chk("showPerHr", "$/hr")}
       ${chk("showPerMi", "$/mi")}
-      ${chk("showDistance", "Distance")}
-      ${chk("showDuration", "Duration")}
       ${chk("showVersionBadge", "Version badge (v14 ⚠)")}
-      ${chk("showStopAddress", "Street addresses")}
       ${chk("showLegDistance", "Leg distances between stops")}
-      ${chk("showDwellTime", "Time at stop")}
-      ${chk("showLoadTypeBadge", "Load type badge (PRELOADED, LIVE, DROP)")}
-      ${chk("showBookButton", "BOOK button")}
-      ${chk("showDriverType", "Driver type (Solo/Team)")}
-      ${chk("showEquipment", "Equipment (53' Trailer)")}
       ${chk("showStopCount", "Stop count")}
       ${chk("showStopCode", "Stop code (SCK6, KSCK)")}
-      ${chk("showExtraStopMeta", "Extra stop metadata (Loaded, Asset, Container)")}
     </div>
   </div>`;
 
   const autoBookWarning = settings.autoBook
     ? `<div class="rfx-autobook-warn">⚠ AUTO-BOOK ARMED — New loads will be booked automatically ⚠</div>` : "";
 
-  // Alert banner (text only — the actual cards are Amazon's styled cards below)
-  let alertBanner = "";
-  if (alertedLoads.length > 0) {
-    alertBanner = `<div class="rfx-alert-section"><div class="rfx-alert-title">⚠ ${alertedLoads.length} NEW LOAD${alertedLoads.length > 1 ? "S" : ""} DETECTED</div></div>`;
-  }
-
-  shadowRoot.innerHTML = `<style>${CSS}</style>${statusBar}${autoBookWarning}${settingsPanel}${alertBanner}`;
+  shadowRoot.innerHTML = `<style>${CSS}</style>${statusBar}${autoBookWarning}${settingsPanel}`;
 
   // Bind control panel listeners
   const startBtn = shadowRoot.getElementById("rfx-start-btn");
@@ -969,7 +962,9 @@ function styleAmazonLoadCards() {
       .load-card .rfx-i-stop-dot { width: 22px; height: 22px; border-radius: 50%; display: flex; align-items: center; justify-content: center; font-size: 11px; font-weight: 700; color: #fff; flex-shrink: 0; }
       .load-card .rfx-i-stop-dot.pickup { background: #2563eb; }
       .load-card .rfx-i-stop-dot.dropoff { background: #7c3aed; }
+      .load-card .rfx-i-stop-head { display: flex; align-items: baseline; justify-content: space-between; gap: 10px; }
       .load-card .rfx-i-stop-name { font-size: 14px; font-weight: 600; color: #0f1111; }
+      .load-card .rfx-i-stop-datetime { font-size: 13px; color: #565959; white-space: nowrap; font-weight: 500; display: inline-flex; align-items: baseline; gap: 8px; flex-wrap: wrap; }
       .load-card .rfx-i-stop-addr { font-size: 12px; color: #888; }
       .load-card .rfx-i-stop-meta { display: flex; gap: 6px; align-items: center; margin-top: 2px; flex-wrap: wrap; }
       .load-card .rfx-i-stop-time { font-size: 13px; color: #565959; }
@@ -988,9 +983,7 @@ function styleAmazonLoadCards() {
       .load-card .rfx-i-book:hover { background: #e88b00; }
       .load-card.rfx-styled { border: 1px solid #d5d9d9; border-radius: 10px; margin-bottom: 10px; overflow: hidden; }
       .load-card.rfx-styled .wo-tag { display: none; }
-      .load-card.rfx-version-warn { border-left: 3px solid #cc3333; }
-      .load-card.rfx-new-detected { border: 2px solid #ff9900 !important; box-shadow: 0 0 12px rgba(255,153,0,0.3); animation: rfxNewFlash 3s ease-out; }
-      @keyframes rfxNewFlash { 0%,50% { background: #fff5e0; } 100% { background: #fff; } }
+      .load-card.rfx-new-detected { background: #fff5e0 !important; border: 2px solid #ff9900 !important; box-shadow: 0 0 12px rgba(255,153,0,0.3); }
       @media (max-width: 640px) {
         .load-card .rfx-card-body { flex-direction: column; gap: 6px; }
         .load-card .rfx-card-right { flex-direction: row; align-items: center; gap: 10px; min-width: 0; text-align: left; flex-wrap: wrap; border-top: 1px solid #f0f0f0; padding-top: 8px; }
@@ -1053,7 +1046,6 @@ function styleAmazonLoadCards() {
     card.dataset.rfxDisplaySig = displaySig;
 
     const ver = wo.version || 1;
-    if (ver > 5) card.classList.add("rfx-version-warn");
 
     // Check if this is an alerted (new/changed) load
     const alert = alertedIds.get(woId);
@@ -1088,6 +1080,11 @@ function styleAmazonLoadCards() {
       if (ver > 3) vBadge = `<span class="rfx-i-version bad">v${ver} ⚠</span>`;
       else if (ver > 1) vBadge = `<span class="rfx-i-version ok">v${ver}</span>`;
     }
+    const firstStopDetails = [
+      settings.showDriverType ? driver : "",
+      settings.showEquipment ? "53' Trailer" : "",
+      settings.showLoadTypeBadge && hasPreloadedStop(wo) ? "Preloaded" : "",
+    ].filter(Boolean).map(v => `<span>${v}</span>`).join("");
 
     // Stops HTML
     let stopsHtml = "";
@@ -1099,36 +1096,25 @@ function styleAmazonLoadCards() {
       const tz = loc.timeZone || firstTz;
       let dwell = "";
       if (checkin && checkout) { const d = new Date(checkout) - new Date(checkin); if (d > 0) dwell = fmtDur(d); }
-      const lt = s.loadingType || s.unloadingType || "";
-      let ltBadge = "";
-      if (lt && settings.showLoadTypeBadge) {
-        const c = lt === "PRELOADED" ? "preloaded" : lt === "LIVE" ? "live" : "drop";
-        ltBadge = `<span class="rfx-i-badge ${c}">${lt}</span>`;
-      }
-      const stopLoads = getLoadsForStop(wo, s);
-      const loadTypes = uniqTruthy(stopLoads.map(load => load.loadType)).map(titleCaseValue);
-      const assetOwners = uniqTruthy((s.trailerDetails || []).map(t => t.assetOwner));
-      const containerOwners = uniqTruthy((s.stopRequirements || []).map(r => r.containerOwner));
-      const category = s.stopCategory ? titleCaseValue(s.stopCategory) : "";
+      const loadTypes = getPickupLoadTypesForStop(wo, s);
       const cityState = `${loc.city || "?"}, ${loc.state || "?"}`;
       const stopLabel = loc.label || loc.stopCode || "";
       const stopName = settings.showStopCode && stopLabel ? `${stopLabel} · ${cityState}` : cityState;
+      const stopDateTime = fmtStopTimeWindow(checkin, checkout, tz);
       const extraMeta = settings.showExtraStopMeta ? [
         ...loadTypes.map(v => `<span class="rfx-i-extra">${v}</span>`),
-        category ? `<span class="rfx-i-extra">${category}</span>` : "",
-        ...assetOwners.map(v => `<span class="rfx-i-extra">Asset ${v}</span>`),
-        ...containerOwners.map(v => `<span class="rfx-i-extra">Container ${v}</span>`),
       ].filter(Boolean).join("") : "";
 
       stopsHtml += `<div class="rfx-i-stop">
         <div class="rfx-i-stop-dot ${dotCls}">${i + 1}</div>
         <div>
-          <div class="rfx-i-stop-name">${stopName}</div>
+          <div class="rfx-i-stop-head">
+            <div class="rfx-i-stop-name">${stopName}</div>
+            ${stopDateTime ? `<span class="rfx-i-stop-datetime">${stopDateTime}${i === 0 && firstStopDetails ? ` ${firstStopDetails}` : ""}</span>` : ""}
+          </div>
           ${settings.showStopAddress ? `<div class="rfx-i-stop-addr">${[loc.line1, loc.line2].filter(Boolean).join(", ")}</div>` : ""}
           <div class="rfx-i-stop-meta">
-            <span class="rfx-i-stop-time">${fmtTimeShort(checkin, tz)}${checkout ? ` → ${fmtTimeShort(checkout, tz)}` : ""}</span>
             ${dwell && settings.showDwellTime ? `<span style="font-size:12px;color:#888">${dwell}</span>` : ""}
-            ${ltBadge}
             ${extraMeta}
           </div>
         </div>
@@ -1153,19 +1139,19 @@ function styleAmazonLoadCards() {
     statsHtml += vBadge;
 
     // Footer
-    let footer = `<b>${fmtTime(wo.firstPickupTime, firstTz)}</b>`;
-    if (settings.showDriverType) footer += ` <span>${driver}</span>`;
-    if (settings.showEquipment) footer += ` <span>53' Trailer</span>`;
+    let footer = "";
+    const postedAge = fmtAge(wo.createdAtTime);
+    if (settings.showPostedAge && postedAge) footer += `<span>${postedAge}</span>`;
     if (settings.showStopCount) footer += ` <span>${wo.stopCount || stops.length} stops</span>`;
 
     // BOOK/FASTBOOK button — FASTBOOK sends Amazon's confirm-book request directly.
-    const bookBtn = settings.showBookButton ? (
+    const bookBtn = (
       bState === "confirmed"
         ? `<button class="rfx-i-book" style="background:#067d62;color:#fff;cursor:default" disabled>Booked</button>`
         : bState === "pending"
           ? `<button class="rfx-i-book" style="background:#b8860b;color:#fff;cursor:default" disabled>Booking...</button>`
           : `<button class="rfx-i-book" data-wo-id="${woId}">${settings.fastBook ? (bState === "failed" ? "RETRY FASTBOOK" : "FASTBOOK") : "BOOK"}</button>`
-    ) : "";
+    );
 
     // Alert badge if this is a new/changed load
     let alertBadge = "";
@@ -1184,7 +1170,7 @@ function styleAmazonLoadCards() {
         <span class="rfx-i-score-tag" style="background:${scoreBg(score)};color:${sc}">${score >= 70 ? "Great" : score >= 40 ? "OK" : "Low"}</span>
       </div>` : ""}
       <div class="rfx-card-body">
-        <div class="rfx-card-left">${stopsHtml}<div class="rfx-i-footer">${footer}</div></div>
+        <div class="rfx-card-left">${stopsHtml}${footer ? `<div class="rfx-i-footer">${footer}</div>` : ""}</div>
         <div class="rfx-card-right"><div>${statsHtml}</div>${bookBtn}</div>
       </div>
     </div>`;
@@ -1297,7 +1283,7 @@ function removeOurCards() {
 
   // Restore Amazon's load cards to original state
   document.querySelectorAll(".load-card.rfx-styled").forEach(card => {
-    card.classList.remove("rfx-styled", "rfx-version-warn", "rfx-new-detected");
+    card.classList.remove("rfx-styled", "rfx-new-detected");
     delete card.dataset.rfxVer;
     const inject = card.querySelector(".rfx-injected");
     if (inject) inject.remove();
@@ -1503,11 +1489,8 @@ window.addEventListener("relay-fetcher-poll-result", (e) => {
         if (botTimer) { clearTimeout(botTimer); botTimer = null; }
         alertedLoads.push(...alerts);
         playAlert();
-        // Refresh Amazon's DOM so new load cards appear
-        forceAmazonRefresh().then(() => {
-          amazonContainer = document.querySelector(".load-list") || findLoadContainer();
-          if (aiModeActive) styleAmazonLoadCards();
-        });
+        amazonContainer = document.querySelector(".load-list") || findLoadContainer();
+        if (aiModeActive) styleAmazonLoadCards();
       }
     } else {
       console.log(`[Bot:Poll] No alerts this cycle.`);
@@ -2027,41 +2010,15 @@ async function forceAmazonRefresh() {
 
   let clicked = false;
 
-  // Strategy 1: Find the button next to "Next Refresh" text
-  const allEls = document.querySelectorAll("p, span, div");
-  for (const el of allEls) {
-    if (/next refresh/i.test(el.textContent) && el.textContent.length < 30) {
-      // The refresh button is a sibling or nearby button
-      const parent = el.closest("div") || el.parentElement;
-      const btn = parent?.querySelector("button") || parent?.parentElement?.querySelector("button");
-      if (btn) {
-        btn.click(); clicked = true;
-        console.log("[Booker] Clicked refresh button near 'Next Refresh' text");
-        break;
-      }
-    }
-  }
-
-  // Strategy 2: Find button with popover-offset attribute (from the HTML structure)
-  if (!clicked) {
-    const btns = document.querySelectorAll("button[popover-offset], button[mdn-popover-offset]");
-    for (const btn of btns) {
-      if (btn.closest("#rfx-host")) continue;
-      // The refresh button is near the bottom of the page, has an SVG icon
-      if (btn.querySelector("svg, span[style*='display: none']")) {
-        btn.click(); clicked = true;
-        console.log("[Booker] Clicked refresh button via popover-offset");
-        break;
-      }
-    }
-  }
-
-  // Strategy 3: Generic selectors
-  if (!clicked) {
-    const selectors = ["[aria-label='Refresh']", "[title='Refresh']"];
-    for (const sel of selectors) {
-      const btn = document.querySelector(sel);
-      if (btn) { btn.click(); clicked = true; console.log("[Booker] Clicked refresh via:", sel); break; }
+  const candidates = document.querySelectorAll("button[aria-label], button[title]");
+  for (const btn of candidates) {
+    if (btn.closest("#rfx-host")) continue;
+    const label = `${btn.getAttribute("aria-label") || ""} ${btn.getAttribute("title") || ""}`.trim();
+    if (/^refresh$/i.test(label) || /auto.?refresh/i.test(label)) {
+      btn.click();
+      clicked = true;
+      console.log("[Booker] Clicked refresh via accessible label:", label);
+      break;
     }
   }
 
