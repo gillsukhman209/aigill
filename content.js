@@ -223,6 +223,14 @@ function getDisplaySettingsSignature() {
   ].map(Boolean).join("");
 }
 
+function formatPriceDelta(delta) {
+  if (delta == null || Math.abs(delta) < 0.01) return "";
+  const sign = delta > 0 ? "+" : "-";
+  const abs = Math.abs(delta);
+  const amount = Number.isInteger(abs) ? String(abs) : abs.toFixed(2).replace(/\.00$/, "");
+  return `${sign}${amount}`;
+}
+
 // ============================================================
 // SCORING (0-100)
 // ============================================================
@@ -343,7 +351,7 @@ function detectChanges(newLoads) {
           badgeClass = "badge-updated";
         }
         console.log(`[Bot:Detect] ★ CHANGED load: ${shortId}... ${badge} (pay:${prev.payout.toFixed(2)}→${newPay.toFixed(2)} ver:${prev.version}→${newVer} time:${prev.pickupTime !== newPickup ? "changed" : "same"})`);
-        alerts.push({ wo, badge, badgeClass });
+        alerts.push({ wo, badge, badgeClass, priceDelta: payChanged ? priceIncrease : null });
         seenLoads.set(wo.id, { version: newVer, payout: newPay, pickupTime: newPickup });
       } else {
         console.log(`[Bot:Detect] — SAME load: ${shortId}... (no change)`);
@@ -466,6 +474,9 @@ const CSS = `
 .rfx-left { flex: 1; min-width: 0; }
 .rfx-right { flex-shrink: 0; display: flex; flex-direction: column; align-items: flex-end; justify-content: space-between; min-width: 140px; text-align: right; gap: 10px; }
 .rfx-payout { font-size: 26px; font-weight: 700; color: #067d62; line-height: 1.2; }
+.rfx-price-delta { font-size: 15px; font-weight: 800; line-height: 1; margin-bottom: 3px; }
+.rfx-price-delta.up { color: #067d62; }
+.rfx-price-delta.down { color: #cc3333; }
 .rfx-stat { font-size: 14px; color: #565959; margin-top: 3px; }
 .rfx-stat b { color: #0f1111; font-weight: 600; }
 .rfx-stats-group { display: flex; flex-direction: column; align-items: flex-end; gap: 3px; }
@@ -665,7 +676,9 @@ function renderCard(wo, extraClass, changeBadge) {
     else if (ver > 1) vBadge = `<span class="rfx-version ok">v${ver}</span>`;
   }
 
-  let badgeHtml = changeBadge ? `<span class="rfx-change-badge ${changeBadge.cls}">${changeBadge.text}</span>` : "";
+  const priceDeltaText = changeBadge?.priceDelta ? formatPriceDelta(changeBadge.priceDelta) : "";
+  const priceDeltaClass = changeBadge?.priceDelta > 0 ? "up" : "down";
+  let badgeHtml = changeBadge && !priceDeltaText ? `<span class="rfx-change-badge ${changeBadge.cls}">${changeBadge.text}</span>` : "";
   if (goneLoads.has(wo.id)) badgeHtml = `<span class="rfx-change-badge badge-gone">GONE</span>`;
   const firstStopDetails = [
     settings.showDriverType ? driver : "",
@@ -713,7 +726,7 @@ function renderCard(wo, extraClass, changeBadge) {
   }
 
   // Build stats conditionally
-  let statsHtml = `<span class="rfx-payout">${fmt$(pay)}</span>`;
+  let statsHtml = `${priceDeltaText ? `<span class="rfx-price-delta ${priceDeltaClass}">${priceDeltaText}</span>` : ""}<span class="rfx-payout">${fmt$(pay)}</span>`;
   if (settings.showPerHr) statsHtml += `<span class="rfx-stat"><b>${fmt$(perHr)}</b>/hr</span>`;
   if (settings.showPerMi) statsHtml += `<span class="rfx-stat"><b>${fmt$(perMi)}</b>/mi</span>`;
   const distDur = [];
@@ -881,6 +894,7 @@ function injectCards() {
     ? `<div class="rfx-autobook-warn">⚠ AUTO-BOOK ARMED — New loads will be booked automatically ⚠</div>` : "";
 
   shadowRoot.innerHTML = `<style>${CSS}</style>${statusBar}${autoBookWarning}${settingsPanel}`;
+  syncChatVisibility();
 
   // Bind control panel listeners
   const startBtn = shadowRoot.getElementById("rfx-start-btn");
@@ -951,6 +965,9 @@ function styleAmazonLoadCards() {
       .load-card .rfx-card-left { flex: 1; min-width: 0; }
       .load-card .rfx-card-right { flex-shrink: 0; display: flex; flex-direction: column; align-items: flex-end; justify-content: space-between; min-width: 130px; text-align: right; gap: 8px; }
       .load-card .rfx-i-payout { font-size: 22px; font-weight: 700; color: #067d62; line-height: 1.2; }
+      .load-card .rfx-i-price-delta { font-size: 15px; font-weight: 800; line-height: 1; margin-bottom: 3px; }
+      .load-card .rfx-i-price-delta.up { color: #067d62; }
+      .load-card .rfx-i-price-delta.down { color: #cc3333; }
       .load-card .rfx-i-stat { font-size: 13px; color: #565959; margin-top: 2px; }
       .load-card .rfx-i-stat b { color: #0f1111; font-weight: 600; }
       .load-card .rfx-i-score-row { display: flex; align-items: center; gap: 8px; margin-bottom: 8px; }
@@ -1021,10 +1038,19 @@ function styleAmazonLoadCards() {
       if (parent?.id && parent.id.length > 20 && parent.id.includes("-")) woId = parent.id;
     }
 
-    if (!woId) { noIdCount++; return; }
+    if (!woId) {
+      card.classList.add("rfx-no-match");
+      noIdCount++;
+      return;
+    }
 
     const wo = loadMap.get(woId);
-    if (!wo) { noDataCount++; return; }
+    if (!wo) {
+      card.classList.add("rfx-no-match");
+      noDataCount++;
+      return;
+    }
+    card.classList.remove("rfx-no-match");
     matchCount++;
     const bState = bookingState.get(woId) || "idle";
     const displaySig = getDisplaySettingsSignature();
@@ -1129,7 +1155,9 @@ function styleAmazonLoadCards() {
     }
 
     // Stats
-    let statsHtml = `<span class="rfx-i-payout">${fmt$(pay)}</span>`;
+    const priceDeltaText = alert?.priceDelta ? formatPriceDelta(alert.priceDelta) : "";
+    const priceDeltaClass = alert?.priceDelta > 0 ? "up" : "down";
+    let statsHtml = `${priceDeltaText ? `<div class="rfx-i-price-delta ${priceDeltaClass}">${priceDeltaText}</div>` : ""}<span class="rfx-i-payout">${fmt$(pay)}</span>`;
     if (settings.showPerHr) statsHtml += `<div class="rfx-i-stat"><b>${fmt$(perHr)}</b>/hr</div>`;
     if (settings.showPerMi) statsHtml += `<div class="rfx-i-stat"><b>${fmt$(perMi)}</b>/mi</div>`;
     const distDur = [];
@@ -1144,18 +1172,20 @@ function styleAmazonLoadCards() {
     if (settings.showPostedAge && postedAge) footer += `<span>${postedAge}</span>`;
     if (settings.showStopCount) footer += ` <span>${wo.stopCount || stops.length} stops</span>`;
 
-    // BOOK/FASTBOOK button — FASTBOOK sends Amazon's confirm-book request directly.
+    const fastBookForThisLoad = settings.fastBook && !!alert;
+
+    // BOOK/FASTBOOK button — FASTBOOK only applies to newly detected/changed loads.
     const bookBtn = (
       bState === "confirmed"
         ? `<button class="rfx-i-book" style="background:#067d62;color:#fff;cursor:default" disabled>Booked</button>`
         : bState === "pending"
           ? `<button class="rfx-i-book" style="background:#b8860b;color:#fff;cursor:default" disabled>Booking...</button>`
-          : `<button class="rfx-i-book" data-wo-id="${woId}">${settings.fastBook ? (bState === "failed" ? "RETRY FASTBOOK" : "FASTBOOK") : "BOOK"}</button>`
+          : `<button class="rfx-i-book" data-wo-id="${woId}">${fastBookForThisLoad ? (bState === "failed" ? "RETRY FASTBOOK" : "FASTBOOK") : "BOOK"}</button>`
     );
 
     // Alert badge if this is a new/changed load
     let alertBadge = "";
-    if (alert) {
+    if (alert && !priceDeltaText) {
       const badgeCls = alert.badgeClass || "badge-new";
       alertBadge = `<span class="rfx-i-badge" style="background:${badgeCls === "badge-new" || badgeCls === "badge-price-up" ? "#067d62" : badgeCls === "badge-price-down" ? "#cc3333" : badgeCls === "badge-time" ? "#b8860b" : "#565959"};color:#fff;margin-bottom:8px;display:inline-block;">${alert.badge}</span>`;
     }
@@ -1183,7 +1213,7 @@ function styleAmazonLoadCards() {
       btn.addEventListener("click", (e) => {
         e.stopPropagation();
         e.preventDefault();
-        if (settings.fastBook) {
+        if (fastBookForThisLoad) {
           bookLoadDirectFromSearch(woId);
         } else {
           bookLoadDirect(woId, card);
@@ -1259,16 +1289,12 @@ function applyHideAmazonLoads() {
     // Hide the truck illustration (it's an img or an svg inside a div near "no matches")
     document.querySelectorAll("img, [role='img']").forEach(el => {
       if (el.closest("#rfx-host")) return;
+      if (el.closest(".chat-box-position")) return;
+      if (el.closest("button, [role='button'], a")) return;
       const src = el.src || el.getAttribute("src") || "";
       const alt = el.alt || el.getAttribute("alt") || "";
       if (/truck|no.?match|empty/i.test(src) || /truck|no.?match|empty/i.test(alt)) {
         el.style.display = "none";
-      }
-      // Also hide the blue circle/dots decoration
-      if (el.parentElement && el.parentElement.children.length <= 2) {
-        const parent = el.parentElement;
-        const parentText = parent.textContent?.trim() || "";
-        if (parentText.length < 5) parent.style.display = "none"; // image-only container
       }
     });
     // Hide pagination only — keep the summary panel (it contains the filter button + tags)
@@ -1649,47 +1675,113 @@ let chatWoVersion = null;
 let chatWoMajorVersion = null;
 let chatOriginalPay = null;
 
+function getChatInput() {
+  const inputs = Array.from(document.querySelectorAll(".chat-box-position textarea, .chat-box-position input"));
+  return inputs.find(el =>
+    /type your message/i.test(el.getAttribute("placeholder") || "") &&
+    !!(el.offsetWidth || el.offsetHeight || el.getClientRects().length)
+  );
+}
+
+function isVisibleElement(el) {
+  return !!el && !!(el.offsetWidth || el.offsetHeight || el.getClientRects().length);
+}
+
+function getChatContainer() {
+  const containers = Array.from(document.querySelectorAll(".chat-box-position"));
+  return containers.find(container =>
+    isVisibleElement(container) &&
+    (
+      container.querySelector("#ra-input, textarea, input") ||
+      /relay assistant/i.test(container.textContent || "")
+    )
+  ) || null;
+}
+
+function getChatInsertTarget() {
+  const input = getChatInput();
+  if (!input) return null;
+  const inputRect = input.getBoundingClientRect();
+  let node = input.parentElement;
+  while (node && node !== document.body) {
+    const rect = node.getBoundingClientRect();
+    const isComposerSized = rect.height > 0 && rect.height <= 120 && Math.abs(rect.bottom - inputRect.bottom) < 80;
+    if (isComposerSized && node.querySelector("textarea, input") && node.querySelector("button")) return node;
+    if (node.classList?.contains("chat-box-position")) break;
+    node = node.parentElement;
+  }
+  return input.parentElement;
+}
+
+function isAmazonChatOpen() {
+  return !!getChatContainer();
+}
+
+function syncChatVisibility() {
+  if (ourHost) ourHost.style.display = isAmazonChatOpen() ? "none" : "";
+  restoreAmazonChatControls();
+}
+
+function restoreAmazonChatControls() {
+  document.querySelectorAll(".chat-box-position .message-header button > span").forEach(el => {
+    if (el.style.display === "none") el.style.display = "";
+  });
+}
+
 function setupChatObserver() {
   if (chatObserver) return;
   chatObserver = new MutationObserver(() => {
-    const modal = document.querySelector(".bot-header, [class*='bot-header']");
+    const modal = getChatContainer();
+    syncChatVisibility();
     if (modal && !document.getElementById("rfx-chat-neg-container")) {
       injectChatNegButton();
     }
     // Clean up if modal closed
-    if (!document.querySelector("[class*='bot-header']") && document.getElementById("rfx-chat-neg-container")) {
+    if (!modal && document.getElementById("rfx-chat-neg-container")) {
       const el = document.getElementById("rfx-chat-neg-container");
       if (el) el.remove();
       chatWoId = null;
     }
   });
   chatObserver.observe(document.body, { childList: true, subtree: true });
+  syncChatVisibility();
+  if (getChatContainer() && !document.getElementById("rfx-chat-neg-container")) {
+    injectChatNegButton();
+  }
 }
 
 function injectChatNegButton() {
-  const header = document.querySelector(".bot-header, [class*='bot-header']");
-  if (!header || document.getElementById("rfx-chat-neg-container")) return;
+  const chat = getChatContainer();
+  const insertTarget = getChatInsertTarget();
+  if (!chat || !insertTarget || !chat.contains(insertTarget) || document.getElementById("rfx-chat-neg-container")) return;
 
   const container = document.createElement("div");
   container.id = "rfx-chat-neg-container";
-  container.style.cssText = "padding: 8px 12px; background: #f0f7ff; border-bottom: 1px solid #bfdbfe; font-family: -apple-system, sans-serif;";
+  container.style.cssText = [
+    "padding: 8px 0",
+    "margin: 0 0 8px 0",
+    "background: transparent",
+    "font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif",
+    "position: relative",
+    "z-index: 1",
+  ].join(";");
   container.innerHTML = `
     <div style="display: flex; gap: 8px;">
       <button id="rfx-chat-neg-btn" style="
-        padding: 8px 20px; font-size: 14px; font-weight: 600;
+        padding: 8px 14px; font-size: 13px; font-weight: 600;
         background: #2563eb; color: #fff; border: none; border-radius: 8px;
-        cursor: pointer; font-family: inherit; flex: 1;
+        cursor: pointer; font-family: inherit; flex: 1; min-height: 36px;
       ">Auto-Negotiate</button>
       <button id="rfx-chat-neg-stop" style="
-        padding: 8px 16px; font-size: 14px; font-weight: 600;
+        padding: 8px 12px; font-size: 13px; font-weight: 600;
         background: #cc3333; color: #fff; border: none; border-radius: 8px;
-        cursor: pointer; font-family: inherit; display: none;
+        cursor: pointer; font-family: inherit; display: none; min-height: 36px;
       ">Stop</button>
     </div>
     <div id="rfx-chat-neg-status" style="margin-top: 6px; font-size: 13px; display: none;"></div>
   `;
 
-  header.after(container);
+  insertTarget.parentElement?.insertBefore(container, insertTarget);
 
   container.querySelector("#rfx-chat-neg-btn").addEventListener("click", () => {
     ensureAudioCtx();
@@ -2377,7 +2469,7 @@ const observer = new MutationObserver((mutations) => {
     // Only re-style if there are NEW unstyled load cards in the DOM
     const loadList = document.querySelector(".load-list");
     if (loadList && allLoads.length > 0) {
-      const unstyled = loadList.querySelectorAll(".load-card:not(.rfx-styled)");
+      const unstyled = loadList.querySelectorAll(".load-card:not(.rfx-styled):not(.rfx-no-match)");
       if (unstyled.length > 0) {
         console.log(`[Observer] ${unstyled.length} unstyled cards found, re-styling`);
         amazonContainer = loadList;
