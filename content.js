@@ -838,11 +838,11 @@ function injectCards() {
     ? `<span class="rfx-fastbook-warn">⚠ FAST BOOK ON — Clicking FASTBOOK will auto-confirm!</span>` : "";
 
   const statusBar = `<div class="rfx-status-bar">
+    <button class="rfx-bot-btn rfx-start-btn" id="rfx-start-btn" ${botRunning ? "disabled" : ""}>Start</button>
+    <button class="rfx-bot-btn rfx-stop-btn" id="rfx-stop-btn" ${!botRunning ? "disabled" : ""}>Stop</button>
     <div class="rfx-dot ${dotClass}"></div>
     <span class="rfx-status-text"><b>${statusText}</b></span>
     <span class="rfx-last-refresh" id="rfx-last-refresh"></span>
-    <button class="rfx-bot-btn rfx-start-btn" id="rfx-start-btn" ${botRunning ? "disabled" : ""}>Start</button>
-    <button class="rfx-bot-btn rfx-stop-btn" id="rfx-stop-btn" ${!botRunning ? "disabled" : ""}>Stop</button>
     <button class="rfx-gear-btn" id="rfx-gear-btn" title="Settings">⚙</button>
     <button class="rfx-bot-btn" id="rfx-toggle-amazon" style="background:#232f3e;color:#fff;font-size:12px;padding:5px 12px;">Amazon View</button>
     ${fastBookWarning}
