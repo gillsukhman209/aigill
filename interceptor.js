@@ -188,18 +188,47 @@
     }
 
     try {
-      const payload = { ...basePayload, nextItemToken: 0, resultSize: 50, _isRelayFetcher: true };
-      const response = await _origFetch("https://relay.amazon.com/api/loadboard/search", {
-        method: "POST",
-        headers: { "Content-Type": "application/json", ...(csrfToken ? { "x-csrf-token": csrfToken } : {}) },
-        credentials: "include",
-        body: JSON.stringify(payload),
-      });
-      const data = await response.json();
+      const allLoads = [];
+      let carrierDetails = null, searchAuditId = null;
+      let nextToken = 0, totalResults = 0, lastStatus = 200;
+
+      while (true) {
+        const payload = { ...basePayload, nextItemToken: nextToken, resultSize: 50, _isRelayFetcher: true };
+        const response = await _origFetch("https://relay.amazon.com/api/loadboard/search", {
+          method: "POST",
+          headers: { "Content-Type": "application/json", ...(csrfToken ? { "x-csrf-token": csrfToken } : {}) },
+          credentials: "include",
+          body: JSON.stringify(payload),
+        });
+        lastStatus = response.status;
+        const data = await response.json();
+        if (data.errorCode) {
+          window.dispatchEvent(new CustomEvent("relay-fetcher-poll-result", {
+            detail: JSON.stringify({ status: response.status, data }),
+          }));
+          return;
+        }
+
+        carrierDetails = data.carrierDetails || carrierDetails;
+        searchAuditId = data.searchAuditId || searchAuditId;
+        const loads = data.workOpportunities || [];
+        allLoads.push(...loads);
+        totalResults = data.totalResultsSize || totalResults;
+        if (data.nextItemToken == null || loads.length === 0 || allLoads.length >= totalResults) break;
+        nextToken = data.nextItemToken;
+      }
+
+      const data = {
+        workOpportunities: allLoads,
+        totalResultsSize: totalResults || allLoads.length,
+        carrierDetails,
+        searchAuditId,
+      };
+
       // Capture token from our own request
       if (csrfToken && !capturedCsrfToken) capturedCsrfToken = csrfToken;
       window.dispatchEvent(new CustomEvent("relay-fetcher-poll-result", {
-        detail: JSON.stringify({ status: response.status, data }),
+        detail: JSON.stringify({ status: lastStatus, data }),
       }));
     } catch (err) {
       window.dispatchEvent(new CustomEvent("relay-fetcher-poll-result", {
@@ -245,6 +274,7 @@
   // Direct booking request — mirrors Amazon's confirm booking endpoint.
   window.addEventListener("relay-fetcher-book-direct", async (e) => {
     const req = JSON.parse(e.detail);
+    console.log("[Relay Interceptor] Direct booking fetch:", req.url);
     let csrfToken = capturedCsrfToken;
     if (!csrfToken) {
       const cookies = document.cookie.split(";");
