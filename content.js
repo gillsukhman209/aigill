@@ -57,7 +57,6 @@ const DEFAULT_SETTINGS = {
   autoBook: false,
   autoResume: false,
   minPriceIncrease: 0,
-  postedAgeMaxMinutes: 0,
   showRoundTrips: true,
   roundTripConnectionRadiusMiles: 35,
   roundTripReturnRadiusMiles: 35,
@@ -168,12 +167,6 @@ function getPostedAgeMinutes(wo) {
   if (!Number.isFinite(ms) || ms < 0) return null;
   return Math.floor(ms / 60000);
 }
-function passesPostedAgeFilter(wo) {
-  const max = Number(settings.postedAgeMaxMinutes) || 0;
-  if (max <= 0) return true;
-  const age = getPostedAgeMinutes(wo);
-  return age != null && age <= max;
-}
 function haversine(lat1, lon1, lat2, lon2) {
   const R = 3959, r = Math.PI / 180;
   const dLat = (lat2 - lat1) * r, dLon = (lon2 - lon1) * r;
@@ -273,7 +266,7 @@ function buildRoundTripMatches(loads, alertMap = new Map()) {
   const minPerMile = Number(settings.roundTripMinPerMile) || 0;
 
   const infos = (loads || [])
-    .filter(wo => wo?.id && passesPostedAgeFilter(wo))
+    .filter(wo => wo?.id)
     .map(getLoadEndpointInfo)
     .filter(info => info.first && info.last && hasCoords(info.first) && hasCoords(info.last) && info.startMs != null && info.endMs != null);
 
@@ -802,6 +795,9 @@ function sortLoads(loads) {
       bv = (b.totalDistance?.value || 0) > 0 ? (b.payout?.value || 0) / (b.totalDistance?.value || 0) : 0;
     } else if (currentSort === "distance") {
       av = a.totalDistance?.value || 0; bv = b.totalDistance?.value || 0;
+    } else if (currentSort === "postedAge") {
+      av = new Date(a.createdAtTime || 0).getTime();
+      bv = new Date(b.createdAtTime || 0).getTime();
     } else if (currentSort === "time") {
       av = new Date(a.firstPickupTime || getAllStops(a)[0]?.actions?.find(x => x.type === "CHECKIN")?.plannedTime || 0).getTime();
       bv = new Date(b.firstPickupTime || getAllStops(b)[0]?.actions?.find(x => x.type === "CHECKIN")?.plannedTime || 0).getTime();
@@ -1586,11 +1582,11 @@ function renderCustomLoadBoard() {
   const alerted = [];
   for (const alert of alertedLoads) {
     const wo = loadMap.get(alert.wo.id) || alert.wo;
-    if (wo && passesPostedAgeFilter(wo) && passesCustomExcludedCities(wo) && passesAmazonOnlyFacilities(wo) && !isIgnoredLoad(wo.id)) alerted.push({ wo, alert });
+    if (wo && passesCustomExcludedCities(wo) && passesAmazonOnlyFacilities(wo) && !isIgnoredLoad(wo.id)) alerted.push({ wo, alert });
   }
 
   const regularLoads = sortLoads(
-    Array.from(loadMap.values()).filter(wo => !alertMap.has(wo.id) && passesPostedAgeFilter(wo) && passesCustomExcludedCities(wo) && passesAmazonOnlyFacilities(wo) && !isIgnoredLoad(wo.id))
+    Array.from(loadMap.values()).filter(wo => !alertMap.has(wo.id) && passesCustomExcludedCities(wo) && passesAmazonOnlyFacilities(wo) && !isIgnoredLoad(wo.id))
   );
   const hiddenByCity = Array.from(loadMap.values()).filter(wo => !passesCustomExcludedCities(wo)).length;
   const hiddenByFacility = Array.from(loadMap.values()).filter(wo => passesCustomExcludedCities(wo) && !passesAmazonOnlyFacilities(wo)).length;
@@ -1601,16 +1597,6 @@ function renderCustomLoadBoard() {
     const arrow = currentSort === key ? (currentSortDir === "asc" ? " ↑" : " ↓") : "";
     return `<button class="rfx-sort-btn${active}" data-sort="${key}">${label}${arrow}</button>`;
   };
-  const postedAgeOptions = [
-    [0, "All posted"],
-    [15, "Posted ≤ 15m"],
-    [30, "Posted ≤ 30m"],
-    [60, "Posted ≤ 1h"],
-    [120, "Posted ≤ 2h"],
-    [240, "Posted ≤ 4h"],
-    [1440, "Posted ≤ 24h"],
-  ].map(([value, label]) => `<option value="${value}" ${Number(settings.postedAgeMaxMinutes) === value ? "selected" : ""}>${label}</option>`).join("");
-
   const cards = [
     ...alerted.map(({ wo, alert }) => renderCard(wo, "new-load", {
       text: alert.badge,
@@ -1619,7 +1605,7 @@ function renderCustomLoadBoard() {
     })),
     ...regularLoads.map(wo => renderCard(wo, "", null)),
   ].join("");
-  const boardLoads = Array.from(loadMap.values()).filter(wo => passesPostedAgeFilter(wo) && passesCustomExcludedCities(wo) && passesAmazonOnlyFacilities(wo) && !isIgnoredLoad(wo.id));
+  const boardLoads = Array.from(loadMap.values()).filter(wo => passesCustomExcludedCities(wo) && passesAmazonOnlyFacilities(wo) && !isIgnoredLoad(wo.id));
   const roundTripsHtml = renderRoundTripMatches(boardLoads, alertMap);
 
   return `<div class="rfx-load-board">
@@ -1629,7 +1615,7 @@ function renderCustomLoadBoard() {
       ${sortBtn("perMile", "$/mi")}
       ${sortBtn("distance", "Distance")}
       ${sortBtn("time", "Start time")}
-      <label class="rfx-toolbar-filter">Posted age <select id="rfx-posted-age-filter">${postedAgeOptions}</select></label>
+      ${sortBtn("postedAge", "Posted age")}
       <span class="rfx-count">${alerted.length + regularLoads.length} of ${loadMap.size} loads${alerted.length ? ` · ${alerted.length} new` : ""}${hiddenByCity + hiddenByFacility + hiddenByLoad ? ` · ${hiddenByCity + hiddenByFacility + hiddenByLoad} hidden` : ""}</span>
     </div>
     ${roundTripsHtml}
@@ -1926,15 +1912,6 @@ function injectCards() {
 	      showToast("Hidden loads cleared");
 	    });
 	  }
-
-	  const postedAgeFilter = shadowRoot.getElementById("rfx-posted-age-filter");
-  if (postedAgeFilter) {
-    postedAgeFilter.addEventListener("change", () => {
-      settings.postedAgeMaxMinutes = parseInt(postedAgeFilter.value, 10) || 0;
-      saveSettings();
-      injectCards();
-    });
-  }
 
   shadowRoot.querySelectorAll(".rfx-sort-btn").forEach(btn => {
     btn.addEventListener("click", () => {
