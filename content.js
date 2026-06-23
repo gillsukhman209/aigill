@@ -51,6 +51,8 @@ const DEFAULT_SETTINGS = {
   showStopCount: true,
   showStopCode: true,
   showExtraStopMeta: true,
+  showTimingRisk: true,
+  amazonOnlyFacilities: false,
   fastBook: false,
   autoBook: false,
   autoResume: false,
@@ -378,10 +380,68 @@ function getPickupLoadTypesForStop(wo, stop) {
   return uniqTruthy(types).map(titleCaseValue);
 }
 
+function isAmazonFacilityStop(stop) {
+  const loc = stop?.location || {};
+  if (String(loc.domicile || "").trim()) return true;
+  const code = String(loc.stopCode || loc.label || "").trim();
+  if (!code) return false;
+  if (code.includes("_")) return false;
+  return /^[A-Z0-9]{3,6}$/.test(code);
+}
+
+function isPrivateLoad(wo) {
+  const stops = getAllStops(wo);
+  return stops.some(stop => !isAmazonFacilityStop(stop));
+}
+
+function passesAmazonOnlyFacilities(wo) {
+  return !settings.amazonOnlyFacilities || !isPrivateLoad(wo);
+}
+
+function getLoadDisplayId(wo) {
+  return wo?.id ? String(wo.id).slice(0, 8) : "";
+}
+
 function hasPreloadedStop(wo) {
   return (wo.loads || []).some(load =>
     (load.stops || []).some(stop => stop.loadingType === "PRELOADED")
   );
+}
+
+function getTimingRisk(wo) {
+  const distance = Number(wo?.totalDistance?.value) || 0;
+  const durationMs = Number(wo?.totalDuration) || 0;
+  if (!distance || !durationMs) return null;
+
+  const stops = getAllStops(wo);
+  const stopCount = Math.max(stops.length || wo?.stopCount || 2, 2);
+  const hasLive = (wo.loads || []).some(load =>
+    (load.stops || []).some(stop => stop.loadingType === "LIVE")
+  );
+  const hasDrop = (wo.loads || []).some(load =>
+    (load.stops || []).some(stop => stop.loadingType === "DROP" || stop.loadingType === "PRELOADED")
+  );
+
+  const mph = distance <= 25 ? 22 : distance <= 100 ? 35 : distance <= 300 ? 48 : 52;
+  const driveHours = distance / mph;
+  const stopMinutes = stopCount * (hasLive ? 45 : hasDrop ? 25 : 35);
+  const bufferMinutes = distance <= 25 ? 30 : distance <= 100 ? 45 : 75;
+  const expectedHours = Math.max(1, driveHours + (stopMinutes + bufferMinutes) / 60);
+  const actualHours = durationMs / 3600000;
+  const ratio = actualHours / expectedHours;
+
+  const severeShort = distance <= 25 && actualHours >= 6 && ratio >= 2.5;
+  const severe = ratio >= 2.75 && actualHours - expectedHours >= 2;
+  const elevated = ratio >= 2.1 && actualHours - expectedHours >= 1.5;
+  if (!severeShort && !severe && !elevated) return null;
+
+  return {
+    level: severeShort || severe ? "bad" : "warn",
+    label: `${fmtDur(durationMs)} for ${distance.toFixed(distance < 10 ? 1 : 0)} mi`,
+    detail: `${ratio.toFixed(1)}x expected`,
+    ratio,
+    expectedMs: expectedHours * 3600000,
+  };
 }
 
 function uniqTruthy(values) {
@@ -543,7 +603,7 @@ function passesCustomExcludedCities(wo) {
 }
 
 function filterCustomExcludedLoads(loads) {
-  return (loads || []).filter(wo => passesCustomExcludedCities(wo) && !isIgnoredLoad(wo?.id));
+  return (loads || []).filter(wo => passesCustomExcludedCities(wo) && passesAmazonOnlyFacilities(wo) && !isIgnoredLoad(wo?.id));
 }
 
 function getIgnoredLoadIds() {
@@ -608,11 +668,13 @@ function getDisplaySettingsSignature() {
     settings.showCheckoutTime,
     settings.showLoadTypeBadge,
     settings.showPostedAge,
+    settings.showTimingRisk,
     settings.showDriverType,
     settings.showEquipment,
     settings.showStopCount,
     settings.showStopCode,
     settings.showExtraStopMeta,
+    settings.amazonOnlyFacilities,
     settings.fastBook,
   ].map(Boolean).join("");
 }
@@ -1062,6 +1124,7 @@ const CSS = `
 .rfx-stop-meta { display: flex; gap: 8px; align-items: center; margin-top: 4px; flex-wrap: wrap; }
 .rfx-stop-time { font-size: 13px; color: #565959; }
 .rfx-stop-dwell { font-size: 12px; color: #888; }
+.rfx-extra { font-size: 11px; padding: 3px 7px; border-radius: 5px; background: #f3f4f6; color: #374151; font-weight: 600; }
 .rfx-badge { font-size: 11px; padding: 2px 8px; border-radius: 4px; font-weight: 600; text-transform: uppercase; }
 .rfx-badge.preloaded { background: #e6f7f2; color: #067d62; }
 .rfx-badge.live { background: #fef3cd; color: #856404; }
@@ -1071,6 +1134,14 @@ const CSS = `
 .rfx-footer { display: flex; align-items: center; gap: 12px; flex-wrap: wrap; padding-top: 10px; margin-top: 6px; border-top: 1px solid #f0f0f0; }
 .rfx-tag { font-size: 13px; color: #565959; }
 .rfx-tag b { color: #0f1111; }
+.rfx-private-tag { background: #fff3cd; border: 1px solid #f3d27a; color: #8a5a00; padding: 3px 8px; border-radius: 6px; font-weight: 800; }
+.rfx-load-id { font-family: ui-monospace, SFMono-Regular, Menlo, monospace; color: #565959; }
+.rfx-timing-risk {
+  display: inline-flex; align-items: center; gap: 4px; border-radius: 6px;
+  padding: 4px 8px; font-size: 12px; font-weight: 800;
+}
+.rfx-timing-risk.warn { background: #fff8e1; color: #8a5a00; border: 1px solid #f3d27a; }
+.rfx-timing-risk.bad { background: #fdecea; color: #b12704; border: 1px solid #f1b8b0; }
 .rfx-book-btn {
   margin-left: auto; padding: 8px 22px; font-size: 14px; font-weight: 600;
   background: #ff9900; color: #0f1111; border: none; border-radius: 8px; cursor: pointer; font-family: inherit;
@@ -1302,6 +1373,9 @@ function renderCard(wo, extraClass, changeBadge) {
   const stops = getAllStops(wo);
   const driver = wo.transitOperatorType === "TEAM_DRIVER" ? "Team" : "Solo";
   const firstTz = stops[0]?.location?.timeZone || "America/Los_Angeles";
+  const timingRisk = settings.showTimingRisk ? getTimingRisk(wo) : null;
+  const privateLoad = isPrivateLoad(wo);
+  const loadDisplayId = getLoadDisplayId(wo);
   const bState = bookingState.get(wo.id) || "idle";
   const isAlerted = !!changeBadge;
   const fastBookForThisLoad = settings.fastBook && isAlerted;
@@ -1337,6 +1411,8 @@ function renderCard(wo, extraClass, changeBadge) {
     const tz = loc.timeZone || firstTz;
     let dwell = "";
     if (checkin && checkout) { const d = new Date(checkout) - new Date(checkin); if (d > 0) dwell = fmtDur(d); }
+    const loadTypes = getPickupLoadTypesForStop(wo, s);
+    const extraMeta = settings.showExtraStopMeta ? loadTypes.map(v => `<span class="rfx-extra">${escapeHtml(v)}</span>`).join("") : "";
     const cityState = `${loc.city || "?"}, ${loc.state || "?"}`;
     const stopLabel = loc.label || loc.stopCode || "";
     const stopName = settings.showStopCode && stopLabel ? `${stopLabel} · ${cityState}` : cityState;
@@ -1355,6 +1431,7 @@ function renderCard(wo, extraClass, changeBadge) {
         ${settings.showStopAddress ? `<div class="rfx-stop-addr">${[loc.line1, loc.line2].filter(Boolean).join(", ")}</div>` : ""}
         <div class="rfx-stop-meta">
           ${dwell && settings.showDwellTime ? `<span class="rfx-stop-dwell">${dwell}</span>` : ""}
+          ${extraMeta}
         </div>
       </div>
     </div>`;
@@ -1380,8 +1457,11 @@ function renderCard(wo, extraClass, changeBadge) {
   // Build footer tags conditionally
   let footerTags = "";
   const postedAge = fmtAge(wo.createdAtTime);
+  if (loadDisplayId) footerTags += `<span class="rfx-tag rfx-load-id" title="${escapeHtml(wo.id)}">ID ${escapeHtml(loadDisplayId)}</span>`;
+  if (privateLoad) footerTags += `<span class="rfx-tag rfx-private-tag">Private load</span>`;
   if (settings.showPostedAge && postedAge) footerTags += `<span class="rfx-tag">${postedAge}</span>`;
   if (settings.showStopCount) footerTags += `<span class="rfx-tag">${wo.stopCount || stops.length} stops</span>`;
+  if (timingRisk) footerTags += `<span class="rfx-timing-risk ${timingRisk.level}" title="${escapeHtml(timingRisk.detail)}">Timing issue · ${escapeHtml(timingRisk.label)}</span>`;
 
 	  return `<div class="${cls}" data-id="${wo.id}">
 	    <button type="button" class="rfx-hide-load-btn" data-hide-load-id="${wo.id}" title="Hide this load">×</button>
@@ -1506,13 +1586,14 @@ function renderCustomLoadBoard() {
   const alerted = [];
   for (const alert of alertedLoads) {
     const wo = loadMap.get(alert.wo.id) || alert.wo;
-    if (wo && passesPostedAgeFilter(wo) && passesCustomExcludedCities(wo) && !isIgnoredLoad(wo.id)) alerted.push({ wo, alert });
+    if (wo && passesPostedAgeFilter(wo) && passesCustomExcludedCities(wo) && passesAmazonOnlyFacilities(wo) && !isIgnoredLoad(wo.id)) alerted.push({ wo, alert });
   }
 
   const regularLoads = sortLoads(
-    Array.from(loadMap.values()).filter(wo => !alertMap.has(wo.id) && passesPostedAgeFilter(wo) && passesCustomExcludedCities(wo) && !isIgnoredLoad(wo.id))
+    Array.from(loadMap.values()).filter(wo => !alertMap.has(wo.id) && passesPostedAgeFilter(wo) && passesCustomExcludedCities(wo) && passesAmazonOnlyFacilities(wo) && !isIgnoredLoad(wo.id))
   );
   const hiddenByCity = Array.from(loadMap.values()).filter(wo => !passesCustomExcludedCities(wo)).length;
+  const hiddenByFacility = Array.from(loadMap.values()).filter(wo => passesCustomExcludedCities(wo) && !passesAmazonOnlyFacilities(wo)).length;
   const hiddenByLoad = Array.from(loadMap.values()).filter(wo => isIgnoredLoad(wo.id)).length;
 
   const sortBtn = (key, label) => {
@@ -1538,7 +1619,7 @@ function renderCustomLoadBoard() {
     })),
     ...regularLoads.map(wo => renderCard(wo, "", null)),
   ].join("");
-  const boardLoads = Array.from(loadMap.values()).filter(wo => passesPostedAgeFilter(wo) && passesCustomExcludedCities(wo) && !isIgnoredLoad(wo.id));
+  const boardLoads = Array.from(loadMap.values()).filter(wo => passesPostedAgeFilter(wo) && passesCustomExcludedCities(wo) && passesAmazonOnlyFacilities(wo) && !isIgnoredLoad(wo.id));
   const roundTripsHtml = renderRoundTripMatches(boardLoads, alertMap);
 
   return `<div class="rfx-load-board">
@@ -1549,7 +1630,7 @@ function renderCustomLoadBoard() {
       ${sortBtn("distance", "Distance")}
       ${sortBtn("time", "Start time")}
       <label class="rfx-toolbar-filter">Posted age <select id="rfx-posted-age-filter">${postedAgeOptions}</select></label>
-      <span class="rfx-count">${alerted.length + regularLoads.length} of ${loadMap.size} loads${alerted.length ? ` · ${alerted.length} new` : ""}${hiddenByCity + hiddenByLoad ? ` · ${hiddenByCity + hiddenByLoad} hidden` : ""}</span>
+      <span class="rfx-count">${alerted.length + regularLoads.length} of ${loadMap.size} loads${alerted.length ? ` · ${alerted.length} new` : ""}${hiddenByCity + hiddenByFacility + hiddenByLoad ? ` · ${hiddenByCity + hiddenByFacility + hiddenByLoad} hidden` : ""}</span>
     </div>
     ${roundTripsHtml}
     ${alerted.length ? `<div class="rfx-section-title">Recently added</div>` : ""}
@@ -1686,6 +1767,7 @@ function injectCards() {
       ${chk("fastBook", "Fast Book — auto-confirm booking (skips manual confirmation)")}
       ${chk("autoBook", "Auto-Book — automatically book new loads when detected (clicks Book only, not Confirm)")}
       ${chk("autoResume", "Auto-resume after stop — restart bot after 5 seconds")}
+      ${chk("amazonOnlyFacilities", "Amazon facilities only")}
     </div>
     <div class="rfx-settings-section">
       <div class="rfx-settings-section-title">Bot Speed</div>
@@ -1730,6 +1812,7 @@ function injectCards() {
       ${chk("showDriverType", "Driver type (Solo/Team)")}
       ${chk("showEquipment", "Equipment (53' Trailer)")}
       ${chk("showPostedAge", "Posted age")}
+      ${chk("showTimingRisk", "Timing issue badge")}
       ${chk("showDuration", "Duration")}
       ${chk("showExtraStopMeta", "Loaded/empty badge")}
       ${chk("showScoreBar", "Score bar")}
@@ -1923,6 +2006,9 @@ function styleAmazonLoadCards() {
       .load-card .rfx-i-badge.live { background: #fef3cd; color: #856404; }
       .load-card .rfx-i-badge.drop { background: #e8f0fe; color: #1a56db; }
       .load-card .rfx-i-extra { font-size: 11px; padding: 2px 6px; border-radius: 4px; background: #f3f4f6; color: #374151; font-weight: 500; }
+      .load-card .rfx-i-timing-risk { font-size: 11px; padding: 3px 7px; border-radius: 6px; font-weight: 800; display: inline-flex; align-items: center; gap: 4px; }
+      .load-card .rfx-i-timing-risk.warn { background:#fff8e1; color:#8a5a00; border:1px solid #f3d27a; }
+      .load-card .rfx-i-timing-risk.bad { background:#fdecea; color:#b12704; border:1px solid #f1b8b0; }
       .load-card .rfx-i-leg { font-size: 12px; color: #888; padding: 2px 0 4px 32px; }
       .load-card .rfx-i-footer { display: flex; align-items: center; gap: 10px; flex-wrap: wrap; padding-top: 8px; margin-top: 6px; border-top: 1px solid #f0f0f0; font-size: 13px; color: #565959; }
       .load-card .rfx-i-footer b { color: #0f1111; }
@@ -2047,6 +2133,7 @@ function styleAmazonLoadCards() {
     const stops = getAllStops(wo);
     const driver = wo.transitOperatorType === "TEAM_DRIVER" ? "Team" : "Solo";
     const firstTz = stops[0]?.location?.timeZone || "America/Los_Angeles";
+    const timingRisk = settings.showTimingRisk ? getTimingRisk(wo) : null;
 
     let vBadge = "";
     if (settings.showVersionBadge) {
@@ -2118,6 +2205,7 @@ function styleAmazonLoadCards() {
     const postedAge = fmtAge(wo.createdAtTime);
     if (settings.showPostedAge && postedAge) footer += `<span>${postedAge}</span>`;
     if (settings.showStopCount) footer += ` <span>${wo.stopCount || stops.length} stops</span>`;
+    if (timingRisk) footer += ` <span class="rfx-i-timing-risk ${timingRisk.level}" title="${escapeHtml(timingRisk.detail)}">Timing issue · ${escapeHtml(timingRisk.label)}</span>`;
 
     const fastBookForThisLoad = settings.fastBook && !!alert;
 
