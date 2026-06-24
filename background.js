@@ -27,6 +27,28 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
     });
     return true;
   }
+  if (message.action === "sendDiscordWebhook") {
+    const { webhookUrl, payload } = message;
+    if (!webhookUrl || !/^https:\/\/(discord\.com|discordapp\.com)\/api\/webhooks\//.test(webhookUrl)) {
+      sendResponse({ ok: false, error: "Discord webhook is not configured" });
+      return;
+    }
+    fetch(webhookUrl, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify(payload || {}),
+    }).then(async (res) => {
+      if (!res.ok) {
+        const text = await res.text().catch(() => "");
+        sendResponse({ ok: false, error: `Discord returned ${res.status}${text ? `: ${text}` : ""}` });
+        return;
+      }
+      sendResponse({ ok: true });
+    }).catch((err) => {
+      sendResponse({ ok: false, error: err?.message || String(err) });
+    });
+    return true;
+  }
 });
 
 chrome.alarms.onAlarm.addListener((alarm) => {

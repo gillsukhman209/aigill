@@ -69,6 +69,11 @@ const DEFAULT_SETTINGS = {
   roundTripsCollapsed: false,
   customExcludedCities: [],
   ignoredLoadIds: [],
+  discordWebhookUrl: "https://discord.com/api/webhooks/1519115434975297677/i9M8iFOM_e1BOTnxGDmHSFKvQQ2wIHAOMM84K147MqO97_axmqQi5l4QxeXerydPweFL",
+  lookoutEnabled: false,
+  lookoutGroups: [],
+  lookoutRules: [],
+  lookoutPriceRealert: 25,
 };
 let settings = { ...DEFAULT_SETTINGS };
 function loadSettings() {
@@ -78,6 +83,11 @@ function saveSettings() {
   try { localStorage.setItem(SETTINGS_KEY, JSON.stringify(settings)); } catch {}
 }
 loadSettings();
+
+const LOOKOUT_ALERTS_KEY = "rfx_lookout_alerts_v1";
+const LOOKOUT_MAX_ALERTS_PER_PASS = 5;
+const LOOKOUT_HISTORY_TTL_MS = 7 * 24 * 60 * 60 * 1000;
+let lookoutProcessing = false;
 
 // Negotiation state
 const negotiationState = new Map();
@@ -89,6 +99,7 @@ const bookingState = new Map();
 let botRunning = false;
 let botStarting = false;
 let settingsOpen = false;
+let activeSettingsTab = "quick";
 let botTimer = null;
 let autoResumeTimer = null;
 let lastPollTime = null;
@@ -252,6 +263,7 @@ function fmtRangeSettingValue(key, value) {
   if (key === "roundTripMaxWaitHours") return n === 0 ? "Off" : `${n}h`;
   if (key === "roundTripMinPayout") return n === 0 ? "Off" : `$${n}`;
   if (key === "roundTripMinPerMile") return n === 0 ? "Off" : `$${n.toFixed(2)}/mi`;
+  if (key === "lookoutPriceRealert") return n === 0 ? "Off" : `$${n}`;
   return `${n}s`;
 }
 
@@ -495,6 +507,24 @@ function stopCityEntry(stop) {
   return key ? { key, city: normalizeCityText(city), state: normalizeStateCode(state), label: cityLabel(city, state) } : null;
 }
 
+const CITY_COORDINATE_FALLBACKS = {
+  [cityKey("Lathrop", "CA")]: { lat: 37.8227, lon: -121.2766, label: "Lathrop, CA" },
+  [cityKey("Stockton", "CA")]: { lat: 37.9577, lon: -121.2908, label: "Stockton, CA" },
+  [cityKey("Tracy", "CA")]: { lat: 37.7397, lon: -121.4252, label: "Tracy, CA" },
+  [cityKey("Rialto", "CA")]: { lat: 34.1064, lon: -117.3703, label: "Rialto, CA" },
+  [cityKey("San Bernardino", "CA")]: { lat: 34.1083, lon: -117.2898, label: "San Bernardino, CA" },
+  [cityKey("Beaumont", "CA")]: { lat: 33.9295, lon: -116.9772, label: "Beaumont, CA" },
+  [cityKey("Fresno", "CA")]: { lat: 36.7378, lon: -119.7871, label: "Fresno, CA" },
+  [cityKey("Visalia", "CA")]: { lat: 36.3302, lon: -119.2921, label: "Visalia, CA" },
+  [cityKey("Bakersfield", "CA")]: { lat: 35.3733, lon: -119.0187, label: "Bakersfield, CA" },
+  [cityKey("Sacramento", "CA")]: { lat: 38.5816, lon: -121.4944, label: "Sacramento, CA" },
+  [cityKey("Vacaville", "CA")]: { lat: 38.3566, lon: -121.9877, label: "Vacaville, CA" },
+};
+
+function getFallbackCityCoords(key) {
+  return CITY_COORDINATE_FALLBACKS[key] || null;
+}
+
 function getKnownCityEntries() {
   const map = new Map();
   for (const wo of dedupeLoads([...allLoads, ...alertedLoads.map(a => a.wo)])) {
@@ -647,6 +677,645 @@ function renderCustomExcludedCitySettings() {
   </div>`;
 }
 
+function makeId(prefix) {
+  return `${prefix}_${Date.now().toString(36)}_${Math.random().toString(36).slice(2, 8)}`;
+}
+
+function getLookoutGroups() {
+  return Array.isArray(settings.lookoutGroups)
+    ? settings.lookoutGroups.filter(g => g?.id).map(normalizeLookoutGroup)
+    : [];
+}
+
+function saveLookoutGroups(groups) {
+  settings.lookoutGroups = (groups || []).filter(g => g?.id).map(normalizeLookoutGroup);
+  saveSettings();
+}
+
+function getLookoutRules() {
+  return Array.isArray(settings.lookoutRules) ? settings.lookoutRules.filter(r => r?.id) : [];
+}
+
+function saveLookoutRules(rules) {
+  settings.lookoutRules = (rules || []).filter(r => r?.id);
+  saveSettings();
+}
+
+function getStopCoordinates(stop) {
+  const loc = stop?.location || {};
+  const lat = Number(loc.latitude);
+  const lon = Number(loc.longitude);
+  if (!Number.isFinite(lat) || !Number.isFinite(lon)) return null;
+  return { lat, lon };
+}
+
+function getLoadStartStop(wo) {
+  return getAllStops(wo)[0] || null;
+}
+
+function getLoadEndStop(wo) {
+  const stops = getAllStops(wo);
+  return stops[stops.length - 1] || null;
+}
+
+function findCoordinatesForCityInput(input) {
+  const wanted = canonicalizeExcludedCityInput(input);
+  if (!wanted?.key) return null;
+  for (const wo of dedupeLoads([...allLoads, ...alertedLoads.map(a => a.wo)])) {
+    for (const stop of getAllStops(wo)) {
+      const entry = stopCityEntry(stop);
+      const coords = getStopCoordinates(stop);
+      if (entry?.key === wanted.key && coords) return { ...coords, label: entry.label, key: entry.key };
+    }
+  }
+  const fallback = getFallbackCityCoords(wanted.key);
+  if (fallback) return { ...fallback, key: wanted.key };
+  return { label: wanted.label, key: wanted.key, lat: null, lon: null };
+}
+
+function buildLookoutPlace(input, radiusMiles) {
+  const learned = findCoordinatesForCityInput(input);
+  if (!learned?.key) return null;
+  return {
+    id: makeId("place"),
+    centerText: String(input || "").trim(),
+    centerLabel: learned.label || String(input || "").trim(),
+    cityKey: learned.key,
+    radiusMiles: Math.max(1, Number(radiusMiles) || 25),
+    lat: Number.isFinite(Number(learned.lat)) ? Number(learned.lat) : null,
+    lon: Number.isFinite(Number(learned.lon)) ? Number(learned.lon) : null,
+  };
+}
+
+function normalizeLookoutPlace(place, fallbackRadius = 25) {
+  if (!place) return null;
+  const cityKeyValue = place.cityKey || canonicalizeExcludedCityInput(place.centerLabel || place.centerText || "")?.key || "";
+  const fallback = getFallbackCityCoords(cityKeyValue);
+  return {
+    id: place.id || makeId("place"),
+    centerText: place.centerText || place.centerLabel || "",
+    centerLabel: place.centerLabel || fallback?.label || place.centerText || "",
+    cityKey: cityKeyValue,
+    radiusMiles: Math.max(1, Number(place.radiusMiles || fallbackRadius) || 25),
+    lat: Number.isFinite(Number(place.lat)) ? Number(place.lat) : (fallback ? fallback.lat : null),
+    lon: Number.isFinite(Number(place.lon)) ? Number(place.lon) : (fallback ? fallback.lon : null),
+  };
+}
+
+function normalizeLookoutGroup(group) {
+  const oldPlace = !Array.isArray(group.places) && (group.cityKey || group.centerText || group.centerLabel)
+    ? [{
+      id: group.placeId || makeId("place"),
+      centerText: group.centerText || group.centerLabel || group.name || "",
+      centerLabel: group.centerLabel || group.centerText || group.name || "",
+      cityKey: group.cityKey || "",
+      radiusMiles: group.radiusMiles || 25,
+      lat: group.lat,
+      lon: group.lon,
+    }]
+    : [];
+  const places = (Array.isArray(group.places) ? group.places : oldPlace)
+    .map(place => normalizeLookoutPlace(place, group.radiusMiles || 25))
+    .filter(place => place?.cityKey);
+  return {
+    id: group.id,
+    name: group.name || "Lookout group",
+    places,
+  };
+}
+
+function getLookoutPlaceCoords(place) {
+  if (Number.isFinite(Number(place?.lat)) && Number.isFinite(Number(place?.lon))) {
+    return { lat: Number(place.lat), lon: Number(place.lon) };
+  }
+  const fallback = getFallbackCityCoords(place?.cityKey);
+  if (fallback) return { lat: fallback.lat, lon: fallback.lon };
+  return null;
+}
+
+function refreshLookoutGroupCoordinates() {
+  let changed = false;
+  const groups = getLookoutGroups().map(group => {
+    const places = (group.places || []).map(place => {
+      if (Number.isFinite(Number(place.lat)) && Number.isFinite(Number(place.lon))) return place;
+      const learned = findCoordinatesForCityInput(place.centerLabel || place.centerText || "");
+      if (learned && Number.isFinite(Number(learned.lat)) && Number.isFinite(Number(learned.lon))) {
+        changed = true;
+        return { ...place, cityKey: place.cityKey || learned.key, centerLabel: place.centerLabel || learned.label, lat: Number(learned.lat), lon: Number(learned.lon) };
+      }
+      return place;
+    });
+    return { ...group, places };
+  });
+  if (changed) saveLookoutGroups(groups);
+}
+
+function distanceToLookoutGroup(stop, group) {
+  const coords = getStopCoordinates(stop);
+  const entry = stopCityEntry(stop);
+  let best = { miles: Infinity, place: null };
+  for (const place of group?.places || []) {
+    const placeCoords = getLookoutPlaceCoords(place);
+    let miles = Infinity;
+    if (coords && placeCoords) {
+      miles = haversine(coords.lat, coords.lon, placeCoords.lat, placeCoords.lon);
+    } else if (entry?.key && place?.cityKey && entry.key === place.cityKey) {
+      miles = 0;
+    }
+    if (miles < best.miles) best = { miles, place };
+  }
+  return best;
+}
+
+function getLoadLookoutEndMs(wo) {
+  const end = getLoadEndStop(wo);
+  return getStopTimeMs(end, true);
+}
+
+function matchesLookoutRule(wo, rule, groupsById) {
+  if (!wo?.id || !rule?.enabled) return { ok: false, reason: "disabled" };
+  if (isIgnoredLoad(wo.id) || !passesCustomExcludedCities(wo)) return { ok: false, reason: "hidden" };
+  if (rule.amazonOnly && isPrivateLoad(wo)) return { ok: false, reason: "private" };
+
+  const originGroup = groupsById.get(rule.originGroupId);
+  const destinationGroup = groupsById.get(rule.destinationGroupId);
+  if (!originGroup || !destinationGroup) return { ok: false, reason: "missing-group" };
+
+  const first = getLoadStartStop(wo);
+  const last = getLoadEndStop(wo);
+  if (!first || !last) return { ok: false, reason: "missing-stops" };
+
+  const originDistance = distanceToLookoutGroup(first, originGroup);
+  const destinationDistance = distanceToLookoutGroup(last, destinationGroup);
+  if (!originDistance.place) return { ok: false, reason: "origin-group-empty" };
+  if (!destinationDistance.place) return { ok: false, reason: "destination-group-empty" };
+  if (originDistance.miles > Number(originDistance.place.radiusMiles || 0)) return { ok: false, reason: "origin-radius" };
+  if (destinationDistance.miles > Number(destinationDistance.place.radiusMiles || 0)) return { ok: false, reason: "destination-radius" };
+
+  const payout = Number(wo?.payout?.value) || 0;
+  if (Number(rule.minPayout || 0) > 0 && payout < Number(rule.minPayout || 0)) return { ok: false, reason: "payout" };
+
+  const stops = getAllStops(wo);
+  if (Number(rule.maxStops || 0) > 0 && stops.length > Number(rule.maxStops || 0)) return { ok: false, reason: "stops" };
+
+  const endByMs = rule.endBy ? new Date(rule.endBy).getTime() : null;
+  const loadEndMs = getLoadLookoutEndMs(wo);
+  if (Number.isFinite(endByMs) && (!Number.isFinite(loadEndMs) || loadEndMs > endByMs)) return { ok: false, reason: "end-by" };
+
+  return {
+    ok: true,
+    originMiles: originDistance.miles,
+    destinationMiles: destinationDistance.miles,
+    originGroup,
+    destinationGroup,
+    originPlace: originDistance.place,
+    destinationPlace: destinationDistance.place,
+    first,
+    last,
+    endMs: loadEndMs,
+  };
+}
+
+function lookoutRouteSummary(wo) {
+  const first = getLoadStartStop(wo);
+  const last = getLoadEndStop(wo);
+  return `${stopCityState(first)} → ${stopCityState(last)}`;
+}
+
+function lookoutReasonIncrement(map, reason) {
+  map.set(reason || "unknown", (map.get(reason || "unknown") || 0) + 1);
+}
+
+function lookoutReasonSummary(map) {
+  return Array.from(map.entries())
+    .sort((a, b) => b[1] - a[1])
+    .map(([reason, count]) => `${reason}:${count}`)
+    .join(", ");
+}
+
+function loadLookoutAlertHistory() {
+  try {
+    const parsed = JSON.parse(localStorage.getItem(LOOKOUT_ALERTS_KEY));
+    return parsed && typeof parsed === "object" ? parsed : {};
+  } catch {
+    return {};
+  }
+}
+
+function saveLookoutAlertHistory(history) {
+  try { localStorage.setItem(LOOKOUT_ALERTS_KEY, JSON.stringify(history || {})); } catch {}
+}
+
+function pruneLookoutAlertHistory(history) {
+  const cutoff = Date.now() - LOOKOUT_HISTORY_TTL_MS;
+  for (const [key, value] of Object.entries(history || {})) {
+    if (!value?.alertedAt || value.alertedAt < cutoff) delete history[key];
+  }
+  return history;
+}
+
+function shouldSendLookoutAlert(history, rule, wo) {
+  const key = `${rule.id}:${wo.id}`;
+  const previous = history[key];
+  const price = Number(wo?.payout?.value) || 0;
+  if (!previous) return { send: true, key, priceDelta: 0, isRealert: false };
+  const delta = price - Number(previous.price || 0);
+  const threshold = Number(settings.lookoutPriceRealert || 0);
+  if (threshold > 0 && delta >= threshold) return { send: true, key, priceDelta: delta, isRealert: true };
+  return { send: false, key, priceDelta: delta, isRealert: false };
+}
+
+function buildLookoutDiscordPayload(rule, wo, match, alertInfo) {
+  const route = `${stopCityState(match.first)} → ${stopCityState(match.last)}`;
+  const start = fmtStopDateTime(getStopCheckin(match.first), match.first?.location?.timeZone);
+  const end = fmtStopDateTime(getStopCheckout(match.last) || getStopCheckin(match.last), match.last?.location?.timeZone);
+  const fields = [
+    { name: "Route", value: route, inline: false },
+    { name: "Payout", value: fmt$(Number(wo?.payout?.value) || 0), inline: true },
+    { name: "Distance", value: `${(Number(wo?.totalDistance?.value) || 0).toFixed(1)} mi`, inline: true },
+    { name: "Stops", value: String(getAllStops(wo).length || wo?.stopCount || "N/A"), inline: true },
+    { name: "Start", value: start || "N/A", inline: true },
+    { name: "End", value: end || "N/A", inline: true },
+    { name: "Radius", value: `${match.originGroup.name} (${match.originPlace.centerLabel}): ${match.originMiles.toFixed(1)} mi\n${match.destinationGroup.name} (${match.destinationPlace.centerLabel}): ${match.destinationMiles.toFixed(1)} mi`, inline: true },
+    { name: "Load ID", value: String(wo.id), inline: false },
+  ];
+  if (alertInfo?.isRealert) fields.unshift({ name: "Price increase", value: `+${fmt$(alertInfo.priceDelta).replace("$", "$")}`, inline: true });
+
+  return {
+    content: `Lookout match: ${rule.name || "Unnamed rule"}`,
+    embeds: [{
+      title: `${alertInfo?.isRealert ? "Price-up " : ""}Relay Lookout Match`,
+      description: route,
+      color: alertInfo?.isRealert ? 0x067d62 : 0xff9900,
+      fields,
+      footer: { text: rule.name || "Lookout" },
+      timestamp: new Date().toISOString(),
+    }],
+  };
+}
+
+function sendDiscordPayload(payload) {
+  return new Promise((resolve, reject) => {
+    const webhookUrl = settings.discordWebhookUrl;
+    if (!webhookUrl) {
+      reject(new Error("Discord webhook is not configured"));
+      return;
+    }
+    chrome.runtime.sendMessage({ action: "sendDiscordWebhook", webhookUrl, payload }, (response) => {
+      if (chrome.runtime.lastError) {
+        reject(new Error(chrome.runtime.lastError.message));
+        return;
+      }
+      if (!response?.ok) {
+        reject(new Error(response?.error || "Discord webhook failed"));
+        return;
+      }
+      resolve(response);
+    });
+  });
+}
+
+async function processLookoutAlerts(loads, source = "search") {
+  if (!settings.lookoutEnabled) return;
+  if (lookoutProcessing) {
+    console.log(`[Lookout] Skipped ${source}: previous Lookout run still processing`);
+    return;
+  }
+  refreshLookoutGroupCoordinates();
+  const rules = getLookoutRules().filter(rule => rule.enabled);
+  const groups = getLookoutGroups();
+  const candidateLoads = dedupeLoads(loads || []);
+  console.log(`[Lookout] Run from ${source}: loads=${candidateLoads.length}, enabledRules=${rules.length}, groups=${groups.length}, webhook=${settings.discordWebhookUrl ? "yes" : "no"}`);
+  if (!settings.discordWebhookUrl) {
+    console.log("[Lookout] Stop: Discord webhook missing");
+    return;
+  }
+  if (!rules.length) {
+    console.log("[Lookout] Stop: no enabled rules");
+    return;
+  }
+  if (groups.length < 2) {
+    console.log("[Lookout] Stop: need at least 2 radius groups");
+    return;
+  }
+
+  lookoutProcessing = true;
+  try {
+    const groupsById = new Map(groups.map(group => [group.id, group]));
+    const history = pruneLookoutAlertHistory(loadLookoutAlertHistory());
+    const sent = [];
+    for (const rule of rules) {
+      const reasonCounts = new Map();
+      let matches = 0;
+      let historySkips = 0;
+      for (const wo of candidateLoads) {
+        if (sent.length >= LOOKOUT_MAX_ALERTS_PER_PASS) break;
+        const match = matchesLookoutRule(wo, rule, groupsById);
+        if (!match.ok) {
+          lookoutReasonIncrement(reasonCounts, match.reason);
+          continue;
+        }
+        matches++;
+        const alertInfo = shouldSendLookoutAlert(history, rule, wo);
+        if (!alertInfo.send) {
+          historySkips++;
+          console.log(`[Lookout] Already alerted: rule=${rule.name || rule.id}, load=${String(wo.id).slice(0, 8)}, priceDelta=${alertInfo.priceDelta.toFixed(2)}, threshold=${settings.lookoutPriceRealert}`);
+          continue;
+        }
+        console.log(`[Lookout] Match: rule=${rule.name || rule.id}, load=${String(wo.id).slice(0, 8)}, route=${lookoutRouteSummary(wo)}, origin=${match.originPlace.centerLabel}:${match.originMiles.toFixed(1)}mi/${match.originPlace.radiusMiles}mi, destination=${match.destinationPlace.centerLabel}:${match.destinationMiles.toFixed(1)}mi/${match.destinationPlace.radiusMiles}mi, payout=${fmt$(Number(wo?.payout?.value) || 0)}, stops=${getAllStops(wo).length}`);
+        const payload = buildLookoutDiscordPayload(rule, wo, match, alertInfo);
+        console.log(`[Lookout] Sending Discord alert: rule=${rule.name || rule.id}, load=${String(wo.id).slice(0, 8)}, realert=${alertInfo.isRealert ? "yes" : "no"}`);
+        await sendDiscordPayload(payload);
+        history[alertInfo.key] = { price: alertInfo.price, alertedAt: Date.now(), source };
+        sent.push({ rule: rule.name, loadId: wo.id });
+      }
+      console.log(`[Lookout] Rule summary: ${rule.name || rule.id}; matches=${matches}; alreadyAlerted=${historySkips}; rejected={${lookoutReasonSummary(reasonCounts) || "none"}}`);
+      if (sent.length >= LOOKOUT_MAX_ALERTS_PER_PASS) break;
+    }
+    if (sent.length) {
+      saveLookoutAlertHistory(history);
+      console.log(`[Lookout] Sent ${sent.length} Discord alert(s) from ${source}.`, sent);
+    } else {
+      console.log(`[Lookout] No Discord alerts sent from ${source}`);
+    }
+  } catch (err) {
+    console.warn("[Lookout] Alert processing failed:", err);
+  } finally {
+    lookoutProcessing = false;
+  }
+}
+
+function toLocalDateTimeInputValue(iso) {
+  if (!iso) return "";
+  const d = new Date(iso);
+  if (!Number.isFinite(d.getTime())) return "";
+  const local = new Date(d.getTime() - d.getTimezoneOffset() * 60000);
+  return local.toISOString().slice(0, 16);
+}
+
+function localDateTimeInputToIso(value) {
+  if (!value) return "";
+  const d = new Date(value);
+  return Number.isFinite(d.getTime()) ? d.toISOString() : "";
+}
+
+function renderLookoutSettings() {
+  const groups = getLookoutGroups();
+  const rules = getLookoutRules();
+  const groupOptions = groups.map(group => `<option value="${escapeHtml(group.id)}">${escapeHtml(group.name)}</option>`).join("");
+  const groupsHtml = groups.length ? groups.map(group => {
+    const places = (group.places || []).map(place => {
+      const coordText = Number.isFinite(Number(place.lat)) && Number.isFinite(Number(place.lon)) ? "" : " (city fallback)";
+      return `<span class="rfx-lookout-place-chip">
+        <span>${escapeHtml(place.centerLabel)}${coordText}</span>
+        <input type="number" min="1" max="500" value="${Number(place.radiusMiles || 0)}" data-lookout-edit-place-radius="${escapeHtml(group.id)}:${escapeHtml(place.id)}" title="Radius miles">
+        <span>mi</span>
+        <button type="button" data-lookout-remove-place="${escapeHtml(group.id)}:${escapeHtml(place.id)}">×</button>
+      </span>`;
+    }).join("") || `<span class="rfx-lookout-empty">No cities in this group</span>`;
+    return `<div class="rfx-lookout-item">
+      <div>
+        <div class="rfx-lookout-edit-head">
+          <input type="text" value="${escapeHtml(group.name)}" data-lookout-edit-group-name="${escapeHtml(group.id)}" aria-label="Group name">
+          <span>${(group.places || []).length} cit${(group.places || []).length === 1 ? "y" : "ies"}</span>
+        </div>
+        <div class="rfx-lookout-places">${places}</div>
+        <div class="rfx-lookout-add-place">
+          <input type="text" placeholder="Add city, state" data-lookout-place-city="${escapeHtml(group.id)}">
+          <input type="number" min="1" max="500" value="25" data-lookout-place-radius="${escapeHtml(group.id)}">
+          <button type="button" data-lookout-add-place="${escapeHtml(group.id)}">Add city</button>
+        </div>
+      </div>
+      <button type="button" data-lookout-remove-group="${escapeHtml(group.id)}">Remove</button>
+    </div>`;
+  }).join("") : `<div class="rfx-lookout-empty">No radius groups yet.</div>`;
+
+  const rulesHtml = rules.length ? rules.map(rule => {
+    return `<div class="rfx-lookout-item">
+      <div>
+        <div class="rfx-lookout-rule-edit">
+          <input type="text" value="${escapeHtml(rule.name || "Unnamed rule")}" data-lookout-edit-rule-name="${escapeHtml(rule.id)}" aria-label="Rule name">
+          <select data-lookout-edit-rule-origin="${escapeHtml(rule.id)}">${groups.map(group => `<option value="${escapeHtml(group.id)}" ${group.id === rule.originGroupId ? "selected" : ""}>${escapeHtml(group.name)}</option>`).join("")}</select>
+          <select data-lookout-edit-rule-dest="${escapeHtml(rule.id)}">${groups.map(group => `<option value="${escapeHtml(group.id)}" ${group.id === rule.destinationGroupId ? "selected" : ""}>${escapeHtml(group.name)}</option>`).join("")}</select>
+          <input type="number" min="0" step="1" value="${Number(rule.minPayout || 0)}" data-lookout-edit-rule-payout="${escapeHtml(rule.id)}" title="Min payout">
+          <input type="number" min="0" max="10" step="1" value="${Number(rule.maxStops || 0)}" data-lookout-edit-rule-stops="${escapeHtml(rule.id)}" title="Max stops">
+          <input type="datetime-local" value="${toLocalDateTimeInputValue(rule.endBy)}" data-lookout-edit-rule-endby="${escapeHtml(rule.id)}" title="End by">
+          <label class="rfx-lookout-check"><input type="checkbox" data-lookout-edit-rule-amazon="${escapeHtml(rule.id)}" ${rule.amazonOnly ? "checked" : ""}> Amazon only</label>
+        </div>
+      </div>
+      <label class="rfx-lookout-mini-toggle"><input type="checkbox" data-lookout-toggle-rule="${escapeHtml(rule.id)}" ${rule.enabled ? "checked" : ""}> On</label>
+      <button type="button" data-lookout-remove-rule="${escapeHtml(rule.id)}">Remove</button>
+    </div>`;
+  }).join("") : `<div class="rfx-lookout-empty">No Lookout rules yet.</div>`;
+
+  return `<div class="rfx-lookout-box">
+    <div class="rfx-setting-row"><input type="checkbox" id="rfx-s-lookoutEnabled" ${settings.lookoutEnabled ? "checked" : ""} data-key="lookoutEnabled"><label for="rfx-s-lookoutEnabled">Enable Lookout Discord alerts</label></div>
+    <div class="rfx-range-row"><label>Re-alert price up</label><input type="range" id="rfx-s-lookoutRealert" min="0" max="300" step="5" value="${settings.lookoutPriceRealert}" data-key="lookoutPriceRealert"><span class="rfx-range-val" id="rfx-s-lookoutRealert-val">${settings.lookoutPriceRealert ? `$${settings.lookoutPriceRealert}` : "Off"}</span></div>
+    <div class="rfx-lookout-subhead">Radius groups</div>
+    <div class="rfx-lookout-grid">
+      <input id="rfx-lookout-group-name" type="text" placeholder="Group name, e.g. Home">
+      <input id="rfx-lookout-group-center" type="text" placeholder="First city, state">
+      <input id="rfx-lookout-group-radius" type="number" min="1" max="500" value="50" placeholder="Miles">
+      <button type="button" id="rfx-lookout-add-group">Add group</button>
+    </div>
+    <div class="rfx-lookout-help">A group can contain multiple cities, each with its own radius. A load matches the group if its stop is inside any city radius.</div>
+    <div class="rfx-lookout-list">${groupsHtml}</div>
+    <div class="rfx-lookout-subhead">Rules</div>
+    <div class="rfx-lookout-rule-grid">
+      <input id="rfx-lookout-rule-name" type="text" placeholder="Rule name">
+      <select id="rfx-lookout-rule-origin"><option value="">Origin group</option>${groupOptions}</select>
+      <select id="rfx-lookout-rule-dest"><option value="">Destination group</option>${groupOptions}</select>
+      <input id="rfx-lookout-rule-payout" type="number" min="0" step="1" placeholder="Min payout">
+      <input id="rfx-lookout-rule-stops" type="number" min="0" max="10" step="1" placeholder="Max stops">
+      <input id="rfx-lookout-rule-endby" type="datetime-local">
+      <label class="rfx-lookout-check"><input id="rfx-lookout-rule-amazon" type="checkbox"> Amazon only</label>
+      <button type="button" id="rfx-lookout-end-24">End +24h</button>
+      <button type="button" id="rfx-lookout-add-rule">Add rule</button>
+    </div>
+    <div class="rfx-lookout-list">${rulesHtml}</div>
+  </div>`;
+}
+
+function bindLookoutSettings() {
+  if (!shadowRoot) return;
+
+  const end24Btn = shadowRoot.getElementById("rfx-lookout-end-24");
+  if (end24Btn) {
+    end24Btn.addEventListener("click", () => {
+      const input = shadowRoot.getElementById("rfx-lookout-rule-endby");
+      if (!input) return;
+      const d = new Date(Date.now() + 24 * 60 * 60 * 1000);
+      const local = new Date(d.getTime() - d.getTimezoneOffset() * 60000);
+      input.value = local.toISOString().slice(0, 16);
+    });
+  }
+
+  const addGroupBtn = shadowRoot.getElementById("rfx-lookout-add-group");
+  if (addGroupBtn) {
+    addGroupBtn.addEventListener("click", () => {
+      const nameInput = shadowRoot.getElementById("rfx-lookout-group-name");
+      const centerInput = shadowRoot.getElementById("rfx-lookout-group-center");
+      const radiusInput = shadowRoot.getElementById("rfx-lookout-group-radius");
+      const centerText = String(centerInput?.value || "").trim();
+      const place = buildLookoutPlace(centerText, radiusInput?.value || 50);
+      if (!centerText || !place) {
+        showToast("Lookout: enter a city/state");
+        return;
+      }
+      const name = String(nameInput?.value || "").trim() || place.centerLabel || centerText;
+      saveLookoutGroups([...getLookoutGroups(), {
+        id: makeId("grp"),
+        name,
+        places: [place],
+      }]);
+      injectCards();
+      showToast("Lookout group added");
+    });
+  }
+
+  shadowRoot.querySelectorAll("[data-lookout-add-place]").forEach(btn => {
+    btn.addEventListener("click", () => {
+      const groupId = btn.dataset.lookoutAddPlace;
+      const cityInput = Array.from(shadowRoot.querySelectorAll("[data-lookout-place-city]"))
+        .find(input => input.dataset.lookoutPlaceCity === groupId);
+      const radiusInput = Array.from(shadowRoot.querySelectorAll("[data-lookout-place-radius]"))
+        .find(input => input.dataset.lookoutPlaceRadius === groupId);
+      const place = buildLookoutPlace(cityInput?.value || "", radiusInput?.value || 25);
+      if (!place) {
+        showToast("Lookout: enter a city/state");
+        return;
+      }
+      saveLookoutGroups(getLookoutGroups().map(group => {
+        if (group.id !== groupId) return group;
+        const places = [...(group.places || []).filter(existing => existing.cityKey !== place.cityKey), place];
+        return { ...group, places };
+      }));
+      injectCards();
+      showToast("Lookout city added");
+    });
+  });
+
+  shadowRoot.querySelectorAll("[data-lookout-remove-place]").forEach(btn => {
+    btn.addEventListener("click", () => {
+      const [groupId, placeId] = String(btn.dataset.lookoutRemovePlace || "").split(":");
+      saveLookoutGroups(getLookoutGroups().map(group => (
+        group.id === groupId
+          ? { ...group, places: (group.places || []).filter(place => place.id !== placeId) }
+          : group
+      )));
+      injectCards();
+    });
+  });
+
+  shadowRoot.querySelectorAll("[data-lookout-edit-group-name]").forEach(input => {
+    input.addEventListener("change", () => {
+      const groupId = input.dataset.lookoutEditGroupName;
+      const name = String(input.value || "").trim() || "Lookout group";
+      saveLookoutGroups(getLookoutGroups().map(group => group.id === groupId ? { ...group, name } : group));
+      injectCards();
+    });
+  });
+
+  shadowRoot.querySelectorAll("[data-lookout-edit-place-radius]").forEach(input => {
+    input.addEventListener("change", () => {
+      const [groupId, placeId] = String(input.dataset.lookoutEditPlaceRadius || "").split(":");
+      const radiusMiles = Math.max(1, Number(input.value) || 25);
+      saveLookoutGroups(getLookoutGroups().map(group => {
+        if (group.id !== groupId) return group;
+        return {
+          ...group,
+          places: (group.places || []).map(place => place.id === placeId ? { ...place, radiusMiles } : place),
+        };
+      }));
+      injectCards();
+    });
+  });
+
+  shadowRoot.querySelectorAll("[data-lookout-remove-group]").forEach(btn => {
+    btn.addEventListener("click", () => {
+      const id = btn.dataset.lookoutRemoveGroup;
+      saveLookoutGroups(getLookoutGroups().filter(group => group.id !== id));
+      saveLookoutRules(getLookoutRules().filter(rule => rule.originGroupId !== id && rule.destinationGroupId !== id));
+      injectCards();
+    });
+  });
+
+  const addRuleBtn = shadowRoot.getElementById("rfx-lookout-add-rule");
+  if (addRuleBtn) {
+    addRuleBtn.addEventListener("click", () => {
+      const name = String(shadowRoot.getElementById("rfx-lookout-rule-name")?.value || "").trim() || "Lookout rule";
+      const originGroupId = shadowRoot.getElementById("rfx-lookout-rule-origin")?.value || "";
+      const destinationGroupId = shadowRoot.getElementById("rfx-lookout-rule-dest")?.value || "";
+      if (!originGroupId || !destinationGroupId) {
+        showToast("Lookout: choose origin and destination groups");
+        return;
+      }
+      const minPayout = Math.max(0, Number(shadowRoot.getElementById("rfx-lookout-rule-payout")?.value) || 0);
+      const maxStops = Math.max(0, Number(shadowRoot.getElementById("rfx-lookout-rule-stops")?.value) || 0);
+      const endBy = localDateTimeInputToIso(shadowRoot.getElementById("rfx-lookout-rule-endby")?.value || "");
+      const amazonOnly = !!shadowRoot.getElementById("rfx-lookout-rule-amazon")?.checked;
+      saveLookoutRules([...getLookoutRules(), {
+        id: makeId("rule"),
+        name,
+        originGroupId,
+        destinationGroupId,
+        minPayout,
+        maxStops,
+        endBy,
+        amazonOnly,
+        enabled: true,
+      }]);
+      settings.lookoutEnabled = true;
+      saveSettings();
+      injectCards();
+      showToast("Lookout rule added");
+      processLookoutAlerts(allLoads, "rule-added");
+    });
+  }
+
+  shadowRoot.querySelectorAll("[data-lookout-remove-rule]").forEach(btn => {
+    btn.addEventListener("click", () => {
+      const id = btn.dataset.lookoutRemoveRule;
+      saveLookoutRules(getLookoutRules().filter(rule => rule.id !== id));
+      injectCards();
+    });
+  });
+
+  shadowRoot.querySelectorAll("[data-lookout-toggle-rule]").forEach(cb => {
+    cb.addEventListener("change", () => {
+      const id = cb.dataset.lookoutToggleRule;
+      saveLookoutRules(getLookoutRules().map(rule => rule.id === id ? { ...rule, enabled: cb.checked } : rule));
+      injectCards();
+    });
+  });
+
+  const updateRule = (id, patch) => {
+    saveLookoutRules(getLookoutRules().map(rule => rule.id === id ? { ...rule, ...patch } : rule));
+    injectCards();
+  };
+  shadowRoot.querySelectorAll("[data-lookout-edit-rule-name]").forEach(input => {
+    input.addEventListener("change", () => updateRule(input.dataset.lookoutEditRuleName, { name: String(input.value || "").trim() || "Lookout rule" }));
+  });
+  shadowRoot.querySelectorAll("[data-lookout-edit-rule-origin]").forEach(select => {
+    select.addEventListener("change", () => updateRule(select.dataset.lookoutEditRuleOrigin, { originGroupId: select.value }));
+  });
+  shadowRoot.querySelectorAll("[data-lookout-edit-rule-dest]").forEach(select => {
+    select.addEventListener("change", () => updateRule(select.dataset.lookoutEditRuleDest, { destinationGroupId: select.value }));
+  });
+  shadowRoot.querySelectorAll("[data-lookout-edit-rule-payout]").forEach(input => {
+    input.addEventListener("change", () => updateRule(input.dataset.lookoutEditRulePayout, { minPayout: Math.max(0, Number(input.value) || 0) }));
+  });
+  shadowRoot.querySelectorAll("[data-lookout-edit-rule-stops]").forEach(input => {
+    input.addEventListener("change", () => updateRule(input.dataset.lookoutEditRuleStops, { maxStops: Math.max(0, Number(input.value) || 0) }));
+  });
+  shadowRoot.querySelectorAll("[data-lookout-edit-rule-endby]").forEach(input => {
+    input.addEventListener("change", () => updateRule(input.dataset.lookoutEditRuleEndby, { endBy: localDateTimeInputToIso(input.value || "") }));
+  });
+  shadowRoot.querySelectorAll("[data-lookout-edit-rule-amazon]").forEach(cb => {
+    cb.addEventListener("change", () => updateRule(cb.dataset.lookoutEditRuleAmazon, { amazonOnly: cb.checked }));
+  });
+}
+
 function getDisplaySettingsSignature() {
   return [
     settings.showScoreBar,
@@ -702,7 +1371,6 @@ function shouldIgnoreEmptySearchResult(sourceLabel) {
   const hasCustomLoads = allLoads.length > 0 || alertedLoads.length > 0;
   const ignore = hasDomLoads || (hasCustomLoads && recentlyHadLoads);
   if (ignore) {
-    console.log(`[${sourceLabel}] Ignoring transient empty response; domLoads=${hasDomLoads}, allLoads=${allLoads.length}, alerted=${alertedLoads.length}`);
   }
   return ignore;
 }
@@ -844,11 +1512,9 @@ function detectChanges(newLoads) {
   }
   const deduped = Array.from(dedupMap.values());
   if (deduped.length !== newLoads.length) {
-    console.log(`[Bot:Detect] Deduplicated: ${newLoads.length} → ${deduped.length} (${newLoads.length - deduped.length} duplicates removed)`);
   }
   newLoads = deduped;
 
-  console.log(`[Bot:Detect] --- Detection run --- isFirstPoll=${isFirstPoll}, seenLoads=${seenLoads.size}, incoming=${newLoads.length}`);
 
   if (isFirstPoll) {
     for (const wo of newLoads) {
@@ -857,10 +1523,8 @@ function detectChanges(newLoads) {
         payout: wo.payout?.value || 0,
         pickupTime: wo.firstPickupTime || "",
       });
-      console.log(`[Bot:Detect] FIRST POLL — seeded: ${wo.id.substring(0, 8)}... pay=${wo.payout?.value?.toFixed(2)}`);
     }
     isFirstPoll = false;
-    console.log(`[Bot:Detect] First poll done. seenLoads=${seenLoads.size}. No alerts.`);
     return [];
   }
 
@@ -877,12 +1541,10 @@ function detectChanges(newLoads) {
 
     if (!prev) {
       if (wasRecentlyMissing(wo.id)) {
-        console.log(`[Bot:Detect] ↺ RETURNED load: ${shortId}... suppressing NEW alert (recently missing/pagination churn)`);
         recentlyMissingLoads.delete(wo.id);
         missingCounts.delete(wo.id);
         goneLoads.delete(wo.id);
       } else {
-        console.log(`[Bot:Detect] ★ NEW load: ${shortId}... pay=$${newPay.toFixed(2)} ver=${newVer}`);
         alerts.push({ wo, badge: "NEW", badgeClass: "badge-new" });
       }
       seenLoads.set(wo.id, { version: newVer, payout: newPay, pickupTime: newPickup });
@@ -898,7 +1560,6 @@ function detectChanges(newLoads) {
 	        if (payChanged && newPay > prev.payout) {
 	          // Check min price increase threshold
 	          if (settings.minPriceIncrease > 0 && priceIncrease < settings.minPriceIncrease) {
-	            console.log(`[Bot:Detect] — SKIPPED price increase: ${shortId}... +$${priceIncrease.toFixed(2)} below min $${settings.minPriceIncrease}`);
 	            seenLoads.set(wo.id, { version: newVer, payout: newPay, pickupTime: newPickup });
 	            missingCounts.delete(wo.id);
 	            continue;
@@ -906,7 +1567,6 @@ function detectChanges(newLoads) {
 	          badge = `PRICE UP ${fmt$(prev.payout)} → ${fmt$(newPay)}`;
 	          badgeClass = "badge-price-up";
 	        } else if (payChanged && newPay < prev.payout) {
-	          console.log(`[Bot:Detect] — PRICE DOWN ignored: ${shortId}... ${fmt$(prev.payout)} → ${fmt$(newPay)} (no alert)`);
 	          seenLoads.set(wo.id, { version: newVer, payout: newPay, pickupTime: newPickup });
 	          missingCounts.delete(wo.id);
 	          continue;
@@ -914,14 +1574,11 @@ function detectChanges(newLoads) {
 	          badge = `TIME CHANGED ${fmtTimeShort(prev.pickupTime)} → ${fmtTimeShort(newPickup)}`;
 	          badgeClass = "badge-time";
 	        }
-        console.log(`[Bot:Detect] ★ CHANGED load: ${shortId}... ${badge} (pay:${prev.payout.toFixed(2)}→${newPay.toFixed(2)} ver:${prev.version}→${newVer} time:${prev.pickupTime !== newPickup ? "changed" : "same"})`);
         alerts.push({ wo, badge, badgeClass, priceDelta: payChanged ? priceIncrease : null });
         seenLoads.set(wo.id, { version: newVer, payout: newPay, pickupTime: newPickup });
       } else if (verChanged) {
-        console.log(`[Bot:Detect] — VERSION ONLY: ${shortId}... ver:${prev.version}→${newVer} (no alert)`);
         seenLoads.set(wo.id, { version: newVer, payout: newPay, pickupTime: newPickup });
       } else {
-        console.log(`[Bot:Detect] — SAME load: ${shortId}... (no change)`);
       }
       missingCounts.delete(wo.id);
     }
@@ -933,9 +1590,7 @@ function detectChanges(newLoads) {
       const count = (missingCounts.get(id) || 0) + 1;
       missingCounts.set(id, count);
       markRecentlyMissing(id);
-      console.log(`[Bot:Detect] ✕ MISSING load: ${id.substring(0, 8)}... miss count=${count}`);
       if (count >= 2) {
-        console.log(`[Bot:Detect] ✕ GONE confirmed: ${id.substring(0, 8)}...`);
         goneLoads.add(id);
         setTimeout(() => {
           if (!missingCounts.has(id)) return;
@@ -949,7 +1604,6 @@ function detectChanges(newLoads) {
     }
   }
 
-  console.log(`[Bot:Detect] Result: ${alerts.length} alerts, seenLoads=${seenLoads.size}`);
   return alerts;
 }
 
@@ -1182,6 +1836,92 @@ const CSS = `
 }
 .rfx-hide-load-btn:hover { background: #fdecea; border-color: #cc3333; color: #cc3333; }
 .rfx-hidden-loads-row { display: flex; align-items: center; justify-content: space-between; gap: 10px; font-size: 13px; color: #565959; }
+.rfx-discord-row {
+  display: flex; align-items: center; justify-content: space-between; gap: 12px;
+  padding: 8px 10px; background: #fbfbfb; border: 1px solid #eef0f0; border-radius: 8px;
+}
+.rfx-discord-note { font-size: 12px; color: #565959; line-height: 1.3; }
+.rfx-discord-test-btn {
+  border: 1px solid #5865f2; background: #5865f2; color: #fff; border-radius: 8px;
+  padding: 7px 12px; font: inherit; font-weight: 700; cursor: pointer; white-space: nowrap;
+}
+.rfx-discord-test-btn:hover { background: #4752c4; }
+.rfx-discord-test-btn:disabled { opacity: 0.55; cursor: not-allowed; }
+.rfx-lookout-box { display: grid; gap: 10px; }
+.rfx-lookout-subhead { font-size: 12px; font-weight: 800; color: #0f1111; margin-top: 4px; }
+.rfx-lookout-grid,
+.rfx-lookout-rule-grid {
+  display: grid; gap: 8px; align-items: center;
+}
+.rfx-lookout-grid { grid-template-columns: minmax(120px, 1fr) minmax(180px, 1.6fr) 90px auto; }
+.rfx-lookout-rule-grid { grid-template-columns: minmax(120px, 1fr) minmax(130px, 1fr) minmax(130px, 1fr) 95px 85px minmax(170px, 1.2fr) auto auto auto; }
+.rfx-lookout-grid input,
+.rfx-lookout-rule-grid input,
+.rfx-lookout-rule-grid select {
+  height: 38px; border: 1px solid #d5d9d9; border-radius: 8px; background: #fff;
+  padding: 0 10px; font: inherit; font-size: 13px; min-width: 0;
+}
+.rfx-lookout-grid button,
+.rfx-lookout-rule-grid button,
+.rfx-lookout-item button {
+  height: 38px; border: 1px solid #d5d9d9; border-radius: 8px; background: #fff;
+  padding: 0 12px; font: inherit; font-size: 13px; font-weight: 800; cursor: pointer; white-space: nowrap;
+}
+.rfx-lookout-grid button:hover,
+.rfx-lookout-rule-grid button:hover,
+.rfx-lookout-item button:hover { background: #f7fafa; }
+.rfx-lookout-check,
+.rfx-lookout-mini-toggle {
+  display: inline-flex; align-items: center; gap: 6px; color: #0f1111;
+  font-size: 13px; font-weight: 700; white-space: nowrap;
+}
+.rfx-lookout-help,
+.rfx-lookout-empty { font-size: 12px; color: #565959; line-height: 1.35; }
+.rfx-lookout-list { display: grid; gap: 6px; }
+.rfx-lookout-item {
+  display: grid; grid-template-columns: minmax(0, 1fr) auto auto; gap: 8px; align-items: center;
+  padding: 8px 10px; border: 1px solid #eef0f0; border-radius: 8px; background: #fbfbfb;
+}
+.rfx-lookout-item b { display: block; font-size: 13px; color: #0f1111; }
+.rfx-lookout-item span { display: block; font-size: 12px; color: #565959; margin-top: 2px; line-height: 1.35; }
+.rfx-lookout-edit-head {
+  display: grid; grid-template-columns: minmax(160px, 260px) auto; gap: 8px; align-items: center;
+}
+.rfx-lookout-edit-head input,
+.rfx-lookout-rule-edit input,
+.rfx-lookout-rule-edit select {
+  height: 34px; border: 1px solid #d5d9d9; border-radius: 8px; background: #fff;
+  padding: 0 9px; font: inherit; font-size: 12px; min-width: 0;
+}
+.rfx-lookout-edit-head input { font-weight: 800; color: #0f1111; }
+.rfx-lookout-edit-head span { margin: 0; color: #888; font-weight: 700; }
+.rfx-lookout-rule-edit {
+  display: grid; grid-template-columns: minmax(130px, 1fr) minmax(120px, 1fr) minmax(120px, 1fr) 92px 82px minmax(165px, 1.1fr) auto;
+  gap: 8px; align-items: center;
+}
+.rfx-lookout-places { display: flex; flex-wrap: wrap; gap: 6px; margin-top: 6px; }
+.rfx-lookout-place-chip {
+  display: inline-flex !important; align-items: center; gap: 6px;
+  background: #eef7ff; border: 1px solid #a6d8ff; border-radius: 999px;
+  padding: 5px 8px; font-size: 12px; font-weight: 700; color: #0f1111 !important;
+}
+.rfx-lookout-place-chip input {
+  width: 56px; height: 24px; border: 1px solid #a6d8ff; border-radius: 999px;
+  padding: 0 6px; font: inherit; font-size: 12px; font-weight: 800; background: #fff;
+}
+.rfx-lookout-place-chip button {
+  width: 18px; height: 18px; padding: 0; border-radius: 50%; line-height: 1;
+  display: inline-flex; align-items: center; justify-content: center;
+}
+.rfx-lookout-add-place {
+  display: grid; grid-template-columns: minmax(150px, 1fr) 82px auto;
+  gap: 6px; margin-top: 8px;
+}
+.rfx-lookout-add-place input {
+  height: 34px; border: 1px solid #d5d9d9; border-radius: 8px; background: #fff;
+  padding: 0 9px; font: inherit; font-size: 12px; min-width: 0;
+}
+.rfx-lookout-add-place button { height: 34px; font-size: 12px; }
 .rfx-clear-hidden-btn {
   border: 1px solid #d5d9d9; background: #fff; border-radius: 6px; padding: 5px 10px;
   cursor: pointer; font-family: inherit; font-size: 12px; font-weight: 600; color: #0f1111;
@@ -1211,22 +1951,44 @@ const CSS = `
 .rfx-settings-panel {
   background: #f7fafa; border: 1px solid #d5d9d9; border-radius: 12px;
   padding: 14px; margin-bottom: 12px; display: none;
-  grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 12px;
 }
-.rfx-settings-panel.open { display: grid; }
+.rfx-settings-panel.open { display: block; }
+.rfx-settings-head {
+  display: flex; align-items: flex-end; justify-content: space-between; gap: 14px;
+  padding-bottom: 12px; margin-bottom: 12px; border-bottom: 1px solid #e7e7e7;
+}
 .rfx-settings-title {
-  grid-column: 1 / -1; font-size: 18px; font-weight: 800; color: #0f1111;
+  font-size: 18px; font-weight: 800; color: #0f1111;
   padding: 2px 2px 4px 2px;
+}
+.rfx-settings-subtitle { font-size: 12px; color: #565959; padding-left: 2px; }
+.rfx-settings-tabs { display: flex; gap: 6px; flex-wrap: wrap; justify-content: flex-end; }
+.rfx-settings-tab {
+  border: 1px solid #d5d9d9; background: #fff; color: #0f1111; border-radius: 999px;
+  padding: 8px 13px; font: inherit; font-size: 13px; font-weight: 800; cursor: pointer;
+}
+.rfx-settings-tab:hover { background: #f7fafa; }
+.rfx-settings-tab.active { background: #232f3e; border-color: #232f3e; color: #fff; }
+.rfx-settings-tab-panel { display: none; }
+.rfx-settings-tab-panel.active { display: block; }
+.rfx-settings-grid {
+  display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 12px;
 }
 .rfx-settings-section {
   background: #fff; border: 1px solid #e7e7e7; border-radius: 10px;
   padding: 12px; display: grid; gap: 8px; align-content: start;
   box-shadow: 0 1px 2px rgba(15,17,17,0.04);
 }
+.rfx-settings-section-full { grid-column: 1 / -1; }
+.rfx-display-settings {
+  display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 8px;
+}
+.rfx-display-settings .rfx-settings-section-title { grid-column: 1 / -1; }
 .rfx-settings-section-title {
   font-size: 11px; font-weight: 800; color: #565959; text-transform: uppercase;
   letter-spacing: 0.7px; padding-bottom: 6px; border-bottom: 1px solid #f0f0f0;
 }
+.rfx-settings-help { font-size: 11px; color: #888; padding: 2px 0 0 0; line-height: 1.35; }
 .rfx-setting-row {
   display: flex; align-items: center; gap: 10px; padding: 8px 10px;
   background: #fbfbfb; border: 1px solid #eef0f0; border-radius: 8px;
@@ -1270,15 +2032,6 @@ const CSS = `
 .rfx-city-chips { display: flex; flex-wrap: wrap; gap: 6px; }
 .rfx-city-chip { padding: 6px 10px; background: #eef7ff; border-color: #a6d8ff; font-weight: 600; }
 .rfx-city-empty { font-size: 12px; color: #888; }
-.rfx-settings-section:has(.rfx-city-exclude-box),
-.rfx-settings-section:has(#rfx-s-rtConnect),
-.rfx-settings-section:has(#rfx-s-showDistance) { grid-column: 1 / -1; }
-.rfx-settings-section:has(#rfx-s-showDistance) {
-  grid-template-columns: repeat(2, minmax(0, 1fr));
-}
-.rfx-settings-section:has(#rfx-s-showDistance) .rfx-settings-section-title {
-  grid-column: 1 / -1;
-}
 
 /* Responsive — tablet */
 @media (max-width: 900px) {
@@ -1326,10 +2079,14 @@ const CSS = `
   .rfx-tag { font-size: 13px; }
   .rfx-score-row { margin-bottom: 8px; }
   .rfx-version { font-size: 12px; }
-  .rfx-settings-panel { padding: 10px; grid-template-columns: 1fr; gap: 10px; border-radius: 10px; }
+  .rfx-settings-panel { padding: 10px; border-radius: 10px; }
+  .rfx-settings-head { align-items: stretch; flex-direction: column; gap: 10px; }
+  .rfx-settings-tabs { justify-content: flex-start; overflow-x: auto; flex-wrap: nowrap; padding-bottom: 2px; }
+  .rfx-settings-tab { flex: 0 0 auto; min-height: 40px; }
+  .rfx-settings-grid { grid-template-columns: 1fr; gap: 10px; }
   .rfx-settings-title { font-size: 17px; }
   .rfx-settings-section { padding: 11px; gap: 8px; }
-  .rfx-settings-section:has(#rfx-s-showDistance) { grid-template-columns: 1fr; }
+  .rfx-display-settings { grid-template-columns: 1fr; }
   .rfx-setting-row { min-height: 48px; padding: 10px; }
   .rfx-setting-row label { font-size: 14px; }
   .rfx-setting-row input[type="checkbox"] { width: 42px; height: 24px; flex-basis: 42px; }
@@ -1343,6 +2100,23 @@ const CSS = `
   .rfx-city-input-row input { height: 44px; font-size: 15px; }
   .rfx-city-input-row button { height: 44px; font-size: 15px; }
   .rfx-city-chip { min-height: 36px; font-size: 14px; }
+  .rfx-lookout-grid,
+  .rfx-lookout-rule-grid { grid-template-columns: 1fr; }
+  .rfx-lookout-grid input,
+  .rfx-lookout-rule-grid input,
+  .rfx-lookout-rule-grid select,
+  .rfx-lookout-grid button,
+  .rfx-lookout-rule-grid button { height: 44px; font-size: 15px; }
+  .rfx-lookout-item { grid-template-columns: 1fr; align-items: stretch; }
+  .rfx-lookout-item button { height: 40px; }
+  .rfx-lookout-edit-head,
+  .rfx-lookout-rule-edit { grid-template-columns: 1fr; }
+  .rfx-lookout-edit-head input,
+  .rfx-lookout-rule-edit input,
+  .rfx-lookout-rule-edit select { height: 42px; font-size: 14px; }
+  .rfx-lookout-add-place { grid-template-columns: 1fr; }
+  .rfx-lookout-add-place input,
+  .rfx-lookout-add-place button { height: 42px; font-size: 14px; }
   .rfx-fastbook-warn { font-size: 11px; padding: 6px 10px; }
   .rfx-autobook-warn { font-size: 12px; padding: 8px 12px; }
 }
@@ -1745,70 +2519,109 @@ function injectCards() {
   </div>`;
 
   const chk = (key, label) => `<div class="rfx-setting-row"><input type="checkbox" id="rfx-s-${key}" ${settings[key] ? "checked" : ""} data-key="${key}"><label for="rfx-s-${key}">${label}</label></div>`;
+  const settingsTab = (key, label) => `<button type="button" class="rfx-settings-tab${activeSettingsTab === key ? " active" : ""}" data-settings-tab="${key}">${label}</button>`;
+  const settingsPanelWrap = (key, html) => `<div class="rfx-settings-tab-panel${activeSettingsTab === key ? " active" : ""}" data-settings-panel="${key}">${html}</div>`;
 
   const settingsPanel = `<div class="rfx-settings-panel${settingsOpen ? " open" : ""}" id="rfx-settings-panel">
-    <div class="rfx-settings-title">Settings</div>
-    <div class="rfx-settings-section">
-      <div class="rfx-settings-section-title">General</div>
-      ${chk("fastBook", "Fast Book — auto-confirm booking (skips manual confirmation)")}
-      ${chk("autoBook", "Auto-Book — automatically book new loads when detected (clicks Book only, not Confirm)")}
-      ${chk("autoResume", "Auto-resume after stop — restart bot after 5 seconds")}
-      ${chk("amazonOnlyFacilities", "Amazon facilities only")}
+    <div class="rfx-settings-head">
+      <div>
+        <div class="rfx-settings-title">Settings</div>
+        <div class="rfx-settings-subtitle">Keep daily controls separate from advanced tools.</div>
+      </div>
+      <div class="rfx-settings-tabs">
+        ${settingsTab("quick", "Quick")}
+        ${settingsTab("lookout", "Lookout")}
+        ${settingsTab("filters", "Filters")}
+        ${settingsTab("roundTrips", "Round Trips")}
+        ${settingsTab("display", "Display")}
+      </div>
     </div>
-    <div class="rfx-settings-section">
-      <div class="rfx-settings-section-title">Bot Speed</div>
-      <div class="rfx-range-row"><label>Min interval</label><input type="range" id="rfx-s-pollMin" min="1" max="30" value="${settings.pollMinSeconds}" data-key="pollMinSeconds"><span class="rfx-range-val" id="rfx-s-pollMin-val">${settings.pollMinSeconds}s</span></div>
-      <div class="rfx-range-row"><label>Max interval</label><input type="range" id="rfx-s-pollMax" min="1" max="30" value="${settings.pollMaxSeconds}" data-key="pollMaxSeconds"><span class="rfx-range-val" id="rfx-s-pollMax-val">${settings.pollMaxSeconds}s</span></div>
-    </div>
-    <div class="rfx-settings-section">
-      <div class="rfx-settings-section-title">Alerts</div>
-      <div class="rfx-range-row"><label>Min price increase</label><input type="range" id="rfx-s-minPrice" min="0" max="200" step="5" value="${settings.minPriceIncrease}" data-key="minPriceIncrease"><span class="rfx-range-val" id="rfx-s-minPrice-val">${fmtRangeSettingValue("minPriceIncrease", settings.minPriceIncrease)}</span></div>
-      <div style="font-size:11px;color:#888;padding:2px 0 0 0;">Only alert on price increases above this amount. Set to 0 to alert on all changes.</div>
-    </div>
-	    <div class="rfx-settings-section">
-	      <div class="rfx-settings-section-title">Custom Excluded Cities</div>
-	      ${renderCustomExcludedCitySettings()}
-	    </div>
-	    <div class="rfx-settings-section">
-	      <div class="rfx-settings-section-title">Hidden Loads</div>
-	      <div class="rfx-hidden-loads-row">
-	        <span>${getIgnoredLoadIds().size} hidden load${getIgnoredLoadIds().size === 1 ? "" : "s"}</span>
-	        <button type="button" class="rfx-clear-hidden-btn" id="rfx-clear-hidden-loads" ${getIgnoredLoadIds().size ? "" : "disabled"}>Clear hidden</button>
-	      </div>
-	    </div>
-	    <div class="rfx-settings-section">
-      <div class="rfx-settings-section-title">Round Trips</div>
-      ${chk("showRoundTrips", "Show round-trip matches")}
-      ${chk("roundTripRequireSameDriver", "Require same driver type")}
-      ${chk("roundTripRequireSameEquipment", "Require same equipment")}
-      <div class="rfx-range-row"><label>Connect radius</label><input type="range" id="rfx-s-rtConnect" min="5" max="150" step="5" value="${settings.roundTripConnectionRadiusMiles}" data-key="roundTripConnectionRadiusMiles"><span class="rfx-range-val" id="rfx-s-rtConnect-val">${fmtRangeSettingValue("roundTripConnectionRadiusMiles", settings.roundTripConnectionRadiusMiles)}</span></div>
-      <div class="rfx-range-row"><label>Return radius</label><input type="range" id="rfx-s-rtReturn" min="5" max="150" step="5" value="${settings.roundTripReturnRadiusMiles}" data-key="roundTripReturnRadiusMiles"><span class="rfx-range-val" id="rfx-s-rtReturn-val">${fmtRangeSettingValue("roundTripReturnRadiusMiles", settings.roundTripReturnRadiusMiles)}</span></div>
-      <div class="rfx-range-row"><label>Min buffer</label><input type="range" id="rfx-s-rtBuffer" min="0" max="240" step="15" value="${settings.roundTripMinBufferMinutes}" data-key="roundTripMinBufferMinutes"><span class="rfx-range-val" id="rfx-s-rtBuffer-val">${fmtRangeSettingValue("roundTripMinBufferMinutes", settings.roundTripMinBufferMinutes)}</span></div>
-      <div class="rfx-range-row"><label>Max wait</label><input type="range" id="rfx-s-rtWait" min="1" max="48" step="1" value="${settings.roundTripMaxWaitHours}" data-key="roundTripMaxWaitHours"><span class="rfx-range-val" id="rfx-s-rtWait-val">${fmtRangeSettingValue("roundTripMaxWaitHours", settings.roundTripMaxWaitHours)}</span></div>
-      <div class="rfx-range-row"><label>Min payout</label><input type="range" id="rfx-s-rtPayout" min="0" max="5000" step="50" value="${settings.roundTripMinPayout}" data-key="roundTripMinPayout"><span class="rfx-range-val" id="rfx-s-rtPayout-val">${fmtRangeSettingValue("roundTripMinPayout", settings.roundTripMinPayout)}</span></div>
-      <div class="rfx-range-row"><label>Min $/mi</label><input type="range" id="rfx-s-rtPerMi" min="0" max="10" step="0.25" value="${settings.roundTripMinPerMile}" data-key="roundTripMinPerMile"><span class="rfx-range-val" id="rfx-s-rtPerMi-val">${fmtRangeSettingValue("roundTripMinPerMile", settings.roundTripMinPerMile)}</span></div>
-    </div>
-    <div class="rfx-settings-section">
-      <div class="rfx-settings-section-title">Card Display</div>
-      ${chk("showDistance", "Distance")}
-      ${chk("showStopAddress", "Street addresses")}
-      ${chk("showDwellTime", "Time at stop")}
-      ${chk("showCheckoutTime", "Checkout time")}
-      ${chk("showLoadTypeBadge", "Preloaded badge")}
-      ${chk("showDriverType", "Driver type (Solo/Team)")}
-      ${chk("showEquipment", "Equipment (53' Trailer)")}
-      ${chk("showPostedAge", "Posted age")}
-      ${chk("showTimingRisk", "Timing issue badge")}
-      ${chk("showDuration", "Duration")}
-      ${chk("showExtraStopMeta", "Loaded/empty badge")}
-      ${chk("showScoreBar", "Score bar")}
-      ${chk("showPerHr", "$/hr")}
-      ${chk("showPerMi", "$/mi")}
-      ${chk("showVersionBadge", "Version badge (v14 ⚠)")}
-      ${chk("showLegDistance", "Leg distances between stops")}
-      ${chk("showStopCount", "Stop count")}
-      ${chk("showStopCode", "Stop code (SCK6, KSCK)")}
-    </div>
+    ${settingsPanelWrap("quick", `
+      <div class="rfx-settings-grid">
+        <div class="rfx-settings-section">
+          <div class="rfx-settings-section-title">General</div>
+          ${chk("fastBook", "Fast Book — auto-confirm booking (skips manual confirmation)")}
+          ${chk("autoBook", "Auto-Book — automatically book new loads when detected (clicks Book only, not Confirm)")}
+          ${chk("autoResume", "Auto-resume after stop — restart bot after 5 seconds")}
+          ${chk("amazonOnlyFacilities", "Amazon facilities only")}
+        </div>
+        <div class="rfx-settings-section">
+          <div class="rfx-settings-section-title">Bot Speed</div>
+          <div class="rfx-range-row"><label>Min interval</label><input type="range" id="rfx-s-pollMin" min="1" max="30" value="${settings.pollMinSeconds}" data-key="pollMinSeconds"><span class="rfx-range-val" id="rfx-s-pollMin-val">${settings.pollMinSeconds}s</span></div>
+          <div class="rfx-range-row"><label>Max interval</label><input type="range" id="rfx-s-pollMax" min="1" max="30" value="${settings.pollMaxSeconds}" data-key="pollMaxSeconds"><span class="rfx-range-val" id="rfx-s-pollMax-val">${settings.pollMaxSeconds}s</span></div>
+        </div>
+        <div class="rfx-settings-section">
+          <div class="rfx-settings-section-title">Alerts</div>
+          <div class="rfx-range-row"><label>Min price increase</label><input type="range" id="rfx-s-minPrice" min="0" max="200" step="5" value="${settings.minPriceIncrease}" data-key="minPriceIncrease"><span class="rfx-range-val" id="rfx-s-minPrice-val">${fmtRangeSettingValue("minPriceIncrease", settings.minPriceIncrease)}</span></div>
+          <div class="rfx-settings-help">Only alert on price increases above this amount. Set to 0 to alert on all changes.</div>
+        </div>
+        <div class="rfx-settings-section">
+          <div class="rfx-settings-section-title">Discord</div>
+          <div class="rfx-discord-row">
+            <div class="rfx-discord-note">Send a test notification to the configured Discord webhook.</div>
+            <button type="button" class="rfx-discord-test-btn" id="rfx-test-discord">Test Discord</button>
+          </div>
+        </div>
+      </div>
+    `)}
+    ${settingsPanelWrap("lookout", `
+      <div class="rfx-settings-section rfx-settings-section-full">
+        <div class="rfx-settings-section-title">Lookout</div>
+        ${renderLookoutSettings()}
+      </div>
+    `)}
+    ${settingsPanelWrap("filters", `
+      <div class="rfx-settings-grid">
+        <div class="rfx-settings-section rfx-settings-section-full">
+          <div class="rfx-settings-section-title">Custom Excluded Cities</div>
+          ${renderCustomExcludedCitySettings()}
+        </div>
+        <div class="rfx-settings-section">
+          <div class="rfx-settings-section-title">Hidden Loads</div>
+          <div class="rfx-hidden-loads-row">
+            <span>${getIgnoredLoadIds().size} hidden load${getIgnoredLoadIds().size === 1 ? "" : "s"}</span>
+            <button type="button" class="rfx-clear-hidden-btn" id="rfx-clear-hidden-loads" ${getIgnoredLoadIds().size ? "" : "disabled"}>Clear hidden</button>
+          </div>
+        </div>
+      </div>
+    `)}
+    ${settingsPanelWrap("roundTrips", `
+      <div class="rfx-settings-section rfx-settings-section-full">
+        <div class="rfx-settings-section-title">Round Trips</div>
+        ${chk("showRoundTrips", "Show round-trip matches")}
+        ${chk("roundTripRequireSameDriver", "Require same driver type")}
+        ${chk("roundTripRequireSameEquipment", "Require same equipment")}
+        <div class="rfx-range-row"><label>Connect radius</label><input type="range" id="rfx-s-rtConnect" min="5" max="150" step="5" value="${settings.roundTripConnectionRadiusMiles}" data-key="roundTripConnectionRadiusMiles"><span class="rfx-range-val" id="rfx-s-rtConnect-val">${fmtRangeSettingValue("roundTripConnectionRadiusMiles", settings.roundTripConnectionRadiusMiles)}</span></div>
+        <div class="rfx-range-row"><label>Return radius</label><input type="range" id="rfx-s-rtReturn" min="5" max="150" step="5" value="${settings.roundTripReturnRadiusMiles}" data-key="roundTripReturnRadiusMiles"><span class="rfx-range-val" id="rfx-s-rtReturn-val">${fmtRangeSettingValue("roundTripReturnRadiusMiles", settings.roundTripReturnRadiusMiles)}</span></div>
+        <div class="rfx-range-row"><label>Min buffer</label><input type="range" id="rfx-s-rtBuffer" min="0" max="240" step="15" value="${settings.roundTripMinBufferMinutes}" data-key="roundTripMinBufferMinutes"><span class="rfx-range-val" id="rfx-s-rtBuffer-val">${fmtRangeSettingValue("roundTripMinBufferMinutes", settings.roundTripMinBufferMinutes)}</span></div>
+        <div class="rfx-range-row"><label>Max wait</label><input type="range" id="rfx-s-rtWait" min="1" max="48" step="1" value="${settings.roundTripMaxWaitHours}" data-key="roundTripMaxWaitHours"><span class="rfx-range-val" id="rfx-s-rtWait-val">${fmtRangeSettingValue("roundTripMaxWaitHours", settings.roundTripMaxWaitHours)}</span></div>
+        <div class="rfx-range-row"><label>Min payout</label><input type="range" id="rfx-s-rtPayout" min="0" max="5000" step="50" value="${settings.roundTripMinPayout}" data-key="roundTripMinPayout"><span class="rfx-range-val" id="rfx-s-rtPayout-val">${fmtRangeSettingValue("roundTripMinPayout", settings.roundTripMinPayout)}</span></div>
+        <div class="rfx-range-row"><label>Min $/mi</label><input type="range" id="rfx-s-rtPerMi" min="0" max="10" step="0.25" value="${settings.roundTripMinPerMile}" data-key="roundTripMinPerMile"><span class="rfx-range-val" id="rfx-s-rtPerMi-val">${fmtRangeSettingValue("roundTripMinPerMile", settings.roundTripMinPerMile)}</span></div>
+      </div>
+    `)}
+    ${settingsPanelWrap("display", `
+      <div class="rfx-settings-section rfx-display-settings">
+        <div class="rfx-settings-section-title">Card Display</div>
+        ${chk("showDistance", "Distance")}
+        ${chk("showStopAddress", "Street addresses")}
+        ${chk("showDwellTime", "Time at stop")}
+        ${chk("showCheckoutTime", "Checkout time")}
+        ${chk("showLoadTypeBadge", "Preloaded badge")}
+        ${chk("showDriverType", "Driver type (Solo/Team)")}
+        ${chk("showEquipment", "Equipment (53' Trailer)")}
+        ${chk("showPostedAge", "Posted age")}
+        ${chk("showTimingRisk", "Timing issue badge")}
+        ${chk("showDuration", "Duration")}
+        ${chk("showExtraStopMeta", "Loaded/empty badge")}
+        ${chk("showScoreBar", "Score bar")}
+        ${chk("showPerHr", "$/hr")}
+        ${chk("showPerMi", "$/mi")}
+        ${chk("showVersionBadge", "Version badge (v14 ⚠)")}
+        ${chk("showLegDistance", "Leg distances between stops")}
+        ${chk("showStopCount", "Stop count")}
+        ${chk("showStopCode", "Stop code (SCK6, KSCK)")}
+      </div>
+    `)}
   </div>`;
 
   const autoBookWarning = settings.autoBook
@@ -1833,6 +2646,17 @@ function injectCards() {
 
   const toggleAmazonBtn = shadowRoot.getElementById("rfx-toggle-amazon");
   if (toggleAmazonBtn) toggleAmazonBtn.addEventListener("click", toggleAiMode);
+  shadowRoot.querySelectorAll("[data-settings-tab]").forEach(btn => {
+    btn.addEventListener("click", () => {
+      activeSettingsTab = btn.dataset.settingsTab || "quick";
+      injectCards();
+    });
+  });
+  const testDiscordBtn = shadowRoot.getElementById("rfx-test-discord");
+  if (testDiscordBtn) {
+    testDiscordBtn.addEventListener("click", () => sendDiscordTestNotification(testDiscordBtn));
+  }
+  bindLookoutSettings();
 
   const roundTripToggle = shadowRoot.getElementById("rfx-roundtrip-toggle");
   if (roundTripToggle) {
@@ -1853,6 +2677,7 @@ function injectCards() {
       if (key === "autoResume" && cb.checked && !botRunning && !botStarting) scheduleAutoResume("setting enabled");
       saveSettings();
       injectCards();
+      if (key === "lookoutEnabled" && cb.checked) processLookoutAlerts(allLoads, "lookout-enabled");
     });
   });
 
@@ -2243,7 +3068,6 @@ function styleAmazonLoadCards() {
     }
   });
 
-  console.log(`[StyleCards] ${loadCards.length} cards, ${matchCount} matched, ${noIdCount} no ID, ${noDataCount} no data`);
   if (matchCount === 0 && loadCards.length > 0) {
     const domIds = [];
     loadCards.forEach(card => {
@@ -2252,8 +3076,6 @@ function styleAmazonLoadCards() {
       });
     });
     const dataIds = Array.from(loadMap.keys()).slice(0, 5).map(id => id.substring(0, 15));
-    console.log(`[StyleCards] DOM IDs: ${domIds.slice(0, 5).join(", ")}`);
-    console.log(`[StyleCards] Data IDs: ${dataIds.join(", ")}`);
   }
 
   // Move alerted (new/changed) load cards to the top of the list
@@ -2460,7 +3282,6 @@ async function startBot(options = {}) {
   ensureAudioCtx();
   if (alertedLoads.length > 0) {
     alertedLoads = [];
-    console.log("[Bot] Alerts cleared on Start");
   }
   missingCounts.clear();
   goneLoads.clear();
@@ -2469,7 +3290,6 @@ async function startBot(options = {}) {
   botStarting = false;
   isFirstPoll = seenLoads.size === 0; // Only baseline if this page session has no seen loads yet
   chrome.runtime.sendMessage({ action: "botStarted" }).catch(() => {});
-  console.log(`[Bot] ▶ Started. isFirstPoll=${isFirstPoll}, seenLoads=${seenLoads.size}, allLoads=${allLoads.length}`);
   doPoll(); // immediate first poll
   scheduleNext();
   if (aiModeActive) injectCards();
@@ -2485,11 +3305,9 @@ function cancelAutoResume() {
 function scheduleAutoResume(reason = "stopped") {
   cancelAutoResume();
   if (!settings.autoResume || botRunning || botStarting) return;
-  console.log(`[Bot] Auto-resume scheduled in 5s (${reason})`);
   autoResumeTimer = setTimeout(() => {
     autoResumeTimer = null;
     if (!settings.autoResume || botRunning || botStarting) return;
-    console.log(`[Bot] Auto-resuming after ${reason}`);
     startBot({ skipAutoBookConfirm: true });
   }, 5000);
 }
@@ -2499,7 +3317,6 @@ function stopBot(options = {}) {
   botRunning = false;
   if (botTimer) { clearTimeout(botTimer); botTimer = null; }
   chrome.runtime.sendMessage({ action: "botStopped" }).catch(() => {});
-  console.log("[Bot] Stopped");
   if (aiModeActive) injectCards();
   if (options.allowAutoResume !== false) scheduleAutoResume(options.reason || "stop");
 }
@@ -2514,7 +3331,6 @@ function resetBot() {
   goneLoads.clear();
   isFirstPoll = true;
   lastPollTime = null;
-  console.log("[Bot] Reset — detection map cleared");
   if (aiModeActive) injectCards();
 }
 
@@ -2522,7 +3338,6 @@ function resumeBot() {
   // Move alerted loads into regular list
   cancelAutoResume();
   alertedLoads = [];
-  console.log("[Bot] Resumed — alerts cleared");
   startBot();
 }
 
@@ -2544,7 +3359,6 @@ function handleDetectedAlerts(alerts, sourceLabel = "Bot") {
   const newLoads = alerts.filter(a => a.badge === "NEW");
 
   if (settings.autoBook && newLoads.length > 0) {
-    console.log(`[${sourceLabel}] ★★★ AUTO-BOOK: ${newLoads.length} new loads — booking first one`);
     playAlert();
     const target = newLoads[0];
     alertedLoads.push(...alerts);
@@ -2554,7 +3368,6 @@ function handleDetectedAlerts(alerts, sourceLabel = "Bot") {
     scheduleAutoResume("new load detected");
     setTimeout(() => autoBookLoad(target.wo.id), 100);
   } else {
-    console.log(`[${sourceLabel}] ★★★ ${alerts.length} ALERTS — stopping bot, playing sound`);
     botRunning = false;
     if (botTimer) { clearTimeout(botTimer); botTimer = null; }
     alertedLoads.push(...alerts);
@@ -2568,7 +3381,6 @@ function handleDetectedAlerts(alerts, sourceLabel = "Bot") {
 
 function doPoll() {
   lastPollTime = Date.now();
-  console.log(`[Bot:Poll] Polling now... seenLoads=${seenLoads.size}, isFirstPoll=${isFirstPoll}`);
 
   const fallback = {
     workOpportunityTypeList: ["ONE_WAY", "ROUND_TRIP", "HOSTLER_SHUTTLE"],
@@ -2619,7 +3431,6 @@ window.addEventListener("relay-fetcher-poll-result", (e) => {
     const loads = filterCustomExcludedLoads(rawLoads);
     carrierDetails = data?.carrierDetails || carrierDetails;
     currentSearchAuditId = data?.searchAuditId || currentSearchAuditId;
-    console.log(`[Bot:Poll] Response: status=${status}, fetched=${rawLoads.length}, visibleAfterCityExcludes=${loads.length}, totalResults=${data?.totalResultsSize}`);
 
     if (loads.length === 0 && shouldIgnoreEmptySearchResult("Bot:Poll")) {
       if (aiModeActive) injectCards();
@@ -2633,12 +3444,11 @@ window.addEventListener("relay-fetcher-poll-result", (e) => {
     const alerts = detectChanges(loads);
 
     allLoads = dedupeLoads(loads);
-    console.log(`[Bot:Poll] allLoads replaced from current poll: ${allLoads.length}`);
+    processLookoutAlerts(allLoads, "bot-poll");
 
     if (alerts.length > 0) {
       handleDetectedAlerts(alerts, "Bot:Poll");
     } else {
-      console.log(`[Bot:Poll] No alerts this cycle.`);
     }
 
     if (aiModeActive) injectCards();
@@ -2667,7 +3477,6 @@ function startNegotiation(woId, version, majorVersion, originalPay) {
   negotiationState.set(woId, state);
   updateChatNegUI(woId);
 
-  console.log(`[Negotiator] Starting negotiation for ${woId.substring(0, 8)}... original=$${originalPay.toFixed(2)}`);
 
   runNegotiationRound(woId, version, majorVersion);
 }
@@ -2679,7 +3488,6 @@ function runNegotiationRound(woId, version, majorVersion) {
   state.round++;
   const round = state.round;
 
-  console.log(`[Negotiator] Round ${round} for ${woId.substring(0, 8)}...`);
 
   // Round 1: mention the issue. Round 2+: demand a much higher price
   let query;
@@ -2691,7 +3499,6 @@ function runNegotiationRound(woId, version, majorVersion) {
     query = `That price is still too low given the conditions. I need at least $${demandPrice} to make this work. The fire and road closures are adding significant time and fuel costs.`;
   }
 
-  console.log(`[Negotiator] Round ${round} message: "${query.substring(0, 60)}..."`);
 
   const payload = {
     action: "query",
@@ -2722,7 +3529,6 @@ function runNegotiationRound(woId, version, majorVersion) {
     const prevPrice = state.prices[state.prices.length - 1];
     const aiResponse = data?.response || "";
 
-    console.log(`[Negotiator] Round ${round}: status="${chatStatus}", updatedPrice=${updatedPrice}, aiResponse="${aiResponse.substring(0, 80)}..."`);
 
     // If Amazon ended the conversation (not IN_PROGRESS)
     if (chatStatus !== "IN_PROGRESS") {
@@ -2730,7 +3536,6 @@ function runNegotiationRound(woId, version, majorVersion) {
         state.prices.push(updatedPrice);
         if (updatedPrice > state.bestPay) state.bestPay = updatedPrice;
       }
-      console.log(`[Negotiator] Amazon ended negotiation (status=${chatStatus}). Best: ${fmt$(state.bestPay)}`);
       state.status = "done";
       negotiationState.set(woId, state);
       updateChatNegUI(woId);
@@ -2743,14 +3548,12 @@ function runNegotiationRound(woId, version, majorVersion) {
       state.prices.push(updatedPrice);
       if (updatedPrice > state.bestPay) state.bestPay = updatedPrice;
       const diff = updatedPrice - prevPrice;
-      console.log(`[Negotiator] Round ${round}: ${fmt$(prevPrice)} → ${fmt$(updatedPrice)} (${diff >= 0 ? "+" : ""}${fmt$(diff)})`);
 
       negotiationState.set(woId, state);
       updateChatNegUI(woId);
 
       // Check if price stopped moving
       if (state.prices.length >= 3 && Math.abs(updatedPrice - prevPrice) < 0.01) {
-        console.log(`[Negotiator] Price stopped moving at ${fmt$(updatedPrice)}. Best: ${fmt$(state.bestPay)}`);
         state.status = "done";
         negotiationState.set(woId, state);
           updateChatNegUI(woId);
@@ -2758,14 +3561,12 @@ function runNegotiationRound(woId, version, majorVersion) {
       }
     } else {
       // updatedPrice is null but status is IN_PROGRESS — Amazon is still talking, keep going
-      console.log(`[Negotiator] Round ${round}: No price yet, still IN_PROGRESS. Continuing...`);
       negotiationState.set(woId, state);
       updateChatNegUI(woId);
     }
 
     // Safety cap
     if (round >= 5) {
-      console.log(`[Negotiator] Safety cap reached (5 rounds). Best: ${fmt$(state.bestPay)}`);
       state.status = "done";
       negotiationState.set(woId, state);
       updateChatNegUI(woId);
@@ -2915,7 +3716,6 @@ function stopNegotiation() {
   if (!chatWoId) return;
   const state = negotiationState.get(chatWoId);
   if (!state || state.status !== "running") return;
-  console.log(`[Negotiator] Manually stopped at round ${state.round}. Best: ${fmt$(state.bestPay)}`);
   state.status = "done";
   negotiationState.set(chatWoId, state);
   playNegotiationSound();
@@ -2932,7 +3732,6 @@ function startChatNegotiation() {
   }
 
   // No data yet — send a quick initial query to get the load details
-  console.log("[Negotiator] No chat data yet — sending initial query to get load details");
   if (btn) btn.textContent = "Getting load info...";
 
   // We need the WO ID to send the query, but we don't have it yet
@@ -3015,7 +3814,6 @@ window.addEventListener("relay-fetcher-chat-intercepted", (e) => {
       chatWoMajorVersion = data.workOpportunity.majorVersion || 1;
       // Get original price from the workOpportunity payout
       chatOriginalPay = data.workOpportunity?.payout?.value || data.updatedPrice?.value || 0;
-      console.log(`[Negotiator] Chat intercepted — WO: ${chatWoId.substring(0, 8)}... ver=${chatWoVersion} major=${chatWoMajorVersion} pay=$${chatOriginalPay.toFixed(2)}`);
     }
   } catch (err) {
     console.error("[Negotiator] Chat intercept error:", err);
@@ -3026,7 +3824,6 @@ window.addEventListener("relay-fetcher-chat-intercepted", (e) => {
 // AUTO-BOOK — clicks Book only, never Confirm
 // ============================================================
 async function autoBookLoad(woId) {
-  console.log(`[AutoBook] ★ Auto-booking load: ${woId}`);
   const wo = allLoads.find(w => w.id === woId);
 
   // Close any open panel
@@ -3042,13 +3839,11 @@ async function autoBookLoad(woId) {
     return;
   }
 
-  console.log("[AutoBook] Found load row, clicking...");
   const clickTarget = loadRow.querySelector("a") || loadRow.querySelector("[role='button']") || loadRow;
   clickTarget.click();
   await sleep(500);
 
   // Find the Book button
-  console.log("[AutoBook] Searching for Book button...");
   let bookBtn = null;
   const allButtons = document.querySelectorAll("button, [role='button']");
   for (const btn of allButtons) {
@@ -3071,12 +3866,9 @@ async function autoBookLoad(woId) {
 
   // === BOOKING DISABLED FOR SAFETY — uncomment to enable ===
   // await sleep(200);
-  // console.log("[AutoBook] ★ Clicking Book button...");
   // bookBtn.click();
-  // console.log("[AutoBook] Book clicked — waiting for confirmation panel...");
   // await sleep(500);
   //
-  // console.log("[AutoBook] Searching for Confirm button...");
   // let confirmBtn = null;
   // const confirmArea = document.querySelector("#confirmation-expander, [data-id='confirmation-expander']");
   // if (confirmArea) {
@@ -3106,16 +3898,13 @@ async function autoBookLoad(woId) {
   //   return;
   // }
   // await sleep(200);
-  // console.log("[AutoBook] ★★★ Clicking Confirm button — BOOKING LOAD");
   // confirmBtn.click();
-  // console.log("[AutoBook] ✅ LOAD BOOKED:", woId);
   // bookingState.set(woId, "confirmed");
   // if (aiModeActive) injectCards();
   // showToast("Auto-book: Load booked successfully!");
   // playBookedSound();
   // === END BOOKING DISABLED ===
 
-  console.log("[AutoBook] Book/Confirm DISABLED for safety. Found load but did not click.");
   showToast("Auto-book: Found load but booking is disabled for safety");
 }
 
@@ -3136,6 +3925,52 @@ function showToast(text) {
   toast.textContent = text;
   document.body.appendChild(toast);
   setTimeout(() => toast.remove(), 5000);
+}
+
+async function sendDiscordTestNotification(button) {
+  const webhookUrl = settings.discordWebhookUrl;
+  if (!webhookUrl) {
+    showToast("Discord webhook is not configured");
+    return;
+  }
+
+  const oldText = button?.textContent;
+  if (button) {
+    button.disabled = true;
+    button.textContent = "Sending...";
+  }
+
+  const payload = {
+    username: "Relay Load Fetcher",
+    content: "✅ Test notification from Relay Load Fetcher. Discord webhook is connected.",
+    embeds: [{
+      title: "Discord Alert Test",
+      description: "This is a test message from the Chrome extension.",
+      color: 0x5865F2,
+      fields: [
+        { name: "Page", value: location.hostname || "relay.amazon.com", inline: true },
+        { name: "Time", value: new Date().toLocaleString(), inline: true },
+      ],
+    }],
+  };
+
+  try {
+    const response = await chrome.runtime.sendMessage({
+      action: "sendDiscordWebhook",
+      webhookUrl,
+      payload,
+    });
+    if (!response?.ok) throw new Error(response?.error || "Discord request failed");
+    showToast("Discord test sent");
+  } catch (err) {
+    console.error("[Discord] Test notification failed:", err);
+    showToast(`Discord test failed: ${err?.message || err}`);
+  } finally {
+    if (button) {
+      button.disabled = false;
+      button.textContent = oldText || "Test Discord";
+    }
+  }
 }
 
 function showIgnoredLoadToast(woId) {
@@ -3188,12 +4023,6 @@ function buildBookingPayload(wo) {
 
 function bookLoadDirectFromSearch(woId) {
   const wo = findLoadForAction(woId);
-  console.log("[DirectBook] FastBook click:", {
-    woId,
-    inAllLoads: allLoads.some(w => w?.id === woId),
-    inAlertedLoads: alertedLoads.some(a => a?.wo?.id === woId),
-    found: !!wo,
-  });
   if (!wo) {
     console.warn("[DirectBook] Could not find load in search results:", woId);
     showToast("Direct book: load data not found. Refresh search first.");
@@ -3215,12 +4044,10 @@ function bookLoadDirectFromSearch(woId) {
   const url = `https://relay.amazon.com/api/loadboard/${wo.id}/${wo.version}/option/${wo.workOpportunityOptionId}/majorVersion/${wo.majorVersion}`;
   const payload = buildBookingPayload(wo);
 
-  console.log("[DirectBook] Sending direct booking request:", { url, payload, wo });
   bookingState.set(woId, "pending");
   if (aiModeActive) injectCards();
   showToast(`Booking ${fmt$(wo.payout.value)} load directly...`);
 
-  console.log("[DirectBook] Dispatching relay-fetcher-book-direct");
   window.dispatchEvent(new CustomEvent("relay-fetcher-book-direct", {
     detail: JSON.stringify({ woId, url, payload }),
   }));
@@ -3237,7 +4064,6 @@ window.addEventListener("relay-fetcher-book-direct-result", (e) => {
       return;
     }
 
-    console.log("[DirectBook] Booked:", { woId, status, data });
     bookingState.set(woId, "confirmed");
     alertedLoads = alertedLoads.filter(a => a.wo.id !== woId);
     seenLoads.delete(woId);
@@ -3250,7 +4076,6 @@ window.addEventListener("relay-fetcher-book-direct-result", (e) => {
 });
 
 async function forceAmazonRefresh() {
-  console.log("[Booker] Forcing Amazon UI refresh...");
 
   let clicked = false;
 
@@ -3265,7 +4090,6 @@ async function forceAmazonRefresh() {
     if (/^refresh$/i.test(label) || /auto.?refresh/i.test(label) || isRefreshIcon) {
       btn.click();
       clicked = true;
-      console.log("[Booker] Clicked refresh:", label || "svg icon");
       break;
     }
   }
@@ -3284,14 +4108,12 @@ async function forceAmazonRefresh() {
 
 // Direct book — we already have the load-card element, no searching needed
 async function bookLoadDirect(woId, loadCard) {
-  console.log(`[Booker] Direct book for load: ${woId}`);
 
   // Close any open panel
   document.dispatchEvent(new KeyboardEvent("keydown", { key: "Escape", bubbles: true }));
   await sleep(200);
 
   // Click the load card to open Amazon's detail panel
-  console.log("[Booker] Clicking load card to open panel...");
   const clickTarget = loadCard.querySelector(".wo-tag") || loadCard.querySelector("div[id]") || loadCard;
   clickTarget.click();
   await sleep(500);
@@ -3304,7 +4126,6 @@ async function bookLoadDirect(woId, loadCard) {
   }
 
   // Find the Book button in the panel
-  console.log("[Booker] Searching for Book button...");
   let bookBtn = null;
   const allButtons = document.querySelectorAll("button, [role='button']");
   for (const btn of allButtons) {
@@ -3314,7 +4135,6 @@ async function bookLoadDirect(woId, loadCard) {
     if (txt === "book" || txt === "book load" || txt === "book this load" || label.includes("book")) {
       if (!txt.includes("confirm") && !txt.includes("accept")) {
         bookBtn = btn;
-        console.log(`[Booker] Found Book button: "${btn.textContent.trim()}"`);
         break;
       }
     }
@@ -3329,7 +4149,6 @@ async function bookLoadDirect(woId, loadCard) {
   // === BOOKING DISABLED FOR SAFETY — uncomment to enable ===
   // await sleep(200);
   // bookBtn.click();
-  // console.log("[Booker] Book clicked");
   //
   // if (settings.fastBook) {
   //   await sleep(500);
@@ -3344,7 +4163,6 @@ async function bookLoadDirect(woId, loadCard) {
   //   if (confirmBtn) {
   //     await sleep(200);
   //     confirmBtn.click();
-  //     console.log("[Booker] ✅ CONFIRMED");
   //     bookingState.set(woId, "confirmed");
   //     if (aiModeActive) injectCards();
   //     playBookedSound();
@@ -3357,7 +4175,6 @@ async function bookLoadDirect(woId, loadCard) {
   // showToast("Book clicked — confirm in panel");
   // === END BOOKING DISABLED ===
 
-  console.log("[Booker] Book/Confirm DISABLED for safety. Found Book button but did not click.");
   showToast("Booking disabled for safety — found Book button");
 }
 
@@ -3391,11 +4208,9 @@ function findLoadInDOM(woId, wo) {
 
 async function refreshUntilFound(woId, wo, maxAttempts) {
   for (let attempt = 1; attempt <= maxAttempts; attempt++) {
-    console.log(`[Booker] Refresh + search attempt ${attempt}/${maxAttempts}`);
     showToast(`Looking for load... (${attempt}/${maxAttempts})`);
     await forceAmazonRefresh();
     const row = findLoadInDOM(woId, wo);
-    if (row) { console.log(`[Booker] Found load on attempt ${attempt}`); return row; }
     if (attempt < maxAttempts) await sleep(500);
   }
   return null;
@@ -3403,7 +4218,6 @@ async function refreshUntilFound(woId, wo, maxAttempts) {
 
 async function bookLoad(woId) {
   const wo = allLoads.find(w => w.id === woId);
-  console.log(`[Booker] Starting book flow for load ID: ${woId}`);
 
   // Close any open panel
   document.dispatchEvent(new KeyboardEvent("keydown", { key: "Escape", bubbles: true }));
@@ -3421,7 +4235,6 @@ async function bookLoad(woId) {
   }
 
 	  // Step 2 — Click the load row to open the detail panel
-	  console.log("[Booker] Clicking load row to open detail panel...");
 	  const loadList = document.querySelector(".load-list");
 	  const prevLoadListDisplay = loadList?.style.display;
 	  if (loadList) loadList.style.display = "";
@@ -3432,7 +4245,6 @@ async function bookLoad(woId) {
 	  if (loadList && aiModeActive) loadList.style.display = prevLoadListDisplay || "none";
 
   // Step 3 — Find and click the Book button inside the detail panel
-  console.log("[Booker] Searching for Book button in detail panel...");
   let bookBtn = null;
 
   // Search all buttons on the page for one that says "Book"
@@ -3446,7 +4258,6 @@ async function bookLoad(woId) {
       // Make sure it's not a confirm/accept button
       if (!txt.includes("confirm") && !txt.includes("accept")) {
         bookBtn = btn;
-        console.log(`[Booker] Found Book button: "${btn.textContent.trim()}"`);
         break;
       }
     }
@@ -3460,22 +4271,17 @@ async function bookLoad(woId) {
 
   // === BOOKING DISABLED FOR SAFETY — uncomment to enable ===
   // await sleep(200);
-  // console.log("[Booker] Clicking Book button...");
   // bookBtn.click();
-  // console.log("[Booker] Book button clicked.");
   //
   // if (!settings.fastBook) {
-  //   console.log("[Booker] Fast Book is OFF — waiting for manual confirmation.");
   //   bookingState.set(woId, "pending");
   //   if (aiModeActive) injectCards();
   //   showToast("Book clicked — review and confirm in Amazon's panel");
   //   return;
   // }
   //
-  // console.log("[Booker] Fast Book is ON — auto-confirming...");
   // await sleep(500);
   //
-  // console.log("[Booker] Searching for Confirm button...");
   // let confirmBtn = null;
   // const confirmArea = document.querySelector("#confirmation-expander, [data-id='confirmation-expander']");
   // if (confirmArea) {
@@ -3505,16 +4311,13 @@ async function bookLoad(woId) {
   //   return;
   // }
   // await sleep(200);
-  // console.log("[Booker] Clicking Confirm button...");
   // confirmBtn.click();
-  // console.log("[Booker] ✅ BOOKING CONFIRMED for load:", woId);
   // bookingState.set(woId, "confirmed");
   // if (aiModeActive) injectCards();
   // playBookedSound();
   // showToast("Load booked successfully!");
   // === END BOOKING DISABLED ===
 
-  console.log("[Booker] Book/Confirm DISABLED for safety. Found Book button but did not click.");
   showToast("Booking is disabled for safety — found the load but did not book");
 }
 
@@ -3534,7 +4337,8 @@ function fetchAllLoads() {
       if (error || data?.errorCode) { resolve(); return; }
       carrierDetails = data?.carrierDetails || carrierDetails;
       currentSearchAuditId = data?.searchAuditId || currentSearchAuditId;
-      allLoads = data?.workOpportunities || [];
+      allLoads = filterCustomExcludedLoads(data?.workOpportunities || []);
+      processLookoutAlerts(allLoads, "fetch-all");
       // Populate seenLoads map so detection works correctly from here
       for (const wo of allLoads) {
         if (!seenLoads.has(wo.id)) {
@@ -3585,7 +4389,6 @@ window.addEventListener("relay-fetcher-auto-update", (e) => {
       const filterChanged = !!pageSignature && pageSignature !== currentSearchSignature;
       const suppressDetection = Date.now() < suppressAutoUpdateDetectionUntil;
       if (pageSignature) currentSearchSignature = pageSignature;
-      console.log(`[Bot:AutoUpdate] Amazon page search returned ${rawPageLoads.length} loads (${pageLoads.length} after custom city excludes). botRunning=${botRunning}, botStarting=${botStarting}, alertPaused=${alertPaused}, filterChanged=${filterChanged}, suppressDetection=${suppressDetection}`);
 
       if (pageLoads.length === 0 && shouldIgnoreEmptySearchResult("Bot:AutoUpdate")) {
         if (aiModeActive) injectCards();
@@ -3595,6 +4398,7 @@ window.addEventListener("relay-fetcher-auto-update", (e) => {
 
       if (filterChanged) {
         allLoads = dedupeLoads(pageLoads);
+        processLookoutAlerts(allLoads, "page-search-filter-change");
         if (suppressDetection) {
           if (seenLoads.size === 0) {
             seedSeenLoads(allLoads);
@@ -3602,24 +4406,19 @@ window.addEventListener("relay-fetcher-auto-update", (e) => {
           }
           missingCounts.clear();
           goneLoads.clear();
-          console.log(`[Bot:AutoUpdate] Filter/search refresh during Start — updated visible loads without alerting. seenLoads=${seenLoads.size}`);
         } else if (botRunning && !botStarting && !alertPaused) {
           const alerts = pageLoads.length > 0 ? detectChanges(pageLoads) : [];
           if (alerts.length > 0) {
-            console.log(`[Bot:AutoUpdate] Filter changed while running — detected ${alerts.length} alerts from Amazon page search.`);
             handleDetectedAlerts(alerts, "Bot:AutoUpdate");
           } else {
-            console.log(`[Bot:AutoUpdate] Filter changed while running — no new/changed loads. seenLoads=${seenLoads.size}`);
           }
         } else if (alertPaused) {
-          console.log("[Bot:AutoUpdate] Filter changed while alert-paused — preserving alerted loads and detection state.");
         } else {
           alertedLoads = [];
           missingCounts.clear();
           goneLoads.clear();
           seedSeenLoads(allLoads);
           isFirstPoll = allLoads.length === 0;
-          console.log(`[Bot:AutoUpdate] Filter changed — reset visible loads to ${allLoads.length}, seenLoads=${seenLoads.size}, isFirstPoll=${isFirstPoll}`);
         }
         if (aiModeActive) injectCards();
         return;
@@ -3627,7 +4426,6 @@ window.addEventListener("relay-fetcher-auto-update", (e) => {
 
       if (pageLoads.length === 0) {
         if (botRunning || botStarting || alertPaused) {
-          console.log("[Bot:AutoUpdate] Ignoring empty page search response while bot/alert is active.");
           return;
         }
         allLoads = [];
@@ -3637,7 +4435,6 @@ window.addEventListener("relay-fetcher-auto-update", (e) => {
         recentlyMissingLoads.clear();
         goneLoads.clear();
         isFirstPoll = false;
-        console.log("[Bot:AutoUpdate] Current Amazon search has 0 loads — cleared custom board.");
         if (aiModeActive) injectCards();
         return;
       }
@@ -3654,15 +4451,14 @@ window.addEventListener("relay-fetcher-auto-update", (e) => {
         }
       }
       allLoads = Array.from(dedupMap.values());
+      processLookoutAlerts(allLoads, "page-search");
 
       if (!botRunning && !botStarting && !alertPaused) {
         allLoads = dedupeLoads(pageLoads);
         seedSeenLoads(allLoads);
         isFirstPoll = false;
-        console.log(`[Bot:AutoUpdate] Bot stopped — reset seenLoads to ${seenLoads.size}. isFirstPoll=${isFirstPoll}`);
       } else {
         // Bot is active or alert-paused — do NOT touch seenLoads. Let the bot's own poll/alert state decide.
-        console.log(`[Bot:AutoUpdate] Preserving seenLoads (${seenLoads.size}). allLoads=${allLoads.length}`);
       }
       if (aiModeActive) injectCards();
     }
@@ -3681,7 +4477,6 @@ const observer = new MutationObserver((mutations) => {
 
   // Check if our host got disconnected (Amazon re-rendered the page)
   if (ourHost && !document.contains(ourHost)) {
-    console.log("[Relay Fetcher] Host disconnected — re-injecting");
     ourHost = null;
     shadowRoot = null;
     amazonContainer = null;
@@ -3718,5 +4513,3 @@ function init() {
 
 if (document.body) init();
 else document.addEventListener("DOMContentLoaded", init);
-
-console.log("[Relay Fetcher] Content script loaded.");

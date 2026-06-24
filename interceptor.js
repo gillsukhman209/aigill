@@ -24,7 +24,6 @@
 
   XMLHttpRequest.prototype.send = function (...args) {
     if (this.__relayFetcherBlockedSimilar) {
-      console.log("[Relay Interceptor] Blocked similar XHR:", this.__relayFetcherBlockedUrl);
       try {
         this.abort();
       } catch (e) {}
@@ -38,7 +37,6 @@
     const url = typeof resource === "string" ? resource : resource?.url || "";
 
     if (isSimilarRequest(url)) {
-      console.log("[Relay Interceptor] Blocked similar fetch:", url);
       return new Response(null, { status: 204, statusText: "Blocked by Relay Fetcher" });
     }
 
@@ -274,7 +272,6 @@
   // Direct booking request — mirrors Amazon's confirm booking endpoint.
   window.addEventListener("relay-fetcher-book-direct", async (e) => {
     const req = JSON.parse(e.detail);
-    console.log("[Relay Interceptor] Direct booking fetch:", req.url);
     let csrfToken = capturedCsrfToken;
     if (!csrfToken) {
       const cookies = document.cookie.split(";");
@@ -313,5 +310,4 @@
     }
   });
 
-  console.log("[Relay Interceptor] Installed (MAIN world).");
 })();
