@@ -74,6 +74,10 @@ const DEFAULT_SETTINGS = {
   lookoutGroups: [],
   lookoutRules: [],
   lookoutPriceRealert: 25,
+  detectionOnlyAlertMatchingRules: false,
+  detectionFilterBoard: false,
+  detectionGroups: [],
+  detectionRules: [],
 };
 let settings = { ...DEFAULT_SETTINGS };
 function loadSettings() {
@@ -702,6 +706,29 @@ function saveLookoutRules(rules) {
   saveSettings();
 }
 
+function getDetectionGroups() {
+  return Array.isArray(settings.detectionGroups)
+    ? settings.detectionGroups.filter(g => g?.id).map(group => ({
+      ...normalizeLookoutGroup(group),
+      name: group.name || "Detection group",
+    }))
+    : [];
+}
+
+function saveDetectionGroups(groups) {
+  settings.detectionGroups = (groups || []).filter(g => g?.id).map(normalizeLookoutGroup);
+  saveSettings();
+}
+
+function getDetectionRules() {
+  return Array.isArray(settings.detectionRules) ? settings.detectionRules.filter(r => r?.id) : [];
+}
+
+function saveDetectionRules(rules) {
+  settings.detectionRules = (rules || []).filter(r => r?.id);
+  saveSettings();
+}
+
 function getStopCoordinates(stop) {
   const loc = stop?.location || {};
   const lat = Number(loc.latitude);
@@ -875,6 +902,86 @@ function matchesLookoutRule(wo, rule, groupsById) {
     last,
     endMs: loadEndMs,
   };
+}
+
+function refreshDetectionGroupCoordinates() {
+  let changed = false;
+  const groups = getDetectionGroups().map(group => {
+    const places = (group.places || []).map(place => {
+      if (Number.isFinite(Number(place.lat)) && Number.isFinite(Number(place.lon))) return place;
+      const learned = findCoordinatesForCityInput(place.centerLabel || place.centerText || "");
+      if (learned && Number.isFinite(Number(learned.lat)) && Number.isFinite(Number(learned.lon))) {
+        changed = true;
+        return { ...place, cityKey: place.cityKey || learned.key, centerLabel: place.centerLabel || learned.label, lat: Number(learned.lat), lon: Number(learned.lon) };
+      }
+      return place;
+    });
+    return { ...group, places };
+  });
+  if (changed) saveDetectionGroups(groups);
+}
+
+function matchesDetectionRule(wo, rule, groupsById) {
+  if (!wo?.id || !rule?.enabled) return { ok: false, reason: "disabled" };
+  if (isIgnoredLoad(wo.id) || !passesCustomExcludedCities(wo) || !passesAmazonOnlyFacilities(wo)) return { ok: false, reason: "hidden" };
+  if (rule.amazonOnly && isPrivateLoad(wo)) return { ok: false, reason: "private" };
+
+  const originGroup = groupsById.get(rule.originGroupId);
+  const destinationGroup = groupsById.get(rule.destinationGroupId);
+  if (!originGroup || !destinationGroup) return { ok: false, reason: "missing-group" };
+
+  const first = getLoadStartStop(wo);
+  const last = getLoadEndStop(wo);
+  if (!first || !last) return { ok: false, reason: "missing-stops" };
+
+  const originDistance = distanceToLookoutGroup(first, originGroup);
+  const destinationDistance = distanceToLookoutGroup(last, destinationGroup);
+  if (!originDistance.place) return { ok: false, reason: "origin-group-empty" };
+  if (!destinationDistance.place) return { ok: false, reason: "destination-group-empty" };
+  if (originDistance.miles > Number(originDistance.place.radiusMiles || 0)) return { ok: false, reason: "origin-radius" };
+  if (destinationDistance.miles > Number(destinationDistance.place.radiusMiles || 0)) return { ok: false, reason: "destination-radius" };
+
+  const payout = Number(wo?.payout?.value) || 0;
+  if (Number(rule.minPayout || 0) > 0 && payout < Number(rule.minPayout || 0)) return { ok: false, reason: "payout" };
+
+  const stops = getAllStops(wo);
+  if (Number(rule.maxStops || 0) > 0 && stops.length > Number(rule.maxStops || 0)) return { ok: false, reason: "stops" };
+
+  return {
+    ok: true,
+    originMiles: originDistance.miles,
+    destinationMiles: destinationDistance.miles,
+    originGroup,
+    destinationGroup,
+    originPlace: originDistance.place,
+    destinationPlace: destinationDistance.place,
+  };
+}
+
+function getActiveDetectionRules() {
+  return getDetectionRules().filter(rule => rule.enabled);
+}
+
+function getDetectionRuleMatch(wo) {
+  const rules = getActiveDetectionRules();
+  if (!rules.length) return { ok: true, noRules: true };
+  refreshDetectionGroupCoordinates();
+  const groupsById = new Map(getDetectionGroups().map(group => [group.id, group]));
+  for (const rule of rules) {
+    const match = matchesDetectionRule(wo, rule, groupsById);
+    if (match.ok) return { ...match, rule };
+  }
+  return { ok: false, reason: "no-detection-rule-match" };
+}
+
+function passesDetectionDisplayRules(wo) {
+  if (!settings.detectionFilterBoard || !getActiveDetectionRules().length) return true;
+  return getDetectionRuleMatch(wo).ok;
+}
+
+function passesDetectionAlertRules(wo) {
+  if (!settings.detectionOnlyAlertMatchingRules || !getActiveDetectionRules().length) return true;
+  return getDetectionRuleMatch(wo).ok;
 }
 
 function lookoutRouteSummary(wo) {
@@ -1222,6 +1329,81 @@ function renderLookoutSettings() {
   </div>`;
 }
 
+function renderDetectionSettings() {
+  const groups = getDetectionGroups();
+  const rules = getDetectionRules();
+  const groupOptions = groups.map(group => `<option value="${escapeHtml(group.id)}">${escapeHtml(group.name)}</option>`).join("");
+  const groupsHtml = groups.length ? groups.map(group => {
+    const places = (group.places || []).map(place => {
+      const coordText = Number.isFinite(Number(place.lat)) && Number.isFinite(Number(place.lon)) ? "" : " (city fallback)";
+      return `<span class="rfx-lookout-place-chip">
+        <span>${escapeHtml(place.centerLabel)}${coordText}</span>
+        <input type="number" min="1" max="500" value="${Number(place.radiusMiles || 0)}" data-detection-edit-place-radius="${escapeHtml(group.id)}:${escapeHtml(place.id)}" title="Radius miles">
+        <span>mi</span>
+        <button type="button" data-detection-remove-place="${escapeHtml(group.id)}:${escapeHtml(place.id)}">×</button>
+      </span>`;
+    }).join("") || `<span class="rfx-lookout-empty">No cities in this group</span>`;
+    return `<div class="rfx-lookout-item">
+      <div>
+        <div class="rfx-lookout-edit-head">
+          <input type="text" value="${escapeHtml(group.name)}" data-detection-edit-group-name="${escapeHtml(group.id)}" aria-label="Group name">
+          <span>${(group.places || []).length} cit${(group.places || []).length === 1 ? "y" : "ies"}</span>
+        </div>
+        <div class="rfx-lookout-places">${places}</div>
+        <div class="rfx-lookout-add-place">
+          <input type="text" placeholder="Add city, state" data-detection-place-city="${escapeHtml(group.id)}">
+          <input type="number" min="1" max="500" value="25" data-detection-place-radius="${escapeHtml(group.id)}">
+          <button type="button" data-detection-add-place="${escapeHtml(group.id)}">Add city</button>
+        </div>
+      </div>
+      <button type="button" data-detection-remove-group="${escapeHtml(group.id)}">Remove</button>
+    </div>`;
+  }).join("") : `<div class="rfx-lookout-empty">No detection groups yet.</div>`;
+
+  const rulesHtml = rules.length ? rules.map(rule => {
+    return `<div class="rfx-lookout-item">
+      <div>
+        <div class="rfx-lookout-rule-edit">
+          <input type="text" value="${escapeHtml(rule.name || "Unnamed rule")}" data-detection-edit-rule-name="${escapeHtml(rule.id)}" aria-label="Rule name">
+          <select data-detection-edit-rule-origin="${escapeHtml(rule.id)}">${groups.map(group => `<option value="${escapeHtml(group.id)}" ${group.id === rule.originGroupId ? "selected" : ""}>${escapeHtml(group.name)}</option>`).join("")}</select>
+          <select data-detection-edit-rule-dest="${escapeHtml(rule.id)}">${groups.map(group => `<option value="${escapeHtml(group.id)}" ${group.id === rule.destinationGroupId ? "selected" : ""}>${escapeHtml(group.name)}</option>`).join("")}</select>
+          <input type="number" min="0" step="1" value="${Number(rule.minPayout || 0)}" data-detection-edit-rule-payout="${escapeHtml(rule.id)}" title="Min payout">
+          <input type="number" min="0" max="10" step="1" value="${Number(rule.maxStops || 0)}" data-detection-edit-rule-stops="${escapeHtml(rule.id)}" title="Max stops">
+          <label class="rfx-lookout-check"><input type="checkbox" data-detection-edit-rule-amazon="${escapeHtml(rule.id)}" ${rule.amazonOnly ? "checked" : ""}> Amazon only</label>
+        </div>
+      </div>
+      <label class="rfx-lookout-mini-toggle"><input type="checkbox" data-detection-toggle-rule="${escapeHtml(rule.id)}" ${rule.enabled ? "checked" : ""}> On</label>
+      <button type="button" data-detection-remove-rule="${escapeHtml(rule.id)}">Remove</button>
+    </div>`;
+  }).join("") : `<div class="rfx-lookout-empty">No detection rules yet.</div>`;
+
+  return `<div class="rfx-lookout-box">
+    <div class="rfx-setting-row"><input type="checkbox" id="rfx-s-detectionOnlyAlertMatchingRules" ${settings.detectionOnlyAlertMatchingRules ? "checked" : ""} data-key="detectionOnlyAlertMatchingRules"><label for="rfx-s-detectionOnlyAlertMatchingRules">Only alert matching detection rules</label></div>
+    <div class="rfx-setting-row"><input type="checkbox" id="rfx-s-detectionFilterBoard" ${settings.detectionFilterBoard ? "checked" : ""} data-key="detectionFilterBoard"><label for="rfx-s-detectionFilterBoard">Only show matching detection rules</label></div>
+    <div class="rfx-lookout-help">If no detection rules are enabled, the extension behaves like normal.</div>
+    <div class="rfx-lookout-subhead">Radius groups</div>
+    <div class="rfx-lookout-grid">
+      <input id="rfx-detection-group-name" type="text" placeholder="Group name, e.g. Home">
+      <input id="rfx-detection-group-center" type="text" placeholder="First city, state">
+      <input id="rfx-detection-group-radius" type="number" min="1" max="500" value="50" placeholder="Miles">
+      <button type="button" id="rfx-detection-add-group">Add group</button>
+    </div>
+    <div class="rfx-lookout-help">A group can contain multiple cities, each with its own radius. Origin checks the first stop. Destination checks the final stop.</div>
+    <div class="rfx-lookout-list">${groupsHtml}</div>
+    <div class="rfx-lookout-subhead">Detection rules</div>
+    <div class="rfx-lookout-rule-grid">
+      <input id="rfx-detection-rule-name" type="text" placeholder="Rule name">
+      <select id="rfx-detection-rule-origin"><option value="">Origin group</option>${groupOptions}</select>
+      <select id="rfx-detection-rule-dest"><option value="">Destination group</option>${groupOptions}</select>
+      <input id="rfx-detection-rule-payout" type="number" min="0" step="1" placeholder="Min payout">
+      <input id="rfx-detection-rule-stops" type="number" min="0" max="10" step="1" placeholder="Max stops">
+      <label class="rfx-lookout-check"><input id="rfx-detection-rule-amazon" type="checkbox"> Amazon only</label>
+      <button type="button" id="rfx-detection-add-rule">Add rule</button>
+    </div>
+    <div class="rfx-lookout-list">${rulesHtml}</div>
+  </div>`;
+}
+
 function bindLookoutSettings() {
   if (!shadowRoot) return;
 
@@ -1402,6 +1584,169 @@ function bindLookoutSettings() {
   });
 }
 
+function bindDetectionSettings() {
+  if (!shadowRoot) return;
+
+  const addGroupBtn = shadowRoot.getElementById("rfx-detection-add-group");
+  if (addGroupBtn) {
+    addGroupBtn.addEventListener("click", () => {
+      const nameInput = shadowRoot.getElementById("rfx-detection-group-name");
+      const centerInput = shadowRoot.getElementById("rfx-detection-group-center");
+      const radiusInput = shadowRoot.getElementById("rfx-detection-group-radius");
+      const centerText = String(centerInput?.value || "").trim();
+      const place = buildLookoutPlace(centerText, radiusInput?.value || 50);
+      if (!centerText || !place) {
+        showToast("Detection: enter a city/state");
+        return;
+      }
+      const name = String(nameInput?.value || "").trim() || place.centerLabel || centerText;
+      saveDetectionGroups([...getDetectionGroups(), {
+        id: makeId("dgrp"),
+        name,
+        places: [place],
+      }]);
+      injectCards();
+      showToast("Detection group added");
+    });
+  }
+
+  shadowRoot.querySelectorAll("[data-detection-add-place]").forEach(btn => {
+    btn.addEventListener("click", () => {
+      const groupId = btn.dataset.detectionAddPlace;
+      const cityInput = Array.from(shadowRoot.querySelectorAll("[data-detection-place-city]"))
+        .find(input => input.dataset.detectionPlaceCity === groupId);
+      const radiusInput = Array.from(shadowRoot.querySelectorAll("[data-detection-place-radius]"))
+        .find(input => input.dataset.detectionPlaceRadius === groupId);
+      const place = buildLookoutPlace(cityInput?.value || "", radiusInput?.value || 25);
+      if (!place) {
+        showToast("Detection: enter a city/state");
+        return;
+      }
+      saveDetectionGroups(getDetectionGroups().map(group => {
+        if (group.id !== groupId) return group;
+        const places = [...(group.places || []).filter(existing => existing.cityKey !== place.cityKey), place];
+        return { ...group, places };
+      }));
+      injectCards();
+      showToast("Detection city added");
+    });
+  });
+
+  shadowRoot.querySelectorAll("[data-detection-remove-place]").forEach(btn => {
+    btn.addEventListener("click", () => {
+      const [groupId, placeId] = String(btn.dataset.detectionRemovePlace || "").split(":");
+      saveDetectionGroups(getDetectionGroups().map(group => (
+        group.id === groupId
+          ? { ...group, places: (group.places || []).filter(place => place.id !== placeId) }
+          : group
+      )));
+      injectCards();
+    });
+  });
+
+  shadowRoot.querySelectorAll("[data-detection-edit-group-name]").forEach(input => {
+    input.addEventListener("change", () => {
+      const groupId = input.dataset.detectionEditGroupName;
+      const name = String(input.value || "").trim() || "Detection group";
+      saveDetectionGroups(getDetectionGroups().map(group => group.id === groupId ? { ...group, name } : group));
+      injectCards();
+    });
+  });
+
+  shadowRoot.querySelectorAll("[data-detection-edit-place-radius]").forEach(input => {
+    input.addEventListener("change", () => {
+      const [groupId, placeId] = String(input.dataset.detectionEditPlaceRadius || "").split(":");
+      const radiusMiles = Math.max(1, Number(input.value) || 25);
+      saveDetectionGroups(getDetectionGroups().map(group => {
+        if (group.id !== groupId) return group;
+        return {
+          ...group,
+          places: (group.places || []).map(place => place.id === placeId ? { ...place, radiusMiles } : place),
+        };
+      }));
+      injectCards();
+    });
+  });
+
+  shadowRoot.querySelectorAll("[data-detection-remove-group]").forEach(btn => {
+    btn.addEventListener("click", () => {
+      const id = btn.dataset.detectionRemoveGroup;
+      saveDetectionGroups(getDetectionGroups().filter(group => group.id !== id));
+      saveDetectionRules(getDetectionRules().filter(rule => rule.originGroupId !== id && rule.destinationGroupId !== id));
+      injectCards();
+    });
+  });
+
+  const addRuleBtn = shadowRoot.getElementById("rfx-detection-add-rule");
+  if (addRuleBtn) {
+    addRuleBtn.addEventListener("click", () => {
+      const name = String(shadowRoot.getElementById("rfx-detection-rule-name")?.value || "").trim() || "Detection rule";
+      const originGroupId = shadowRoot.getElementById("rfx-detection-rule-origin")?.value || "";
+      const destinationGroupId = shadowRoot.getElementById("rfx-detection-rule-dest")?.value || "";
+      if (!originGroupId || !destinationGroupId) {
+        showToast("Detection: choose origin and destination groups");
+        return;
+      }
+      const minPayout = Math.max(0, Number(shadowRoot.getElementById("rfx-detection-rule-payout")?.value) || 0);
+      const maxStops = Math.max(0, Number(shadowRoot.getElementById("rfx-detection-rule-stops")?.value) || 0);
+      const amazonOnly = !!shadowRoot.getElementById("rfx-detection-rule-amazon")?.checked;
+      saveDetectionRules([...getDetectionRules(), {
+        id: makeId("drule"),
+        name,
+        originGroupId,
+        destinationGroupId,
+        minPayout,
+        maxStops,
+        amazonOnly,
+        enabled: true,
+      }]);
+      settings.detectionOnlyAlertMatchingRules = true;
+      saveSettings();
+      injectCards();
+      showToast("Detection rule added");
+    });
+  }
+
+  shadowRoot.querySelectorAll("[data-detection-remove-rule]").forEach(btn => {
+    btn.addEventListener("click", () => {
+      const id = btn.dataset.detectionRemoveRule;
+      saveDetectionRules(getDetectionRules().filter(rule => rule.id !== id));
+      injectCards();
+    });
+  });
+
+  shadowRoot.querySelectorAll("[data-detection-toggle-rule]").forEach(cb => {
+    cb.addEventListener("change", () => {
+      const id = cb.dataset.detectionToggleRule;
+      saveDetectionRules(getDetectionRules().map(rule => rule.id === id ? { ...rule, enabled: cb.checked } : rule));
+      injectCards();
+    });
+  });
+
+  const updateRule = (id, patch) => {
+    saveDetectionRules(getDetectionRules().map(rule => rule.id === id ? { ...rule, ...patch } : rule));
+    injectCards();
+  };
+  shadowRoot.querySelectorAll("[data-detection-edit-rule-name]").forEach(input => {
+    input.addEventListener("change", () => updateRule(input.dataset.detectionEditRuleName, { name: String(input.value || "").trim() || "Detection rule" }));
+  });
+  shadowRoot.querySelectorAll("[data-detection-edit-rule-origin]").forEach(select => {
+    select.addEventListener("change", () => updateRule(select.dataset.detectionEditRuleOrigin, { originGroupId: select.value }));
+  });
+  shadowRoot.querySelectorAll("[data-detection-edit-rule-dest]").forEach(select => {
+    select.addEventListener("change", () => updateRule(select.dataset.detectionEditRuleDest, { destinationGroupId: select.value }));
+  });
+  shadowRoot.querySelectorAll("[data-detection-edit-rule-payout]").forEach(input => {
+    input.addEventListener("change", () => updateRule(input.dataset.detectionEditRulePayout, { minPayout: Math.max(0, Number(input.value) || 0) }));
+  });
+  shadowRoot.querySelectorAll("[data-detection-edit-rule-stops]").forEach(input => {
+    input.addEventListener("change", () => updateRule(input.dataset.detectionEditRuleStops, { maxStops: Math.max(0, Number(input.value) || 0) }));
+  });
+  shadowRoot.querySelectorAll("[data-detection-edit-rule-amazon]").forEach(cb => {
+    cb.addEventListener("change", () => updateRule(cb.dataset.detectionEditRuleAmazon, { amazonOnly: cb.checked }));
+  });
+}
+
 function getDisplaySettingsSignature() {
   return [
     settings.showScoreBar,
@@ -1423,6 +1768,7 @@ function getDisplaySettingsSignature() {
     settings.showStopCode,
     settings.showExtraStopMeta,
     settings.amazonOnlyFacilities,
+    settings.detectionFilterBoard,
     settings.fastBook,
   ].map(Boolean).join("");
 }
@@ -1631,7 +1977,9 @@ function detectChanges(newLoads) {
         missingCounts.delete(wo.id);
         goneLoads.delete(wo.id);
       } else {
-        alerts.push({ wo, badge: "NEW", badgeClass: "badge-new" });
+        if (passesDetectionAlertRules(wo)) {
+          alerts.push({ wo, badge: "NEW", badgeClass: "badge-new" });
+        }
       }
       seenLoads.set(wo.id, { version: newVer, payout: newPay, pickupTime: newPickup });
     } else {
@@ -1660,7 +2008,9 @@ function detectChanges(newLoads) {
 	          badge = `TIME CHANGED ${fmtTimeShort(prev.pickupTime)} → ${fmtTimeShort(newPickup)}`;
 	          badgeClass = "badge-time";
 	        }
-        alerts.push({ wo, badge, badgeClass, priceDelta: payChanged ? priceIncrease : null });
+        if (passesDetectionAlertRules(wo)) {
+          alerts.push({ wo, badge, badgeClass, priceDelta: payChanged ? priceIncrease : null });
+        }
         seenLoads.set(wo.id, { version: newVer, payout: newPay, pickupTime: newPickup });
       } else if (verChanged) {
         seenLoads.set(wo.id, { version: newVer, payout: newPay, pickupTime: newPickup });
@@ -2441,15 +2791,16 @@ function renderCustomLoadBoard() {
   const alerted = [];
   for (const alert of alertedLoads) {
     const wo = loadMap.get(alert.wo.id) || alert.wo;
-    if (wo && passesCustomExcludedCities(wo) && passesAmazonOnlyFacilities(wo) && !isIgnoredLoad(wo.id)) alerted.push({ wo, alert });
+    if (wo && passesCustomExcludedCities(wo) && passesAmazonOnlyFacilities(wo) && passesDetectionDisplayRules(wo) && !isIgnoredLoad(wo.id)) alerted.push({ wo, alert });
   }
 
   const regularLoads = sortLoads(
-    Array.from(loadMap.values()).filter(wo => !alertMap.has(wo.id) && passesCustomExcludedCities(wo) && passesAmazonOnlyFacilities(wo) && !isIgnoredLoad(wo.id))
+    Array.from(loadMap.values()).filter(wo => !alertMap.has(wo.id) && passesCustomExcludedCities(wo) && passesAmazonOnlyFacilities(wo) && passesDetectionDisplayRules(wo) && !isIgnoredLoad(wo.id))
   );
   const hiddenByCity = Array.from(loadMap.values()).filter(wo => !passesCustomExcludedCities(wo)).length;
   const hiddenByFacility = Array.from(loadMap.values()).filter(wo => passesCustomExcludedCities(wo) && !passesAmazonOnlyFacilities(wo)).length;
-  const hiddenByLoad = Array.from(loadMap.values()).filter(wo => isIgnoredLoad(wo.id)).length;
+  const hiddenByDetection = Array.from(loadMap.values()).filter(wo => passesCustomExcludedCities(wo) && passesAmazonOnlyFacilities(wo) && !passesDetectionDisplayRules(wo)).length;
+  const hiddenByLoad = Array.from(loadMap.values()).filter(wo => passesCustomExcludedCities(wo) && passesAmazonOnlyFacilities(wo) && passesDetectionDisplayRules(wo) && isIgnoredLoad(wo.id)).length;
 
   const sortBtn = (key, label) => {
     const active = currentSort === key ? " active" : "";
@@ -2464,7 +2815,7 @@ function renderCustomLoadBoard() {
     })),
     ...regularLoads.map(wo => renderCard(wo, "", null)),
   ].join("");
-  const boardLoads = Array.from(loadMap.values()).filter(wo => passesCustomExcludedCities(wo) && passesAmazonOnlyFacilities(wo) && !isIgnoredLoad(wo.id));
+  const boardLoads = Array.from(loadMap.values()).filter(wo => passesCustomExcludedCities(wo) && passesAmazonOnlyFacilities(wo) && passesDetectionDisplayRules(wo) && !isIgnoredLoad(wo.id));
   const roundTripsHtml = renderRoundTripMatches(boardLoads, alertMap);
 
   return `<div class="rfx-load-board">
@@ -2475,7 +2826,7 @@ function renderCustomLoadBoard() {
       ${sortBtn("distance", "Distance")}
       ${sortBtn("time", "Start time")}
       ${sortBtn("postedAge", "Posted age")}
-      <span class="rfx-count">${alerted.length + regularLoads.length} of ${loadMap.size} loads${alerted.length ? ` · ${alerted.length} new` : ""}${hiddenByCity + hiddenByFacility + hiddenByLoad ? ` · ${hiddenByCity + hiddenByFacility + hiddenByLoad} hidden` : ""}</span>
+      <span class="rfx-count">${alerted.length + regularLoads.length} of ${loadMap.size} loads${alerted.length ? ` · ${alerted.length} new` : ""}${hiddenByCity + hiddenByFacility + hiddenByDetection + hiddenByLoad ? ` · ${hiddenByCity + hiddenByFacility + hiddenByDetection + hiddenByLoad} hidden` : ""}</span>
     </div>
     ${roundTripsHtml}
     ${alerted.length ? `<div class="rfx-section-title">Recently added</div>` : ""}
@@ -2616,6 +2967,7 @@ function injectCards() {
       <div class="rfx-settings-tabs">
         ${settingsTab("quick", "Quick")}
         ${settingsTab("lookout", "Lookout")}
+        ${settingsTab("detection", "Detection")}
         ${settingsTab("filters", "Filters")}
         ${settingsTab("roundTrips", "Round Trips")}
         ${settingsTab("display", "Display")}
@@ -2653,6 +3005,12 @@ function injectCards() {
       <div class="rfx-settings-section rfx-settings-section-full">
         <div class="rfx-settings-section-title">Lookout</div>
         ${renderLookoutSettings()}
+      </div>
+    `)}
+    ${settingsPanelWrap("detection", `
+      <div class="rfx-settings-section rfx-settings-section-full">
+        <div class="rfx-settings-section-title">Detection Rules</div>
+        ${renderDetectionSettings()}
       </div>
     `)}
     ${settingsPanelWrap("filters", `
@@ -2742,6 +3100,7 @@ function injectCards() {
     testDiscordBtn.addEventListener("click", () => sendDiscordTestNotification(testDiscordBtn));
   }
   bindLookoutSettings();
+  bindDetectionSettings();
 
   const roundTripToggle = shadowRoot.getElementById("rfx-roundtrip-toggle");
   if (roundTripToggle) {
@@ -2969,6 +3328,11 @@ function styleAmazonLoadCards() {
 	    }
 	    if (isIgnoredLoad(woId)) {
 	      card.classList.add("rfx-load-ignored");
+	      return;
+	    }
+	    if (!passesDetectionDisplayRules(wo)) {
+	      card.classList.add("rfx-no-match");
+	      hideUnmatchedLoadCard(card);
 	      return;
 	    }
 	    card.classList.remove("rfx-load-ignored");
