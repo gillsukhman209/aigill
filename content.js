@@ -94,6 +94,7 @@ const negotiationState = new Map();
 
 // Booking state — key: woId, value: 'idle'|'pending'|'failed'
 const bookingState = new Map();
+const armedFastBookLoads = new Set();
 
 // Bot state
 let botRunning = false;
@@ -915,34 +916,109 @@ function pruneLookoutAlertHistory(history) {
 }
 
 function shouldSendLookoutAlert(history, rule, wo) {
-  const key = `${rule.id}:${wo.id}`;
-  const previous = history[key];
+  const key = `${rule.id}:${getLookoutLoadKey(wo)}`;
+  const legacyKey = wo?.id ? `${rule.id}:${wo.id}` : key;
+  const previousKey = history[key] ? key : history[legacyKey] ? legacyKey : key;
+  const previous = history[previousKey];
   const price = Number(wo?.payout?.value) || 0;
-  if (!previous) return { send: true, key, priceDelta: 0, isRealert: false };
-  const delta = price - Number(previous.price || 0);
+  if (!previous) return { send: true, key, legacyKey, price, priceDelta: 0, isRealert: false };
+  const previousPrice = Number(previous.price);
+  const needsHistoryRepair = previousKey !== key || !Number.isFinite(previousPrice);
+  const delta = Number.isFinite(previousPrice) ? price - previousPrice : 0;
   const threshold = Number(settings.lookoutPriceRealert || 0);
-  if (threshold > 0 && delta >= threshold) return { send: true, key, priceDelta: delta, isRealert: true };
-  return { send: false, key, priceDelta: delta, isRealert: false };
+  if (threshold > 0 && delta >= threshold) return { send: true, key, legacyKey, price, priceDelta: delta, isRealert: true };
+  return { send: false, key, legacyKey, price, priceDelta: delta, isRealert: false, needsHistoryRepair };
+}
+
+function getLookoutLoadKey(wo) {
+  if (wo?.id) return `id:${wo.id}`;
+  const stops = getAllStops(wo);
+  const first = stops[0];
+  const last = stops[stops.length - 1];
+  return [
+    "fp",
+    stopCityState(first),
+    getStopCheckin(first) || "",
+    stopCityState(last),
+    getStopCheckout(last) || getStopCheckin(last) || "",
+    Number(wo?.totalDistance?.value || 0).toFixed(1),
+  ].join("|");
+}
+
+function truncateDiscordValue(value, max = 1024) {
+  const text = String(value || "N/A");
+  return text.length > max ? `${text.slice(0, Math.max(0, max - 1))}…` : text;
+}
+
+function getLookoutStopLines(wo) {
+  const stops = getAllStops(wo);
+  const firstTz = stops[0]?.location?.timeZone || "America/Los_Angeles";
+  return stops.map((stop, index) => {
+    const loc = stop.location || {};
+    const tz = loc.timeZone || firstTz;
+    const checkin = getStopCheckin(stop);
+    const checkout = getStopCheckout(stop);
+    const time = fmtStopTimeWindow(checkin, checkout, tz) || fmtStopDateTime(checkin, tz) || "time unknown";
+    const code = loc.stopCode || loc.label || "";
+    const city = stopCityState(stop);
+    const address = [loc.line1, loc.line2].filter(Boolean).join(", ");
+    const pickupTypes = getPickupLoadTypesForStop(wo, stop);
+    const loadingType = titleCaseValue(stop.loadingType || "");
+    const badges = [...pickupTypes, loadingType].filter(Boolean).join(", ");
+    const facilityType = isAmazonFacilityStop(stop) ? "Amazon" : "Private";
+    return [
+      `${index + 1}. ${code ? `${code} - ` : ""}${city}`,
+      `   ${time}`,
+      address ? `   ${address}` : "",
+      badges ? `   ${badges}` : "",
+      `   ${facilityType}`,
+    ].filter(Boolean).join("\n");
+  });
+}
+
+function getLookoutLoadDetails(wo) {
+  const pay = Number(wo?.payout?.value) || 0;
+  const dist = Number(wo?.totalDistance?.value) || 0;
+  const durMs = Number(wo?.totalDuration) || 0;
+  const durH = durMs / 3600000;
+  const perMi = dist > 0 ? pay / dist : 0;
+  const perHr = durH > 0 ? pay / durH : 0;
+  const driver = wo?.transitOperatorType === "TEAM_DRIVER" ? "Team" : "Solo";
+  const timingRisk = getTimingRisk(wo);
+  return [
+    `Payout: ${fmt$(pay)}`,
+    dist ? `Distance: ${dist.toFixed(1)} mi` : "",
+    durMs ? `Duration: ${fmtDur(durMs)}` : "",
+    perMi ? `$/mi: ${fmt$(perMi)}` : "",
+    perHr ? `$/hr: ${fmt$(perHr)}` : "",
+    `Stops: ${getAllStops(wo).length || wo?.stopCount || "N/A"}`,
+    `Driver: ${driver}`,
+    "Equipment: 53' Trailer",
+    hasPreloadedStop(wo) ? "Load type: Preloaded" : "",
+    isPrivateLoad(wo) ? "Facility: Private load" : "Facility: Amazon facilities",
+    wo?.createdAtTime ? `Posted: ${fmtAge(wo.createdAtTime)}` : "",
+    timingRisk ? `Timing issue: ${timingRisk.label} (${timingRisk.detail})` : "",
+    wo?.id ? `Load ID: ${wo.id}` : "",
+  ].filter(Boolean).join("\n");
 }
 
 function buildLookoutDiscordPayload(rule, wo, match, alertInfo) {
   const route = `${stopCityState(match.first)} → ${stopCityState(match.last)}`;
   const start = fmtStopDateTime(getStopCheckin(match.first), match.first?.location?.timeZone);
   const end = fmtStopDateTime(getStopCheckout(match.last) || getStopCheckin(match.last), match.last?.location?.timeZone);
+  const stopLines = getLookoutStopLines(wo).join("\n\n");
   const fields = [
     { name: "Route", value: route, inline: false },
-    { name: "Payout", value: fmt$(Number(wo?.payout?.value) || 0), inline: true },
-    { name: "Distance", value: `${(Number(wo?.totalDistance?.value) || 0).toFixed(1)} mi`, inline: true },
-    { name: "Stops", value: String(getAllStops(wo).length || wo?.stopCount || "N/A"), inline: true },
     { name: "Start", value: start || "N/A", inline: true },
     { name: "End", value: end || "N/A", inline: true },
-    { name: "Radius", value: `${match.originGroup.name} (${match.originPlace.centerLabel}): ${match.originMiles.toFixed(1)} mi\n${match.destinationGroup.name} (${match.destinationPlace.centerLabel}): ${match.destinationMiles.toFixed(1)} mi`, inline: true },
-    { name: "Load ID", value: String(wo.id), inline: false },
+    { name: "Details", value: truncateDiscordValue(getLookoutLoadDetails(wo)), inline: false },
+    { name: "Stops", value: truncateDiscordValue(stopLines), inline: false },
+    { name: "Radius match", value: truncateDiscordValue(`${match.originGroup.name} (${match.originPlace.centerLabel}): ${match.originMiles.toFixed(1)} mi / ${match.originPlace.radiusMiles} mi\n${match.destinationGroup.name} (${match.destinationPlace.centerLabel}): ${match.destinationMiles.toFixed(1)} mi / ${match.destinationPlace.radiusMiles} mi`), inline: false },
   ];
-  if (alertInfo?.isRealert) fields.unshift({ name: "Price increase", value: `+${fmt$(alertInfo.priceDelta).replace("$", "$")}`, inline: true });
+  if (alertInfo?.isRealert) fields.unshift({ name: "Price increase", value: `+${fmt$(alertInfo.priceDelta)}`, inline: true });
 
   return {
-    content: `Lookout match: ${rule.name || "Unnamed rule"}`,
+    content: `${alertInfo?.isRealert ? "Price-up Lookout match" : "Lookout match"}: ${rule.name || "Unnamed rule"} - ${route} - ${fmt$(Number(wo?.payout?.value) || 0)}`,
     embeds: [{
       title: `${alertInfo?.isRealert ? "Price-up " : ""}Relay Lookout Match`,
       description: route,
@@ -1003,6 +1079,7 @@ async function processLookoutAlerts(loads, source = "search") {
   try {
     const groupsById = new Map(groups.map(group => [group.id, group]));
     const history = pruneLookoutAlertHistory(loadLookoutAlertHistory());
+    let historyDirty = false;
     const sent = [];
     for (const rule of rules) {
       const reasonCounts = new Map();
@@ -1018,6 +1095,11 @@ async function processLookoutAlerts(loads, source = "search") {
         matches++;
         const alertInfo = shouldSendLookoutAlert(history, rule, wo);
         if (!alertInfo.send) {
+          if (alertInfo.needsHistoryRepair) {
+            history[alertInfo.key] = { price: alertInfo.price, alertedAt: history[alertInfo.legacyKey]?.alertedAt || Date.now(), source: history[alertInfo.legacyKey]?.source || source };
+            if (alertInfo.legacyKey && alertInfo.legacyKey !== alertInfo.key) delete history[alertInfo.legacyKey];
+            historyDirty = true;
+          }
           historySkips++;
           console.log(`[Lookout] Already alerted: rule=${rule.name || rule.id}, load=${String(wo.id).slice(0, 8)}, priceDelta=${alertInfo.priceDelta.toFixed(2)}, threshold=${settings.lookoutPriceRealert}`);
           continue;
@@ -1027,13 +1109,17 @@ async function processLookoutAlerts(loads, source = "search") {
         console.log(`[Lookout] Sending Discord alert: rule=${rule.name || rule.id}, load=${String(wo.id).slice(0, 8)}, realert=${alertInfo.isRealert ? "yes" : "no"}`);
         await sendDiscordPayload(payload);
         history[alertInfo.key] = { price: alertInfo.price, alertedAt: Date.now(), source };
+        if (alertInfo.legacyKey && alertInfo.legacyKey !== alertInfo.key) delete history[alertInfo.legacyKey];
+        historyDirty = true;
         sent.push({ rule: rule.name, loadId: wo.id });
       }
       console.log(`[Lookout] Rule summary: ${rule.name || rule.id}; matches=${matches}; alreadyAlerted=${historySkips}; rejected={${lookoutReasonSummary(reasonCounts) || "none"}}`);
       if (sent.length >= LOOKOUT_MAX_ALERTS_PER_PASS) break;
     }
-    if (sent.length) {
+    if (sent.length || historyDirty) {
       saveLookoutAlertHistory(history);
+    }
+    if (sent.length) {
       console.log(`[Lookout] Sent ${sent.length} Discord alert(s) from ${source}.`, sent);
     } else {
       console.log(`[Lookout] No Discord alerts sent from ${source}`);
@@ -2147,8 +2233,7 @@ function renderCard(wo, extraClass, changeBadge) {
   const privateLoad = isPrivateLoad(wo);
   const loadDisplayId = getLoadDisplayId(wo);
   const bState = bookingState.get(wo.id) || "idle";
-  const isAlerted = !!changeBadge;
-  const fastBookForThisLoad = settings.fastBook && isAlerted;
+  const armedForFastBook = settings.fastBook || armedFastBookLoads.has(wo.id);
   const cls = [
     "rfx-card",
     goneLoads.has(wo.id) ? "gone" : "",
@@ -2253,7 +2338,7 @@ function renderCard(wo, extraClass, changeBadge) {
             ? `<button class="rfx-book-btn" style="background:#067d62;color:#fff;cursor:default" disabled>✅ Booked</button>`
             : bState === "pending"
               ? `<button class="rfx-book-btn pending" data-wo-id="${wo.id}" disabled>Booking...</button>`
-              : `<button class="rfx-book-btn" data-wo-id="${wo.id}" data-fastbook="${fastBookForThisLoad ? "1" : "0"}">${fastBookForThisLoad ? (bState === "failed" ? "RETRY FASTBOOK" : "FASTBOOK") : "BOOK"}</button>`
+              : `<button class="rfx-book-btn" data-wo-id="${wo.id}" data-action="${armedForFastBook ? "fastbook" : "arm"}">${armedForFastBook ? (bState === "failed" ? "RETRY FASTBOOK" : "FASTBOOK") : "BOOK"}</button>`
         }
       </div>
     </div>
@@ -2262,14 +2347,14 @@ function renderCard(wo, extraClass, changeBadge) {
 
 function renderRoundTripBookButton(wo, isAlerted) {
   const bState = bookingState.get(wo.id) || "idle";
-  const fastBookForThisLoad = settings.fastBook && isAlerted;
+  const armedForFastBook = settings.fastBook || armedFastBookLoads.has(wo.id);
   if (bState === "confirmed") {
     return `<button class="rfx-book-btn" style="background:#067d62;color:#fff;cursor:default" disabled>Booked</button>`;
   }
   if (bState === "pending") {
     return `<button class="rfx-book-btn pending" data-wo-id="${wo.id}" disabled>Booking...</button>`;
   }
-  return `<button class="rfx-book-btn" data-wo-id="${wo.id}" data-fastbook="${fastBookForThisLoad ? "1" : "0"}">${fastBookForThisLoad ? "FASTBOOK" : "BOOK"}</button>`;
+  return `<button class="rfx-book-btn" data-wo-id="${wo.id}" data-action="${armedForFastBook ? "fastbook" : "arm"}">${armedForFastBook ? "FASTBOOK" : "BOOK"}</button>`;
 }
 
 function renderRoundTripLeg(info, label) {
@@ -2673,6 +2758,7 @@ function injectCards() {
       settings[key] = cb.checked;
       if (key === "fastBook" && cb.checked) settings.autoBook = false;
       else if (key === "autoBook" && cb.checked) settings.fastBook = false;
+      if ((key === "fastBook" && !cb.checked) || (key === "autoBook" && cb.checked)) armedFastBookLoads.clear();
       if (key === "autoResume" && !cb.checked) cancelAutoResume();
       if (key === "autoResume" && cb.checked && !botRunning && !botStarting) scheduleAutoResume("setting enabled");
       saveSettings();
@@ -2757,8 +2843,13 @@ function injectCards() {
       e.stopPropagation();
       const woId = btn.dataset.woId;
       if (!woId || btn.disabled) return;
-      if (btn.dataset.fastbook === "1") bookLoadDirectFromSearch(woId);
-      else bookLoad(woId);
+      if (btn.dataset.action === "fastbook") {
+        bookLoadDirectFromSearch(woId);
+        return;
+      }
+      armedFastBookLoads.add(woId);
+      injectCards();
+      showToast("Fastbook armed for this load. Click FASTBOOK to book.");
     });
   });
 
@@ -3009,15 +3100,15 @@ function styleAmazonLoadCards() {
     if (settings.showStopCount) footer += ` <span>${wo.stopCount || stops.length} stops</span>`;
     if (timingRisk) footer += ` <span class="rfx-i-timing-risk ${timingRisk.level}" title="${escapeHtml(timingRisk.detail)}">Timing issue · ${escapeHtml(timingRisk.label)}</span>`;
 
-    const fastBookForThisLoad = settings.fastBook && !!alert;
+    const armedForFastBook = settings.fastBook || armedFastBookLoads.has(woId);
 
-    // BOOK/FASTBOOK button — FASTBOOK only applies to newly detected/changed loads.
+    // BOOK arms one load; FASTBOOK sends the direct booking request for that load.
     const bookBtn = (
       bState === "confirmed"
         ? `<button class="rfx-i-book" style="background:#067d62;color:#fff;cursor:default" disabled>Booked</button>`
         : bState === "pending"
           ? `<button class="rfx-i-book" style="background:#b8860b;color:#fff;cursor:default" disabled>Booking...</button>`
-          : `<button class="rfx-i-book" data-wo-id="${woId}">${fastBookForThisLoad ? (bState === "failed" ? "RETRY FASTBOOK" : "FASTBOOK") : "BOOK"}</button>`
+          : `<button class="rfx-i-book" data-wo-id="${woId}" data-action="${armedForFastBook ? "fastbook" : "arm"}">${armedForFastBook ? (bState === "failed" ? "RETRY FASTBOOK" : "FASTBOOK") : "BOOK"}</button>`
     );
 
     // Alert badge if this is a new/changed load
@@ -3045,26 +3136,29 @@ function styleAmazonLoadCards() {
 
     card.appendChild(inject);
 
-    // Bind BOOK button. Only Fast Book sends Amazon's confirm-book request directly.
-	    const btn = inject.querySelector(".rfx-i-book");
+    // Bind BOOK button. First click arms the load; second click books directly.
+    const btn = inject.querySelector(".rfx-i-book");
     if (btn) {
       btn.addEventListener("click", (e) => {
         e.stopPropagation();
         e.preventDefault();
-        if (fastBookForThisLoad) {
+        if (btn.dataset.action === "fastbook") {
           bookLoadDirectFromSearch(woId);
         } else {
-          bookLoadDirect(woId, card);
-	    }
-	    const hideBtn = inject.querySelector("[data-hide-load-id]");
-	    if (hideBtn) {
-	      hideBtn.addEventListener("click", (e) => {
-	        e.stopPropagation();
-	        e.preventDefault();
-	        ignoreLoad(hideBtn.dataset.hideLoadId);
-	      });
-	    }
-	  });
+          armedFastBookLoads.add(woId);
+          styleAmazonLoadCards();
+          showToast("Fastbook armed for this load. Click FASTBOOK to book.");
+        }
+      });
+    }
+
+    const hideBtn = inject.querySelector("[data-hide-load-id]");
+    if (hideBtn) {
+      hideBtn.addEventListener("click", (e) => {
+        e.stopPropagation();
+        e.preventDefault();
+        ignoreLoad(hideBtn.dataset.hideLoadId);
+      });
     }
   });
 
@@ -4065,6 +4159,7 @@ window.addEventListener("relay-fetcher-book-direct-result", (e) => {
     }
 
     bookingState.set(woId, "confirmed");
+    armedFastBookLoads.delete(woId);
     alertedLoads = alertedLoads.filter(a => a.wo.id !== woId);
     seenLoads.delete(woId);
     playBookedSound();
