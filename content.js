@@ -78,6 +78,14 @@ const DEFAULT_SETTINGS = {
   detectionFilterBoard: false,
   detectionGroups: [],
   detectionRules: [],
+  customDateFilterEnabled: false,
+  customDateFilterStart: "",
+  customDateFilterEnd: "",
+  showProfitEstimate: true,
+  profitMpg: 6.5,
+  profitFuelPrice: 4.75,
+  profitDeadheadMiles: 0,
+  profitReturnMiles: 0,
 };
 let settings = { ...DEFAULT_SETTINGS };
 function loadSettings() {
@@ -106,6 +114,7 @@ let botStarting = false;
 let settingsOpen = false;
 let activeSettingsTab = "quick";
 let botTimer = null;
+let botStartWatchdog = null;
 let autoResumeTimer = null;
 let lastPollTime = null;
 let lastRefreshInterval = null;
@@ -255,6 +264,25 @@ function getLoadEndpointInfo(wo) {
   };
 }
 
+function getLoadStartMs(wo) {
+  return getLoadEndpointInfo(wo).startMs;
+}
+
+function getLoadEndMs(wo) {
+  return getLoadEndpointInfo(wo).endMs;
+}
+
+function passesCustomDateFilter(wo) {
+  if (!settings.customDateFilterEnabled) return true;
+  const startLimit = settings.customDateFilterStart ? new Date(settings.customDateFilterStart).getTime() : null;
+  const endLimit = settings.customDateFilterEnd ? new Date(settings.customDateFilterEnd).getTime() : null;
+  const loadStart = getLoadStartMs(wo);
+  const loadEnd = getLoadEndMs(wo);
+  if (Number.isFinite(startLimit) && (!Number.isFinite(loadStart) || loadStart < startLimit)) return false;
+  if (Number.isFinite(endLimit) && (!Number.isFinite(loadEnd) || loadEnd > endLimit)) return false;
+  return true;
+}
+
 function fmtWait(ms) {
   if (!Number.isFinite(ms) || ms < 0) return "N/A";
   return fmtDur(ms);
@@ -270,6 +298,23 @@ function fmtRangeSettingValue(key, value) {
   if (key === "roundTripMinPerMile") return n === 0 ? "Off" : `$${n.toFixed(2)}/mi`;
   if (key === "lookoutPriceRealert") return n === 0 ? "Off" : `$${n}`;
   return `${n}s`;
+}
+
+function calcFuelProfit(wo) {
+  const payout = Number(wo?.payout?.value) || 0;
+  const loadedMiles = Number(wo?.totalDistance?.value) || 0;
+  const mpg = Number(settings.profitMpg) || 0;
+  const fuelPrice = Number(settings.profitFuelPrice) || 0;
+  const deadheadMiles = Number(settings.profitDeadheadMiles) || 0;
+  const returnMiles = Number(settings.profitReturnMiles) || 0;
+  if (mpg <= 0 || fuelPrice <= 0) return null;
+  const emptyMiles = Math.max(0, deadheadMiles) + Math.max(0, returnMiles);
+  const totalMiles = loadedMiles + emptyMiles;
+  const gallons = totalMiles / mpg;
+  const fuelCost = gallons * fuelPrice;
+  const profit = payout - fuelCost;
+  const profitPerMile = totalMiles > 0 ? profit / totalMiles : 0;
+  return { payout, loadedMiles, emptyMiles, totalMiles, mpg, fuelPrice, gallons, fuelCost, profit, profitPerMile };
 }
 
 function buildRoundTripMatches(loads, alertMap = new Map()) {
@@ -980,6 +1025,7 @@ function passesDetectionDisplayRules(wo) {
 }
 
 function passesDetectionAlertRules(wo) {
+  if (!passesCustomDateFilter(wo)) return false;
   if (!settings.detectionOnlyAlertMatchingRules || !getActiveDetectionRules().length) return true;
   return getDetectionRuleMatch(wo).ok;
 }
@@ -1767,10 +1813,15 @@ function getDisplaySettingsSignature() {
     settings.showStopCount,
     settings.showStopCode,
     settings.showExtraStopMeta,
+    settings.showProfitEstimate,
+    settings.profitMpg,
+    settings.profitFuelPrice,
+    settings.profitDeadheadMiles,
+    settings.profitReturnMiles,
     settings.amazonOnlyFacilities,
     settings.detectionFilterBoard,
     settings.fastBook,
-  ].map(Boolean).join("");
+  ].map(v => String(v)).join("|");
 }
 
 function formatPriceDelta(delta) {
@@ -1907,13 +1958,42 @@ function sortLoads(loads) {
   return sorted;
 }
 
+function renderCustomDateFilter() {
+  const enabled = !!settings.customDateFilterEnabled;
+  const startValue = toLocalDateTimeInputValue(settings.customDateFilterStart);
+  const endValue = toLocalDateTimeInputValue(settings.customDateFilterEnd);
+  return `<div class="rfx-date-filter ${enabled ? "active" : ""}">
+    <div class="rfx-date-filter-main">
+      <label class="rfx-date-toggle">
+        <input type="checkbox" id="rfx-date-filter-enabled" ${enabled ? "checked" : ""}>
+        <span>My date filter</span>
+      </label>
+      <div class="rfx-date-inputs">
+        <label>Start after <input type="datetime-local" id="rfx-date-filter-start" value="${escapeHtml(startValue)}"></label>
+        <label>End before <input type="datetime-local" id="rfx-date-filter-end" value="${escapeHtml(endValue)}"></label>
+      </div>
+    </div>
+    <div class="rfx-date-actions">
+      <button type="button" data-date-preset="today">Today</button>
+      <button type="button" data-date-preset="24h">Next 24h</button>
+      <button type="button" data-date-preset="clear">Clear</button>
+    </div>
+  </div>`;
+}
+
 // ============================================================
 // SOUND — mp3 files from Sounds folder
 // ============================================================
 let audioCtx = null;
 function ensureAudioCtx() {
-  if (!audioCtx) audioCtx = new AudioContext();
-  if (audioCtx.state === "suspended") audioCtx.resume();
+  try {
+    const AudioCtor = window.AudioContext || window.webkitAudioContext;
+    if (!AudioCtor) return;
+    if (!audioCtx) audioCtx = new AudioCtor();
+    if (audioCtx.state === "suspended") audioCtx.resume().catch(() => {});
+  } catch (err) {
+    console.warn("[Sound] Audio context unavailable:", err);
+  }
 }
 
 function playSound(filename) {
@@ -2123,6 +2203,27 @@ const CSS = `
   color: #0f1111; font-size: 13px; padding: 0 8px; font-family: inherit;
 }
 .rfx-count { font-size: 13px; color: #565959; margin-left: auto; }
+.rfx-date-filter {
+  display: flex; align-items: center; justify-content: space-between; gap: 12px;
+  padding: 10px 12px; margin: 0 0 10px 0; border: 1px solid #d5d9d9; border-radius: 10px;
+  background: #fff;
+}
+.rfx-date-filter.active { border-color: #067d62; background: #f3fbf8; }
+.rfx-date-filter-main { display: flex; align-items: center; gap: 12px; min-width: 0; flex: 1; }
+.rfx-date-toggle { display: inline-flex; align-items: center; gap: 8px; font-size: 13px; font-weight: 800; color: #0f1111; white-space: nowrap; }
+.rfx-date-toggle input { width: 18px; height: 18px; accent-color: #067d62; }
+.rfx-date-inputs { display: flex; align-items: center; gap: 8px; flex-wrap: wrap; min-width: 0; }
+.rfx-date-inputs label { display: inline-flex; align-items: center; gap: 6px; font-size: 12px; color: #565959; font-weight: 700; }
+.rfx-date-inputs input {
+  height: 34px; border: 1px solid #d5d9d9; border-radius: 8px; background: #fff;
+  color: #0f1111; font: inherit; font-size: 13px; padding: 0 8px;
+}
+.rfx-date-actions { display: flex; align-items: center; gap: 6px; flex-wrap: wrap; justify-content: flex-end; }
+.rfx-date-actions button {
+  height: 34px; border: 1px solid #d5d9d9; border-radius: 8px; background: #fff;
+  color: #0f1111; font: inherit; font-size: 12px; font-weight: 800; padding: 0 10px; cursor: pointer;
+}
+.rfx-date-actions button:hover { background: #f7fafa; }
 .rfx-load-board { margin-top: 8px; }
 .rfx-section-title { font-size: 14px; font-weight: 700; color: #0f1111; margin: 0 0 10px 0; }
 .rfx-roundtrip-section {
@@ -2181,6 +2282,12 @@ const CSS = `
 .rfx-stat { font-size: 14px; color: #565959; margin-top: 3px; }
 .rfx-stat b { color: #0f1111; font-weight: 600; }
 .rfx-stats-group { display: flex; flex-direction: column; align-items: flex-end; gap: 3px; }
+.rfx-profit-est {
+  display: inline-flex; align-items: center; justify-content: center;
+  padding: 3px 8px; border-radius: 999px; background: #e6f7f2; color: #067d62;
+  font-size: 12px; font-weight: 800; line-height: 1.25; white-space: nowrap;
+}
+.rfx-profit-est.negative { background: #fdecea; color: #b12704; }
 .rfx-version { font-size: 12px; padding: 3px 8px; border-radius: 4px; font-weight: 600; margin-top: 6px; }
 .rfx-version.ok { background: #f0f0f0; color: #565959; }
 .rfx-version.bad { background: #fdecea; color: #cc3333; }
@@ -2425,6 +2532,18 @@ const CSS = `
   letter-spacing: 0.7px; padding-bottom: 6px; border-bottom: 1px solid #f0f0f0;
 }
 .rfx-settings-help { font-size: 11px; color: #888; padding: 2px 0 0 0; line-height: 1.35; }
+.rfx-profit-grid {
+  display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 8px;
+}
+.rfx-profit-field {
+  display: grid; gap: 5px; padding: 9px 10px; background: #fbfbfb;
+  border: 1px solid #eef0f0; border-radius: 8px;
+}
+.rfx-profit-field label { font-size: 12px; color: #565959; font-weight: 800; }
+.rfx-profit-field input {
+  height: 36px; border: 1px solid #d5d9d9; border-radius: 8px;
+  padding: 0 10px; font: inherit; font-size: 14px; background: #fff;
+}
 .rfx-setting-row {
   display: flex; align-items: center; gap: 10px; padding: 8px 10px;
   background: #fbfbfb; border: 1px solid #eef0f0; border-radius: 8px;
@@ -2508,6 +2627,13 @@ const CSS = `
   .rfx-toolbar-filter { width: 100%; margin-left: 0; }
   .rfx-toolbar-filter select { flex: 1; min-height: 36px; }
   .rfx-count { width: 100%; margin-left: 0; font-size: 12px; }
+  .rfx-date-filter { flex-direction: column; align-items: stretch; gap: 10px; padding: 10px; }
+  .rfx-date-filter-main { flex-direction: column; align-items: stretch; gap: 8px; }
+  .rfx-date-inputs { display: grid; grid-template-columns: 1fr; gap: 8px; }
+  .rfx-date-inputs label { align-items: stretch; flex-direction: column; gap: 4px; }
+  .rfx-date-inputs input, .rfx-date-actions button { min-height: 40px; }
+  .rfx-date-actions { justify-content: stretch; }
+  .rfx-date-actions button { flex: 1; }
   .rfx-stop-name { font-size: 14px; }
   .rfx-stop-time { font-size: 13px; }
   .rfx-badge { font-size: 11px; padding: 2px 8px; }
@@ -2523,6 +2649,7 @@ const CSS = `
   .rfx-settings-title { font-size: 17px; }
   .rfx-settings-section { padding: 11px; gap: 8px; }
   .rfx-display-settings { grid-template-columns: 1fr; }
+  .rfx-profit-grid { grid-template-columns: 1fr; }
   .rfx-setting-row { min-height: 48px; padding: 10px; }
   .rfx-setting-row label { font-size: 14px; }
   .rfx-setting-row input[type="checkbox"] { width: 42px; height: 24px; flex-basis: 42px; }
@@ -2653,6 +2780,11 @@ function renderCard(wo, extraClass, changeBadge) {
   let statsHtml = `${priceDeltaText ? `<span class="rfx-price-delta ${priceDeltaClass}">${priceDeltaText}</span>` : ""}<span class="rfx-payout">${fmt$(pay)}</span>`;
   if (settings.showPerHr) statsHtml += `<span class="rfx-stat"><b>${fmt$(perHr)}</b>/hr</span>`;
   if (settings.showPerMi) statsHtml += `<span class="rfx-stat"><b>${fmt$(perMi)}</b>/mi</span>`;
+  const fuelProfit = settings.showProfitEstimate ? calcFuelProfit(wo) : null;
+  if (fuelProfit) {
+    const title = `Fuel-only estimate: ${fuelProfit.totalMiles.toFixed(1)} total mi / ${fuelProfit.mpg.toFixed(1)} MPG × ${fmt$(fuelProfit.fuelPrice)} = ${fmt$(fuelProfit.fuelCost)} fuel`;
+    statsHtml += `<span class="rfx-profit-est ${fuelProfit.profit < 0 ? "negative" : ""}" title="${escapeHtml(title)}">${fmt$(fuelProfit.profit)} after fuel</span>`;
+  }
   const distDur = [];
   if (settings.showDistance) distDur.push(`<b>${dist.toFixed(1)}</b> mi`);
   if (settings.showDuration) distDur.push(`<b>${fmtDur(durMs)}</b>`);
@@ -2791,16 +2923,17 @@ function renderCustomLoadBoard() {
   const alerted = [];
   for (const alert of alertedLoads) {
     const wo = loadMap.get(alert.wo.id) || alert.wo;
-    if (wo && passesCustomExcludedCities(wo) && passesAmazonOnlyFacilities(wo) && passesDetectionDisplayRules(wo) && !isIgnoredLoad(wo.id)) alerted.push({ wo, alert });
+    if (wo && passesCustomExcludedCities(wo) && passesAmazonOnlyFacilities(wo) && passesDetectionDisplayRules(wo) && passesCustomDateFilter(wo) && !isIgnoredLoad(wo.id)) alerted.push({ wo, alert });
   }
 
   const regularLoads = sortLoads(
-    Array.from(loadMap.values()).filter(wo => !alertMap.has(wo.id) && passesCustomExcludedCities(wo) && passesAmazonOnlyFacilities(wo) && passesDetectionDisplayRules(wo) && !isIgnoredLoad(wo.id))
+    Array.from(loadMap.values()).filter(wo => !alertMap.has(wo.id) && passesCustomExcludedCities(wo) && passesAmazonOnlyFacilities(wo) && passesDetectionDisplayRules(wo) && passesCustomDateFilter(wo) && !isIgnoredLoad(wo.id))
   );
   const hiddenByCity = Array.from(loadMap.values()).filter(wo => !passesCustomExcludedCities(wo)).length;
   const hiddenByFacility = Array.from(loadMap.values()).filter(wo => passesCustomExcludedCities(wo) && !passesAmazonOnlyFacilities(wo)).length;
   const hiddenByDetection = Array.from(loadMap.values()).filter(wo => passesCustomExcludedCities(wo) && passesAmazonOnlyFacilities(wo) && !passesDetectionDisplayRules(wo)).length;
-  const hiddenByLoad = Array.from(loadMap.values()).filter(wo => passesCustomExcludedCities(wo) && passesAmazonOnlyFacilities(wo) && passesDetectionDisplayRules(wo) && isIgnoredLoad(wo.id)).length;
+  const hiddenByDate = Array.from(loadMap.values()).filter(wo => passesCustomExcludedCities(wo) && passesAmazonOnlyFacilities(wo) && passesDetectionDisplayRules(wo) && !passesCustomDateFilter(wo)).length;
+  const hiddenByLoad = Array.from(loadMap.values()).filter(wo => passesCustomExcludedCities(wo) && passesAmazonOnlyFacilities(wo) && passesDetectionDisplayRules(wo) && passesCustomDateFilter(wo) && isIgnoredLoad(wo.id)).length;
 
   const sortBtn = (key, label) => {
     const active = currentSort === key ? " active" : "";
@@ -2815,10 +2948,12 @@ function renderCustomLoadBoard() {
     })),
     ...regularLoads.map(wo => renderCard(wo, "", null)),
   ].join("");
-  const boardLoads = Array.from(loadMap.values()).filter(wo => passesCustomExcludedCities(wo) && passesAmazonOnlyFacilities(wo) && passesDetectionDisplayRules(wo) && !isIgnoredLoad(wo.id));
+  const boardLoads = Array.from(loadMap.values()).filter(wo => passesCustomExcludedCities(wo) && passesAmazonOnlyFacilities(wo) && passesDetectionDisplayRules(wo) && passesCustomDateFilter(wo) && !isIgnoredLoad(wo.id));
   const roundTripsHtml = renderRoundTripMatches(boardLoads, alertMap);
+  const hiddenTotal = hiddenByCity + hiddenByFacility + hiddenByDetection + hiddenByDate + hiddenByLoad;
 
   return `<div class="rfx-load-board">
+    ${renderCustomDateFilter()}
     <div class="rfx-toolbar">
       <span class="rfx-toolbar-label">Sort</span>
       ${sortBtn("payout", "Payout")}
@@ -2826,7 +2961,7 @@ function renderCustomLoadBoard() {
       ${sortBtn("distance", "Distance")}
       ${sortBtn("time", "Start time")}
       ${sortBtn("postedAge", "Posted age")}
-      <span class="rfx-count">${alerted.length + regularLoads.length} of ${loadMap.size} loads${alerted.length ? ` · ${alerted.length} new` : ""}${hiddenByCity + hiddenByFacility + hiddenByDetection + hiddenByLoad ? ` · ${hiddenByCity + hiddenByFacility + hiddenByDetection + hiddenByLoad} hidden` : ""}</span>
+      <span class="rfx-count">${alerted.length + regularLoads.length} of ${loadMap.size} loads${alerted.length ? ` · ${alerted.length} new` : ""}${hiddenTotal ? ` · ${hiddenTotal} hidden` : ""}</span>
     </div>
     ${roundTripsHtml}
     ${alerted.length ? `<div class="rfx-section-title">Recently added</div>` : ""}
@@ -2955,6 +3090,7 @@ function injectCards() {
   </div>`;
 
   const chk = (key, label) => `<div class="rfx-setting-row"><input type="checkbox" id="rfx-s-${key}" ${settings[key] ? "checked" : ""} data-key="${key}"><label for="rfx-s-${key}">${label}</label></div>`;
+  const numSetting = (key, label, step = "0.1") => `<div class="rfx-profit-field"><label for="rfx-s-${key}">${label}</label><input type="number" id="rfx-s-${key}" min="0" step="${step}" value="${Number(settings[key]) || 0}" data-number-key="${key}"></div>`;
   const settingsTab = (key, label) => `<button type="button" class="rfx-settings-tab${activeSettingsTab === key ? " active" : ""}" data-settings-tab="${key}">${label}</button>`;
   const settingsPanelWrap = (key, html) => `<div class="rfx-settings-tab-panel${activeSettingsTab === key ? " active" : ""}" data-settings-panel="${key}">${html}</div>`;
 
@@ -2970,6 +3106,7 @@ function injectCards() {
         ${settingsTab("detection", "Detection")}
         ${settingsTab("filters", "Filters")}
         ${settingsTab("roundTrips", "Round Trips")}
+        ${settingsTab("profit", "Profit")}
         ${settingsTab("display", "Display")}
       </div>
     </div>
@@ -3065,6 +3202,19 @@ function injectCards() {
         ${chk("showStopCode", "Stop code (SCK6, KSCK)")}
       </div>
     `)}
+    ${settingsPanelWrap("profit", `
+      <div class="rfx-settings-section rfx-settings-section-full">
+        <div class="rfx-settings-section-title">Profit Calculator</div>
+        ${chk("showProfitEstimate", "Show fuel-profit estimate on load cards")}
+        <div class="rfx-profit-grid">
+          ${numSetting("profitMpg", "Truck MPG", "0.1")}
+          ${numSetting("profitFuelPrice", "Fuel price / gal", "0.01")}
+          ${numSetting("profitDeadheadMiles", "Default deadhead miles", "1")}
+          ${numSetting("profitReturnMiles", "Default return-home miles", "1")}
+        </div>
+        <div class="rfx-settings-help">Simple estimate only: payout minus fuel cost using loaded miles plus your default empty miles. It does not include driver pay, maintenance, insurance, tolls, or detention.</div>
+      </div>
+    `)}
   </div>`;
 
   const autoBookWarning = settings.autoBook
@@ -3139,6 +3289,58 @@ function injectCards() {
       const maxVal = shadowRoot.getElementById("rfx-s-pollMax-val");
       if (minVal) minVal.textContent = settings.pollMinSeconds + "s";
       if (maxVal) maxVal.textContent = settings.pollMaxSeconds + "s";
+    });
+  });
+
+  shadowRoot.querySelectorAll("[data-number-key]").forEach(input => {
+    input.addEventListener("change", () => {
+      const key = input.dataset.numberKey;
+      settings[key] = Math.max(0, Number(input.value) || 0);
+      saveSettings();
+      injectCards();
+    });
+  });
+
+  const dateEnabled = shadowRoot.getElementById("rfx-date-filter-enabled");
+  const dateStart = shadowRoot.getElementById("rfx-date-filter-start");
+  const dateEnd = shadowRoot.getElementById("rfx-date-filter-end");
+  const saveDateFilter = () => {
+    settings.customDateFilterEnabled = !!dateEnabled?.checked;
+    settings.customDateFilterStart = localDateTimeInputToIso(dateStart?.value || "");
+    settings.customDateFilterEnd = localDateTimeInputToIso(dateEnd?.value || "");
+    saveSettings();
+    injectCards();
+  };
+  if (dateEnabled) dateEnabled.addEventListener("change", saveDateFilter);
+  if (dateStart) dateStart.addEventListener("change", () => {
+    if ((dateStart.value || dateEnd?.value) && dateEnabled) dateEnabled.checked = true;
+    saveDateFilter();
+  });
+  if (dateEnd) dateEnd.addEventListener("change", () => {
+    if ((dateStart?.value || dateEnd.value) && dateEnabled) dateEnabled.checked = true;
+    saveDateFilter();
+  });
+  shadowRoot.querySelectorAll("[data-date-preset]").forEach(btn => {
+    btn.addEventListener("click", () => {
+      const preset = btn.dataset.datePreset;
+      const now = new Date();
+      if (preset === "clear") {
+        settings.customDateFilterEnabled = false;
+        settings.customDateFilterStart = "";
+        settings.customDateFilterEnd = "";
+      } else {
+        let start = now;
+        let end = new Date(now.getTime() + 24 * 3600000);
+        if (preset === "today") {
+          start = new Date(now.getFullYear(), now.getMonth(), now.getDate(), 0, 0, 0);
+          end = new Date(now.getFullYear(), now.getMonth(), now.getDate() + 1, 0, 0, 0);
+        }
+        settings.customDateFilterEnabled = true;
+        settings.customDateFilterStart = start.toISOString();
+        settings.customDateFilterEnd = end.toISOString();
+      }
+      saveSettings();
+      injectCards();
     });
   });
 
@@ -3238,6 +3440,12 @@ function styleAmazonLoadCards() {
       .load-card .rfx-i-price-delta.down { color: #cc3333; }
       .load-card .rfx-i-stat { font-size: 13px; color: #565959; margin-top: 2px; }
       .load-card .rfx-i-stat b { color: #0f1111; font-weight: 600; }
+      .load-card .rfx-i-profit {
+        display: inline-flex; align-items: center; justify-content: center;
+        padding: 3px 8px; border-radius: 999px; background: #e6f7f2; color: #067d62;
+        font-size: 12px; font-weight: 800; line-height: 1.25; white-space: nowrap; margin-top: 3px;
+      }
+      .load-card .rfx-i-profit.negative { background: #fdecea; color: #b12704; }
       .load-card .rfx-i-score-row { display: flex; align-items: center; gap: 8px; margin-bottom: 8px; }
       .load-card .rfx-i-score-bg { flex: 1; height: 5px; background: #e7e7e7; border-radius: 3px; overflow: hidden; max-width: 200px; }
       .load-card .rfx-i-score-fill { height: 100%; border-radius: 3px; }
@@ -3451,6 +3659,11 @@ function styleAmazonLoadCards() {
     let statsHtml = `${priceDeltaText ? `<div class="rfx-i-price-delta ${priceDeltaClass}">${priceDeltaText}</div>` : ""}<span class="rfx-i-payout">${fmt$(pay)}</span>`;
     if (settings.showPerHr) statsHtml += `<div class="rfx-i-stat"><b>${fmt$(perHr)}</b>/hr</div>`;
     if (settings.showPerMi) statsHtml += `<div class="rfx-i-stat"><b>${fmt$(perMi)}</b>/mi</div>`;
+    const fuelProfit = settings.showProfitEstimate ? calcFuelProfit(wo) : null;
+    if (fuelProfit) {
+      const title = `Fuel-only estimate: ${fuelProfit.totalMiles.toFixed(1)} total mi / ${fuelProfit.mpg.toFixed(1)} MPG × ${fmt$(fuelProfit.fuelPrice)} = ${fmt$(fuelProfit.fuelCost)} fuel`;
+      statsHtml += `<div class="rfx-i-profit ${fuelProfit.profit < 0 ? "negative" : ""}" title="${escapeHtml(title)}">${fmt$(fuelProfit.profit)} after fuel</div>`;
+    }
     const distDur = [];
     if (settings.showDistance) distDur.push(`<b>${dist.toFixed(1)}</b> mi`);
     if (settings.showDuration) distDur.push(`<b>${fmtDur(durMs)}</b>`);
@@ -3714,6 +3927,10 @@ function toggleAiMode() {
 async function startBot(options = {}) {
   if (botRunning || botStarting) return;
   cancelAutoResume();
+  if (botStartWatchdog) {
+    clearTimeout(botStartWatchdog);
+    botStartWatchdog = null;
+  }
 
   // If auto-book is on, ask for confirmation first
   if (settings.autoBook && !options.skipAutoBookConfirm) {
@@ -3730,27 +3947,47 @@ async function startBot(options = {}) {
   botStarting = true;
   suppressAutoUpdateDetectionUntil = Date.now() + 5000;
   if (aiModeActive) injectCards();
+  botStartWatchdog = setTimeout(() => {
+    if (!botStarting) return;
+    console.warn("[Bot] Startup watchdog recovered from stuck Starting state.");
+    botStarting = false;
+    botRunning = true;
+    isFirstPoll = seenLoads.size === 0;
+    doPoll();
+    scheduleNext();
+    if (aiModeActive) injectCards();
+  }, 8000);
 
   try {
-    await forceAmazonRefresh();
-  } catch (err) {
-    console.warn("[Bot] Amazon refresh before start failed:", err);
-  }
+    try {
+      await forceAmazonRefresh();
+    } catch (err) {
+      console.warn("[Bot] Amazon refresh before start failed:", err);
+    }
 
-  ensureAudioCtx();
-  if (alertedLoads.length > 0) {
-    alertedLoads = [];
+    ensureAudioCtx();
+    if (alertedLoads.length > 0) {
+      alertedLoads = [];
+    }
+    missingCounts.clear();
+    goneLoads.clear();
+    document.querySelectorAll(".load-card.rfx-new-detected").forEach(card => card.classList.remove("rfx-new-detected"));
+    botRunning = true;
+    isFirstPoll = seenLoads.size === 0; // Only baseline if this page session has no seen loads yet
+    try { chrome.runtime.sendMessage({ action: "botStarted" }).catch(() => {}); } catch {}
+    doPoll(); // immediate first poll
+    scheduleNext();
+  } catch (err) {
+    console.error("[Bot] Start failed:", err);
+    botRunning = false;
+  } finally {
+    botStarting = false;
+    if (botStartWatchdog) {
+      clearTimeout(botStartWatchdog);
+      botStartWatchdog = null;
+    }
+    if (aiModeActive) injectCards();
   }
-  missingCounts.clear();
-  goneLoads.clear();
-  document.querySelectorAll(".load-card.rfx-new-detected").forEach(card => card.classList.remove("rfx-new-detected"));
-  botRunning = true;
-  botStarting = false;
-  isFirstPoll = seenLoads.size === 0; // Only baseline if this page session has no seen loads yet
-  chrome.runtime.sendMessage({ action: "botStarted" }).catch(() => {});
-  doPoll(); // immediate first poll
-  scheduleNext();
-  if (aiModeActive) injectCards();
 }
 
 function cancelAutoResume() {
@@ -3773,8 +4010,9 @@ function scheduleAutoResume(reason = "stopped") {
 function stopBot(options = {}) {
   botStarting = false;
   botRunning = false;
+  if (botStartWatchdog) { clearTimeout(botStartWatchdog); botStartWatchdog = null; }
   if (botTimer) { clearTimeout(botTimer); botTimer = null; }
-  chrome.runtime.sendMessage({ action: "botStopped" }).catch(() => {});
+  try { chrome.runtime.sendMessage({ action: "botStopped" }).catch(() => {}); } catch {}
   if (aiModeActive) injectCards();
   if (options.allowAutoResume !== false) scheduleAutoResume(options.reason || "stop");
 }
