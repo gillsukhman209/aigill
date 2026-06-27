@@ -6,6 +6,7 @@
 // Safari doesn't support "world": "MAIN" in manifest, so we inject manually
 // ============================================================
 (function injectInterceptor() {
+  if (!/\/loadboard(?:\/|$)/.test(window.location.pathname || "")) return;
   const script = document.createElement("script");
   script.src = chrome.runtime.getURL("interceptor.js");
   script.onload = () => script.remove();
@@ -31,6 +32,58 @@ let lastNonEmptySearchAt = 0;
 
 // Settings (persisted to localStorage)
 const SETTINGS_KEY = "rfx_settings";
+const DEFAULT_CUSTOM_EXCLUDED_CITY_LABELS = [
+  "American Canyon, CA",
+  "Brisbane, CA",
+  "Fairfield, CA",
+  "Hollister, CA",
+  "Livermore, CA",
+  "Modesto, CA",
+  "Newark, CA",
+  "Rancho Cordova, CA",
+  "Reno",
+  "Richmond, CA",
+  "Roseville, CA",
+  "San Francisco, CA",
+  "San Jose, CA",
+  "San Pablo, CA",
+  "Santa Clarita",
+  "South San Francisco",
+];
+function normalizeDefaultExcludedText(value) {
+  return String(value || "")
+    .toLowerCase()
+    .replace(/[^a-z0-9\s]/g, " ")
+    .replace(/\s+/g, " ")
+    .trim();
+}
+
+function makeDefaultExcludedCityEntry(label) {
+  const parts = String(label || "").split(",").map(part => part.trim()).filter(Boolean);
+  const cityText = parts[0] || "";
+  const stateText = parts[1] || "";
+  const city = normalizeDefaultExcludedText(cityText);
+  const state = stateText.length === 2 ? stateText.toUpperCase() : "";
+  const key = [city, state.toLowerCase()].filter(Boolean).join(" ");
+  return key ? { key, city, state, label: String(label || "").trim() } : null;
+}
+
+const DEFAULT_CUSTOM_EXCLUDED_CITIES = DEFAULT_CUSTOM_EXCLUDED_CITY_LABELS
+  .map(makeDefaultExcludedCityEntry)
+  .filter(Boolean);
+const DEFAULT_CUSTOM_EXCLUDED_CITY_KEYS = new Set(DEFAULT_CUSTOM_EXCLUDED_CITIES.map(entry => entry.key));
+
+function normalizeCustomExcludedCityList(cities, removedDefaultKeys = settings?.removedDefaultExcludedCityKeys || []) {
+  const removed = new Set((removedDefaultKeys || []).filter(Boolean));
+  const unique = new Map(DEFAULT_CUSTOM_EXCLUDED_CITIES.filter(city => !removed.has(city.key)).map(city => [city.key, city]));
+  for (const item of cities || []) {
+    const entry = typeof item === "string" ? makeDefaultExcludedCityEntry(item) : item;
+    if (!entry?.key) continue;
+    unique.set(entry.key, entry);
+  }
+  return Array.from(unique.values()).sort((a, b) => a.label.localeCompare(b.label));
+}
+
 const DEFAULT_SETTINGS = {
   pollMinSeconds: 2,
   pollMaxSeconds: 5,
@@ -67,7 +120,8 @@ const DEFAULT_SETTINGS = {
   roundTripRequireSameDriver: true,
   roundTripRequireSameEquipment: true,
   roundTripsCollapsed: false,
-  customExcludedCities: [],
+  customExcludedCities: DEFAULT_CUSTOM_EXCLUDED_CITIES,
+  removedDefaultExcludedCityKeys: [],
   ignoredLoadIds: [],
   discordWebhookUrl: "https://discord.com/api/webhooks/1519115434975297677/i9M8iFOM_e1BOTnxGDmHSFKvQQ2wIHAOMM84K147MqO97_axmqQi5l4QxeXerydPweFL",
   lookoutEnabled: false,
@@ -82,14 +136,15 @@ const DEFAULT_SETTINGS = {
   customDateFilterStart: "",
   customDateFilterEnd: "",
   showProfitEstimate: true,
-  profitMpg: 6.5,
-  profitFuelPrice: 4.75,
+  profitMpg: 8,
+  profitFuelPrice: 6.50,
   profitDeadheadMiles: 0,
   profitReturnMiles: 0,
 };
 let settings = { ...DEFAULT_SETTINGS };
 function loadSettings() {
   try { const s = JSON.parse(localStorage.getItem(SETTINGS_KEY)); if (s) settings = { ...DEFAULT_SETTINGS, ...s }; } catch {}
+  settings.customExcludedCities = normalizeCustomExcludedCityList(settings.customExcludedCities);
 }
 function saveSettings() {
   try { localStorage.setItem(SETTINGS_KEY, JSON.stringify(settings)); } catch {}
@@ -315,6 +370,21 @@ function calcFuelProfit(wo) {
   const profit = payout - fuelCost;
   const profitPerMile = totalMiles > 0 ? profit / totalMiles : 0;
   return { payout, loadedMiles, emptyMiles, totalMiles, mpg, fuelPrice, gallons, fuelCost, profit, profitPerMile };
+}
+
+function calcFuelProfitFromTrip(payout, loadedMiles) {
+  return calcFuelProfit({
+    payout: { value: Number(payout) || 0 },
+    totalDistance: { value: Number(loadedMiles) || 0 },
+  });
+}
+
+function isLoadBoardPage() {
+  return /\/loadboard(?:\/|$)/.test(window.location.pathname || "");
+}
+
+function isTripsPage() {
+  return /\/tours\/(?:upcoming|in-transit|history)(?:\/|$)/.test(window.location.pathname || "");
 }
 
 function buildRoundTripMatches(loads, alertMap = new Map()) {
@@ -559,6 +629,7 @@ function stopCityEntry(stop) {
 
 const CITY_COORDINATE_FALLBACKS = {
   [cityKey("Lathrop", "CA")]: { lat: 37.8227, lon: -121.2766, label: "Lathrop, CA" },
+  [cityKey("Manteca", "CA")]: { lat: 37.7974, lon: -121.2161, label: "Manteca, CA" },
   [cityKey("Stockton", "CA")]: { lat: 37.9577, lon: -121.2908, label: "Stockton, CA" },
   [cityKey("Tracy", "CA")]: { lat: 37.7397, lon: -121.4252, label: "Tracy, CA" },
   [cityKey("Rialto", "CA")]: { lat: 34.1064, lon: -117.3703, label: "Rialto, CA" },
@@ -648,16 +719,17 @@ function canonicalizeExcludedCityInput(input) {
 }
 
 function getCustomExcludedCities() {
-  return (settings.customExcludedCities || [])
+  return normalizeCustomExcludedCityList(settings.customExcludedCities)
     .map(item => typeof item === "string" ? canonicalizeExcludedCityInput(item) : item)
     .filter(item => item?.key);
 }
 
 function saveCustomExcludedCities(cities) {
   const unique = new Map();
-  for (const city of cities || []) {
+  for (const city of (cities || [])) {
     if (city?.key) unique.set(city.key, city);
   }
+  settings.removedDefaultExcludedCityKeys = Array.from(DEFAULT_CUSTOM_EXCLUDED_CITY_KEYS).filter(key => !unique.has(key));
   settings.customExcludedCities = Array.from(unique.values()).sort((a, b) => a.label.localeCompare(b.label));
   saveSettings();
 }
@@ -766,12 +838,29 @@ function saveDetectionGroups(groups) {
 }
 
 function getDetectionRules() {
-  return Array.isArray(settings.detectionRules) ? settings.detectionRules.filter(r => r?.id) : [];
+  return Array.isArray(settings.detectionRules) ? settings.detectionRules.filter(r => r?.id).map(normalizeDetectionRule) : [];
 }
 
 function saveDetectionRules(rules) {
-  settings.detectionRules = (rules || []).filter(r => r?.id);
+  settings.detectionRules = (rules || []).filter(r => r?.id).map(normalizeDetectionRule);
   saveSettings();
+}
+
+function uniqueGroupIds(values) {
+  return Array.from(new Set((Array.isArray(values) ? values : [values]).map(value => String(value || "").trim()).filter(Boolean)));
+}
+
+function normalizeDetectionRule(rule) {
+  const originGroupIds = uniqueGroupIds(rule.originGroupIds?.length ? rule.originGroupIds : rule.originGroupId);
+  const destinationGroupIds = uniqueGroupIds(rule.destinationGroupIds?.length ? rule.destinationGroupIds : rule.destinationGroupId);
+  return {
+    ...rule,
+    originGroupIds,
+    destinationGroupIds,
+    originGroupId: originGroupIds[0] || "",
+    destinationGroupId: destinationGroupIds[0] || "",
+    enabled: rule.enabled !== false,
+  };
 }
 
 function getStopCoordinates(stop) {
@@ -866,6 +955,15 @@ function getLookoutPlaceCoords(place) {
   return null;
 }
 
+function getStopCoordinatesWithFallback(stop) {
+  const coords = getStopCoordinates(stop);
+  if (coords) return coords;
+  const entry = stopCityEntry(stop);
+  const fallback = getFallbackCityCoords(entry?.key);
+  if (fallback) return { lat: fallback.lat, lon: fallback.lon };
+  return null;
+}
+
 function refreshLookoutGroupCoordinates() {
   let changed = false;
   const groups = getLookoutGroups().map(group => {
@@ -884,7 +982,7 @@ function refreshLookoutGroupCoordinates() {
 }
 
 function distanceToLookoutGroup(stop, group) {
-  const coords = getStopCoordinates(stop);
+  const coords = getStopCoordinatesWithFallback(stop);
   const entry = stopCityEntry(stop);
   let best = { miles: Infinity, place: null };
   for (const place of group?.places || []) {
@@ -971,20 +1069,24 @@ function matchesDetectionRule(wo, rule, groupsById) {
   if (isIgnoredLoad(wo.id) || !passesCustomExcludedCities(wo) || !passesAmazonOnlyFacilities(wo)) return { ok: false, reason: "hidden" };
   if (rule.amazonOnly && isPrivateLoad(wo)) return { ok: false, reason: "private" };
 
-  const originGroup = groupsById.get(rule.originGroupId);
-  const destinationGroup = groupsById.get(rule.destinationGroupId);
-  if (!originGroup || !destinationGroup) return { ok: false, reason: "missing-group" };
+  const originGroups = uniqueGroupIds(rule.originGroupIds?.length ? rule.originGroupIds : rule.originGroupId)
+    .map(id => groupsById.get(id))
+    .filter(Boolean);
+  const destinationGroups = uniqueGroupIds(rule.destinationGroupIds?.length ? rule.destinationGroupIds : rule.destinationGroupId)
+    .map(id => groupsById.get(id))
+    .filter(Boolean);
+  if (!originGroups.length && !destinationGroups.length) return { ok: false, reason: "missing-group" };
 
   const first = getLoadStartStop(wo);
   const last = getLoadEndStop(wo);
   if (!first || !last) return { ok: false, reason: "missing-stops" };
 
-  const originDistance = distanceToLookoutGroup(first, originGroup);
-  const destinationDistance = distanceToLookoutGroup(last, destinationGroup);
-  if (!originDistance.place) return { ok: false, reason: "origin-group-empty" };
-  if (!destinationDistance.place) return { ok: false, reason: "destination-group-empty" };
-  if (originDistance.miles > Number(originDistance.place.radiusMiles || 0)) return { ok: false, reason: "origin-radius" };
-  if (destinationDistance.miles > Number(destinationDistance.place.radiusMiles || 0)) return { ok: false, reason: "destination-radius" };
+  const originDistance = originGroups.length ? bestDetectionGroupDistance(first, originGroups) : null;
+  const destinationDistance = destinationGroups.length ? bestDetectionGroupDistance(last, destinationGroups) : null;
+  if (originGroups.length && !originDistance?.place) return { ok: false, reason: "origin-group-empty" };
+  if (destinationGroups.length && !destinationDistance?.place) return { ok: false, reason: "destination-group-empty" };
+  if (originDistance?.place && originDistance.miles > Number(originDistance.place.radiusMiles || 0)) return { ok: false, reason: "origin-radius" };
+  if (destinationDistance?.place && destinationDistance.miles > Number(destinationDistance.place.radiusMiles || 0)) return { ok: false, reason: "destination-radius" };
 
   const payout = Number(wo?.payout?.value) || 0;
   if (Number(rule.minPayout || 0) > 0 && payout < Number(rule.minPayout || 0)) return { ok: false, reason: "payout" };
@@ -994,13 +1096,22 @@ function matchesDetectionRule(wo, rule, groupsById) {
 
   return {
     ok: true,
-    originMiles: originDistance.miles,
-    destinationMiles: destinationDistance.miles,
-    originGroup,
-    destinationGroup,
-    originPlace: originDistance.place,
-    destinationPlace: destinationDistance.place,
+    originMiles: originDistance ? originDistance.miles : null,
+    destinationMiles: destinationDistance ? destinationDistance.miles : null,
+    originGroup: originDistance ? originDistance.group : null,
+    destinationGroup: destinationDistance ? destinationDistance.group : null,
+    originPlace: originDistance ? originDistance.place : null,
+    destinationPlace: destinationDistance ? destinationDistance.place : null,
   };
+}
+
+function bestDetectionGroupDistance(stop, groups) {
+  let best = { miles: Infinity, place: null, group: null };
+  for (const group of groups || []) {
+    const current = distanceToLookoutGroup(stop, group);
+    if (current.place && current.miles < best.miles) best = { ...current, group };
+  }
+  return best;
 }
 
 function getActiveDetectionRules() {
@@ -1312,7 +1423,7 @@ function renderLookoutSettings() {
         <button type="button" data-lookout-remove-place="${escapeHtml(group.id)}:${escapeHtml(place.id)}">×</button>
       </span>`;
     }).join("") || `<span class="rfx-lookout-empty">No cities in this group</span>`;
-    return `<div class="rfx-lookout-item">
+    return `<div class="rfx-lookout-item rfx-detection-rule-item">
       <div>
         <div class="rfx-lookout-edit-head">
           <input type="text" value="${escapeHtml(group.name)}" data-lookout-edit-group-name="${escapeHtml(group.id)}" aria-label="Group name">
@@ -1378,7 +1489,25 @@ function renderLookoutSettings() {
 function renderDetectionSettings() {
   const groups = getDetectionGroups();
   const rules = getDetectionRules();
-  const groupOptions = groups.map(group => `<option value="${escapeHtml(group.id)}">${escapeHtml(group.name)}</option>`).join("");
+  const groupChoiceCards = (name, selectedIds = [], attrName = "", ruleId = "") => {
+    const selected = new Set(uniqueGroupIds(selectedIds));
+    return `<div class="rfx-detection-picker" role="group" aria-label="${escapeHtml(name)}">
+      <div class="rfx-detection-picker-title">${escapeHtml(name)}</div>
+      <div class="rfx-detection-choice-grid">
+        ${groups.map(group => {
+          const checked = selected.has(group.id);
+          const count = (group.places || []).length;
+          return `<label class="rfx-detection-choice ${checked ? "selected" : ""}">
+            <input type="checkbox" ${attrName ? `${attrName}="${escapeHtml(group.id)}"` : ""} ${ruleId ? `data-detection-rule-id="${escapeHtml(ruleId)}"` : ""} ${checked ? "checked" : ""}>
+            <span>
+              <b>${escapeHtml(group.name)}</b>
+              <small>${count} cit${count === 1 ? "y" : "ies"}</small>
+            </span>
+          </label>`;
+        }).join("") || `<span class="rfx-lookout-empty">Create a radius group first.</span>`}
+      </div>
+    </div>`;
+  };
   const groupsHtml = groups.length ? groups.map(group => {
     const places = (group.places || []).map(place => {
       const coordText = Number.isFinite(Number(place.lat)) && Number.isFinite(Number(place.lon)) ? "" : " (city fallback)";
@@ -1407,19 +1536,27 @@ function renderDetectionSettings() {
   }).join("") : `<div class="rfx-lookout-empty">No detection groups yet.</div>`;
 
   const rulesHtml = rules.length ? rules.map(rule => {
+    const originIds = uniqueGroupIds(rule.originGroupIds?.length ? rule.originGroupIds : rule.originGroupId);
+    const destinationIds = uniqueGroupIds(rule.destinationGroupIds?.length ? rule.destinationGroupIds : rule.destinationGroupId);
     return `<div class="rfx-lookout-item">
       <div>
-        <div class="rfx-lookout-rule-edit">
-          <input type="text" value="${escapeHtml(rule.name || "Unnamed rule")}" data-detection-edit-rule-name="${escapeHtml(rule.id)}" aria-label="Rule name">
-          <select data-detection-edit-rule-origin="${escapeHtml(rule.id)}">${groups.map(group => `<option value="${escapeHtml(group.id)}" ${group.id === rule.originGroupId ? "selected" : ""}>${escapeHtml(group.name)}</option>`).join("")}</select>
-          <select data-detection-edit-rule-dest="${escapeHtml(rule.id)}">${groups.map(group => `<option value="${escapeHtml(group.id)}" ${group.id === rule.destinationGroupId ? "selected" : ""}>${escapeHtml(group.name)}</option>`).join("")}</select>
-          <input type="number" min="0" step="1" value="${Number(rule.minPayout || 0)}" data-detection-edit-rule-payout="${escapeHtml(rule.id)}" title="Min payout">
-          <input type="number" min="0" max="10" step="1" value="${Number(rule.maxStops || 0)}" data-detection-edit-rule-stops="${escapeHtml(rule.id)}" title="Max stops">
-          <label class="rfx-lookout-check"><input type="checkbox" data-detection-edit-rule-amazon="${escapeHtml(rule.id)}" ${rule.amazonOnly ? "checked" : ""}> Amazon only</label>
+        <div class="rfx-detection-rule-card">
+          <div class="rfx-detection-rule-head">
+            <input type="text" value="${escapeHtml(rule.name || "Unnamed rule")}" data-detection-edit-rule-name="${escapeHtml(rule.id)}" aria-label="Rule name">
+            <label class="rfx-lookout-mini-toggle"><input type="checkbox" data-detection-toggle-rule="${escapeHtml(rule.id)}" ${rule.enabled ? "checked" : ""}> On</label>
+          </div>
+          <div class="rfx-detection-route-grid">
+            ${groupChoiceCards("Origin groups (optional)", originIds, "data-detection-edit-rule-origin-option", rule.id)}
+            ${groupChoiceCards("Destination groups (optional)", destinationIds, "data-detection-edit-rule-dest-option", rule.id)}
+          </div>
+          <div class="rfx-detection-rule-controls">
+            <label>Min payout <input type="number" min="0" step="1" value="${Number(rule.minPayout || 0)}" data-detection-edit-rule-payout="${escapeHtml(rule.id)}" title="Min payout"></label>
+            <label>Max stops <input type="number" min="0" max="10" step="1" value="${Number(rule.maxStops || 0)}" data-detection-edit-rule-stops="${escapeHtml(rule.id)}" title="Max stops"></label>
+            <label class="rfx-lookout-check"><input type="checkbox" data-detection-edit-rule-amazon="${escapeHtml(rule.id)}" ${rule.amazonOnly ? "checked" : ""}> Amazon only</label>
+            <button type="button" data-detection-remove-rule="${escapeHtml(rule.id)}">Remove</button>
+          </div>
         </div>
       </div>
-      <label class="rfx-lookout-mini-toggle"><input type="checkbox" data-detection-toggle-rule="${escapeHtml(rule.id)}" ${rule.enabled ? "checked" : ""}> On</label>
-      <button type="button" data-detection-remove-rule="${escapeHtml(rule.id)}">Remove</button>
     </div>`;
   }).join("") : `<div class="rfx-lookout-empty">No detection rules yet.</div>`;
 
@@ -1437,15 +1574,20 @@ function renderDetectionSettings() {
     <div class="rfx-lookout-help">A group can contain multiple cities, each with its own radius. Origin checks the first stop. Destination checks the final stop.</div>
     <div class="rfx-lookout-list">${groupsHtml}</div>
     <div class="rfx-lookout-subhead">Detection rules</div>
-    <div class="rfx-lookout-rule-grid">
-      <input id="rfx-detection-rule-name" type="text" placeholder="Rule name">
-      <select id="rfx-detection-rule-origin"><option value="">Origin group</option>${groupOptions}</select>
-      <select id="rfx-detection-rule-dest"><option value="">Destination group</option>${groupOptions}</select>
-      <input id="rfx-detection-rule-payout" type="number" min="0" step="1" placeholder="Min payout">
-      <input id="rfx-detection-rule-stops" type="number" min="0" max="10" step="1" placeholder="Max stops">
-      <label class="rfx-lookout-check"><input id="rfx-detection-rule-amazon" type="checkbox"> Amazon only</label>
-      <button type="button" id="rfx-detection-add-rule">Add rule</button>
+    <div class="rfx-detection-builder">
+      <div class="rfx-detection-builder-row">
+        <input id="rfx-detection-rule-name" type="text" placeholder="Rule name">
+        <input id="rfx-detection-rule-payout" type="number" min="0" step="1" placeholder="Min payout">
+        <input id="rfx-detection-rule-stops" type="number" min="0" max="10" step="1" placeholder="Max stops">
+        <label class="rfx-lookout-check"><input id="rfx-detection-rule-amazon" type="checkbox"> Amazon only</label>
+        <button type="button" id="rfx-detection-add-rule">Add rule</button>
+      </div>
+      <div class="rfx-detection-route-grid">
+        ${groupChoiceCards("Origin groups (optional)", [], "data-detection-rule-origin-option")}
+        ${groupChoiceCards("Destination groups (optional)", [], "data-detection-rule-dest-option")}
+      </div>
     </div>
+    <div class="rfx-lookout-help">Select origin groups, destination groups, or both. Empty origin means start anywhere; empty destination means end anywhere.</div>
     <div class="rfx-lookout-list">${rulesHtml}</div>
   </div>`;
 }
@@ -1718,19 +1860,29 @@ function bindDetectionSettings() {
     btn.addEventListener("click", () => {
       const id = btn.dataset.detectionRemoveGroup;
       saveDetectionGroups(getDetectionGroups().filter(group => group.id !== id));
-      saveDetectionRules(getDetectionRules().filter(rule => rule.originGroupId !== id && rule.destinationGroupId !== id));
+      saveDetectionRules(getDetectionRules()
+        .map(rule => {
+          const originGroupIds = uniqueGroupIds(rule.originGroupIds?.length ? rule.originGroupIds : rule.originGroupId).filter(groupId => groupId !== id);
+          const destinationGroupIds = uniqueGroupIds(rule.destinationGroupIds?.length ? rule.destinationGroupIds : rule.destinationGroupId).filter(groupId => groupId !== id);
+          return { ...rule, originGroupIds, destinationGroupIds };
+        })
+        .filter(rule => rule.originGroupIds.length || rule.destinationGroupIds.length));
       injectCards();
     });
   });
 
+  const getCheckedGroupValues = (selector, attrName) => Array.from(shadowRoot.querySelectorAll(selector))
+    .filter(input => input.checked)
+    .map(input => input.getAttribute(attrName))
+    .filter(Boolean);
   const addRuleBtn = shadowRoot.getElementById("rfx-detection-add-rule");
   if (addRuleBtn) {
     addRuleBtn.addEventListener("click", () => {
       const name = String(shadowRoot.getElementById("rfx-detection-rule-name")?.value || "").trim() || "Detection rule";
-      const originGroupId = shadowRoot.getElementById("rfx-detection-rule-origin")?.value || "";
-      const destinationGroupId = shadowRoot.getElementById("rfx-detection-rule-dest")?.value || "";
-      if (!originGroupId || !destinationGroupId) {
-        showToast("Detection: choose origin and destination groups");
+      const originGroupIds = getCheckedGroupValues("input[data-detection-rule-origin-option]", "data-detection-rule-origin-option");
+      const destinationGroupIds = getCheckedGroupValues("input[data-detection-rule-dest-option]", "data-detection-rule-dest-option");
+      if (!originGroupIds.length && !destinationGroupIds.length) {
+        showToast("Detection: choose at least one origin or destination group");
         return;
       }
       const minPayout = Math.max(0, Number(shadowRoot.getElementById("rfx-detection-rule-payout")?.value) || 0);
@@ -1739,8 +1891,10 @@ function bindDetectionSettings() {
       saveDetectionRules([...getDetectionRules(), {
         id: makeId("drule"),
         name,
-        originGroupId,
-        destinationGroupId,
+        originGroupIds,
+        destinationGroupIds,
+        originGroupId: originGroupIds[0],
+        destinationGroupId: destinationGroupIds[0],
         minPayout,
         maxStops,
         amazonOnly,
@@ -1776,11 +1930,19 @@ function bindDetectionSettings() {
   shadowRoot.querySelectorAll("[data-detection-edit-rule-name]").forEach(input => {
     input.addEventListener("change", () => updateRule(input.dataset.detectionEditRuleName, { name: String(input.value || "").trim() || "Detection rule" }));
   });
-  shadowRoot.querySelectorAll("[data-detection-edit-rule-origin]").forEach(select => {
-    select.addEventListener("change", () => updateRule(select.dataset.detectionEditRuleOrigin, { originGroupId: select.value }));
+  shadowRoot.querySelectorAll("[data-detection-edit-rule-origin-option]").forEach(input => {
+    input.addEventListener("change", () => {
+      const id = input.dataset.detectionRuleId;
+      const originGroupIds = getCheckedGroupValues(`input[data-detection-edit-rule-origin-option][data-detection-rule-id="${CSS.escape(id)}"]`, "data-detection-edit-rule-origin-option");
+      updateRule(id, { originGroupIds, originGroupId: originGroupIds[0] || "" });
+    });
   });
-  shadowRoot.querySelectorAll("[data-detection-edit-rule-dest]").forEach(select => {
-    select.addEventListener("change", () => updateRule(select.dataset.detectionEditRuleDest, { destinationGroupId: select.value }));
+  shadowRoot.querySelectorAll("[data-detection-edit-rule-dest-option]").forEach(input => {
+    input.addEventListener("change", () => {
+      const id = input.dataset.detectionRuleId;
+      const destinationGroupIds = getCheckedGroupValues(`input[data-detection-edit-rule-dest-option][data-detection-rule-id="${CSS.escape(id)}"]`, "data-detection-edit-rule-dest-option");
+      updateRule(id, { destinationGroupIds, destinationGroupId: destinationGroupIds[0] || "" });
+    });
   });
   shadowRoot.querySelectorAll("[data-detection-edit-rule-payout]").forEach(input => {
     input.addEventListener("change", () => updateRule(input.dataset.detectionEditRulePayout, { minPayout: Math.max(0, Number(input.value) || 0) }));
@@ -2404,6 +2566,11 @@ const CSS = `
   height: 38px; border: 1px solid #d5d9d9; border-radius: 8px; background: #fff;
   padding: 0 10px; font: inherit; font-size: 13px; min-width: 0;
 }
+.rfx-lookout-rule-grid select[multiple],
+.rfx-lookout-rule-edit select[multiple] {
+  height: 78px;
+  padding: 6px 8px;
+}
 .rfx-lookout-grid button,
 .rfx-lookout-rule-grid button,
 .rfx-lookout-item button {
@@ -2425,6 +2592,7 @@ const CSS = `
   display: grid; grid-template-columns: minmax(0, 1fr) auto auto; gap: 8px; align-items: center;
   padding: 8px 10px; border: 1px solid #eef0f0; border-radius: 8px; background: #fbfbfb;
 }
+.rfx-detection-rule-item { grid-template-columns: 1fr; padding: 12px; background: #fff; border-color: #dfe5e7; }
 .rfx-lookout-item b { display: block; font-size: 13px; color: #0f1111; }
 .rfx-lookout-item span { display: block; font-size: 12px; color: #565959; margin-top: 2px; line-height: 1.35; }
 .rfx-lookout-edit-head {
@@ -2441,6 +2609,70 @@ const CSS = `
 .rfx-lookout-rule-edit {
   display: grid; grid-template-columns: minmax(130px, 1fr) minmax(120px, 1fr) minmax(120px, 1fr) 92px 82px minmax(165px, 1.1fr) auto;
   gap: 8px; align-items: center;
+}
+.rfx-detection-builder {
+  display: grid; gap: 10px; padding: 12px; border: 1px solid #dfe5e7; border-radius: 10px; background: #fff;
+}
+.rfx-detection-builder-row {
+  display: grid; grid-template-columns: minmax(160px, 1fr) 100px 90px minmax(130px, auto) auto;
+  gap: 8px; align-items: center;
+}
+.rfx-detection-builder-row input {
+  height: 38px; border: 1px solid #d5d9d9; border-radius: 8px; background: #fff;
+  padding: 0 10px; font: inherit; font-size: 13px; min-width: 0;
+}
+.rfx-detection-builder-row button {
+  height: 38px; border: 1px solid #172033; border-radius: 8px; background: #172033; color: #fff;
+  padding: 0 14px; font: inherit; font-size: 13px; font-weight: 800; cursor: pointer; white-space: nowrap;
+}
+.rfx-detection-route-grid {
+  display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 10px;
+}
+.rfx-detection-picker {
+  display: grid; gap: 8px; padding: 10px; border: 1px solid #eef0f0; border-radius: 10px; background: #fbfbfb;
+}
+.rfx-detection-picker-title {
+  color: #565959; font-size: 11px; font-weight: 900; letter-spacing: .04em; text-transform: uppercase;
+}
+.rfx-detection-choice-grid {
+  display: grid; grid-template-columns: repeat(auto-fit, minmax(125px, 1fr)); gap: 7px;
+}
+.rfx-detection-choice {
+  display: flex; align-items: center; gap: 8px; min-height: 42px;
+  padding: 7px 9px; border: 1px solid #d5d9d9; border-radius: 9px; background: #fff;
+  cursor: pointer; user-select: none;
+}
+.rfx-detection-choice.selected,
+.rfx-detection-choice:has(input:checked) {
+  border-color: #07876b; background: #effbf7; box-shadow: inset 0 0 0 1px #07876b;
+}
+.rfx-detection-choice input { width: 16px; height: 16px; accent-color: #07876b; flex: 0 0 auto; }
+.rfx-detection-choice span { margin: 0; min-width: 0; }
+.rfx-detection-choice b {
+  display: block; font-size: 13px; line-height: 1.15; color: #0f1111; white-space: nowrap; overflow: hidden; text-overflow: ellipsis;
+}
+.rfx-detection-choice small { display: block; margin-top: 2px; color: #6f7373; font-size: 11px; font-weight: 700; }
+.rfx-detection-rule-card { display: grid; gap: 10px; }
+.rfx-detection-rule-head {
+  display: grid; grid-template-columns: minmax(180px, 1fr) auto; gap: 10px; align-items: center;
+}
+.rfx-detection-rule-head input {
+  height: 36px; border: 1px solid #d5d9d9; border-radius: 8px; background: #fff;
+  padding: 0 10px; font: inherit; font-size: 13px; font-weight: 800; min-width: 0;
+}
+.rfx-detection-rule-controls {
+  display: flex; flex-wrap: wrap; gap: 8px; align-items: center; justify-content: flex-end;
+  padding-top: 2px;
+}
+.rfx-detection-rule-controls label:not(.rfx-lookout-check) {
+  display: inline-flex; align-items: center; gap: 6px; color: #565959; font-size: 12px; font-weight: 800;
+}
+.rfx-detection-rule-controls input[type="number"] {
+  width: 78px; height: 34px; border: 1px solid #d5d9d9; border-radius: 8px; padding: 0 8px; font: inherit;
+}
+.rfx-detection-rule-controls button {
+  height: 34px; border: 1px solid #d5d9d9; border-radius: 8px; background: #fff;
+  padding: 0 12px; font: inherit; font-size: 12px; font-weight: 800; cursor: pointer;
 }
 .rfx-lookout-places { display: flex; flex-wrap: wrap; gap: 6px; margin-top: 6px; }
 .rfx-lookout-place-chip {
@@ -2677,6 +2909,16 @@ const CSS = `
   .rfx-lookout-edit-head input,
   .rfx-lookout-rule-edit input,
   .rfx-lookout-rule-edit select { height: 42px; font-size: 14px; }
+  .rfx-lookout-rule-grid select[multiple],
+  .rfx-lookout-rule-edit select[multiple] { height: 104px; }
+  .rfx-detection-builder-row,
+  .rfx-detection-route-grid,
+  .rfx-detection-rule-head { grid-template-columns: 1fr; }
+  .rfx-detection-choice-grid { grid-template-columns: 1fr; }
+  .rfx-detection-builder-row input,
+  .rfx-detection-builder-row button,
+  .rfx-detection-rule-head input { height: 44px; font-size: 15px; }
+  .rfx-detection-rule-controls { justify-content: flex-start; }
   .rfx-lookout-add-place { grid-template-columns: 1fr; }
   .rfx-lookout-add-place input,
   .rfx-lookout-add-place button { height: 42px; font-size: 14px; }
@@ -2951,6 +3193,16 @@ function renderCustomLoadBoard() {
   const boardLoads = Array.from(loadMap.values()).filter(wo => passesCustomExcludedCities(wo) && passesAmazonOnlyFacilities(wo) && passesDetectionDisplayRules(wo) && passesCustomDateFilter(wo) && !isIgnoredLoad(wo.id));
   const roundTripsHtml = renderRoundTripMatches(boardLoads, alertMap);
   const hiddenTotal = hiddenByCity + hiddenByFacility + hiddenByDetection + hiddenByDate + hiddenByLoad;
+  const hiddenReasons = [
+    hiddenByCity ? `${hiddenByCity} excluded city` : "",
+    hiddenByFacility ? `${hiddenByFacility} non-Amazon/private` : "",
+    hiddenByDetection ? `${hiddenByDetection} detection rule` : "",
+    hiddenByDate ? `${hiddenByDate} date window` : "",
+    hiddenByLoad ? `${hiddenByLoad} hidden load` : "",
+  ].filter(Boolean);
+  const emptyText = loadMap.size
+    ? `All ${loadMap.size} loads are hidden by filters${hiddenReasons.length ? `: ${hiddenReasons.join(", ")}` : ""}.`
+    : "Waiting for Amazon search results...";
 
   return `<div class="rfx-load-board">
     ${renderCustomDateFilter()}
@@ -2965,7 +3217,7 @@ function renderCustomLoadBoard() {
     </div>
     ${roundTripsHtml}
     ${alerted.length ? `<div class="rfx-section-title">Recently added</div>` : ""}
-    ${cards || `<div class="rfx-empty">Waiting for Amazon search results...</div>`}
+    ${cards || `<div class="rfx-empty">${escapeHtml(emptyText)}</div>`}
   </div>`;
 }
 
@@ -3061,6 +3313,7 @@ function placeCustomBoardHost() {
 // INJECT INTO AMAZON'S LOAD CARDS
 // ============================================================
 function injectCards() {
+  if (!isLoadBoardPage()) return;
   if (!aiModeActive) return;
 
   // Find Amazon's load-list
@@ -3900,6 +4153,7 @@ function refreshStyledCards() {
 }
 
 function toggleAiMode() {
+  if (!isLoadBoardPage()) return;
   aiModeActive = !aiModeActive;
   const backBtnWrap = document.getElementById("rfx-back-btn");
   if (aiModeActive) {
@@ -5165,8 +5419,156 @@ window.addEventListener("relay-fetcher-auto-update", (e) => {
 // Keepalive handler
 chrome.runtime.onMessage.addListener((msg) => { if (msg.action === "keepalive") return; });
 
+// ============================================================
+// TRIPS PAGES — fuel profit badges for upcoming/in-transit/history
+// ============================================================
+function ensureTripsProfitStyle() {
+  if (document.getElementById("rfx-trips-profit-style")) return;
+  const style = document.createElement("style");
+  style.id = "rfx-trips-profit-style";
+  style.textContent = `
+    .rfx-trip-profit-badge {
+      display: block; width: max-content; max-width: 190px;
+      margin-top: 3px; padding: 3px 7px; border-radius: 5px;
+      background: #e6f7f2; color: #067d62;
+      font: 800 12px/1.25 -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif;
+      white-space: nowrap; overflow: hidden; text-overflow: ellipsis;
+    }
+    .rfx-trip-profit-badge.negative {
+      background: #fdecea; color: #b12704;
+    }
+    .rfx-trip-profit-badge small {
+      color: inherit; opacity: 0.68; font-weight: 700; margin-left: 3px;
+    }
+    @media (max-width: 700px) {
+      .rfx-trip-profit-badge { max-width: 165px; font-size: 11px; padding: 2px 6px; }
+    }
+  `;
+  document.head.appendChild(style);
+}
+
+function parseMoneyFromText(text) {
+  const matches = [...String(text || "").matchAll(/\$([\d,]+(?:\.\d{1,2})?)/g)]
+    .map(m => Number(m[1].replace(/,/g, "")))
+    .filter(n => Number.isFinite(n));
+  if (!matches.length) return 0;
+  return Math.max(...matches);
+}
+
+function parseLoadedMilesFromText(text) {
+  const matches = [...String(text || "").matchAll(/([\d,]+(?:\.\d+)?)\s*mi\b/gi)]
+    .map(m => Number(m[1].replace(/,/g, "")))
+    .filter(n => Number.isFinite(n));
+  if (!matches.length) return 0;
+  return Math.max(...matches);
+}
+
+function getTripRowId(text) {
+  const match = String(text || "").match(/\b(?:T-)?[A-Z0-9]{7,12}\b/);
+  return match?.[0] || "";
+}
+
+function isVisibleTripRow(el) {
+  const rect = el.getBoundingClientRect();
+  if (rect.width < 500 || rect.height < 40 || rect.height > 180) return false;
+  const style = window.getComputedStyle(el);
+  return style.display !== "none" && style.visibility !== "hidden" && style.opacity !== "0";
+}
+
+function findTripRows() {
+  const candidates = [];
+  for (const el of document.querySelectorAll("div")) {
+    if (el.closest("#rfx-host") || el.closest(".rfx-trip-profit-badge")) continue;
+    const text = (el.innerText || "").replace(/\s+/g, " ").trim();
+    if (!text || text.length > 1000) continue;
+    const tripId = getTripRowId(text);
+    if (!tripId || !/\$\d/.test(text) || !/\bmi\b/i.test(text)) continue;
+    if (!isVisibleTripRow(el)) continue;
+
+    const rect = el.getBoundingClientRect();
+    candidates.push({ el, text, tripId, area: rect.width * rect.height });
+  }
+
+  candidates.sort((a, b) => a.area - b.area);
+
+  const rows = [];
+  const seen = new Set();
+  for (const candidate of candidates) {
+    if (seen.has(candidate.tripId)) continue;
+    if (rows.some(row => candidate.el.contains(row.el) || row.el.contains(candidate.el))) continue;
+    seen.add(candidate.tripId);
+    rows.push(candidate);
+  }
+  return rows;
+}
+
+let tripsProfitTimer = null;
+function scheduleTripsProfitCalculator(delay = 600) {
+  if (!isTripsPage()) return;
+  if (tripsProfitTimer) clearTimeout(tripsProfitTimer);
+  tripsProfitTimer = setTimeout(() => {
+    tripsProfitTimer = null;
+    applyTripsProfitCalculator();
+  }, delay);
+}
+
+function applyTripsProfitCalculator() {
+  if (!isTripsPage()) return;
+  const pageText = (document.body?.innerText || "").slice(0, 2000);
+  if (/one moment please/i.test(pageText)) {
+    scheduleTripsProfitCalculator(1000);
+    return;
+  }
+  ensureTripsProfitStyle();
+
+  const rows = findTripRows();
+  const validHosts = new Set(rows.map(row => row.el));
+  document.querySelectorAll(".rfx-trip-profit-badge").forEach(badge => {
+    if (!validHosts.has(badge.parentElement)) badge.remove();
+  });
+  for (const row of rows) {
+    const payout = parseMoneyFromText(row.text);
+    const miles = parseLoadedMilesFromText(row.text);
+    const estimate = calcFuelProfitFromTrip(payout, miles);
+    if (!estimate || !payout || !miles) continue;
+
+    let badge = row.el.querySelector(":scope > .rfx-trip-profit-badge");
+    const signature = [
+      payout,
+      miles,
+      settings.profitMpg,
+      settings.profitFuelPrice,
+      settings.profitDeadheadMiles,
+      settings.profitReturnMiles,
+      settings.showProfitEstimate,
+    ].join("|");
+    if (badge?.dataset.sig === signature) continue;
+
+    if (!settings.showProfitEstimate) {
+      if (badge) badge.remove();
+      continue;
+    }
+
+    if (!badge) {
+      badge = document.createElement("span");
+      badge.className = "rfx-trip-profit-badge";
+      row.el.appendChild(badge);
+    }
+    badge.dataset.sig = signature;
+    badge.classList.toggle("negative", estimate.profit < 0);
+    badge.title = `Fuel-only estimate: ${estimate.totalMiles.toFixed(1)} total mi / ${estimate.mpg.toFixed(1)} MPG × ${fmt$(estimate.fuelPrice)} = ${fmt$(estimate.fuelCost)} fuel`;
+    badge.innerHTML = `${fmt$(estimate.profit)} profit <small>fuel ${fmt$(estimate.fuelCost)}</small>`;
+  }
+}
+
 // MutationObserver — injects our UI, re-injects if removed, hides Amazon content
 const observer = new MutationObserver((mutations) => {
+  if (isTripsPage()) {
+    if (mutations.some(m => m.target?.closest?.(".rfx-trip-profit-badge"))) return;
+    scheduleTripsProfitCalculator();
+    return;
+  }
+  if (!isLoadBoardPage()) return;
   for (const m of mutations) {
     if (m.target.id === "rfx-host" || m.target.closest?.("#rfx-host")) return;
   }
@@ -5185,11 +5587,24 @@ const observer = new MutationObserver((mutations) => {
 	    applyHideAmazonLoads();
 	  }
 });
+let observerStarted = false;
+function ensureObserverStarted() {
+  if (observerStarted || !document.body) return;
+  observer.observe(document.body, { childList: true, subtree: true });
+  observerStarted = true;
+}
 
 // ============================================================
 // INIT
 // ============================================================
 function init() {
+  ensureObserverStarted();
+  if (isTripsPage()) {
+    scheduleTripsProfitCalculator(800);
+    return;
+  }
+  if (!isLoadBoardPage()) return;
+
   // Persistent "AI Loads" button — injected into the same area as the load list
   const backBtn = document.createElement("div");
   backBtn.id = "rfx-back-btn";
@@ -5203,7 +5618,6 @@ function init() {
   backBtn.querySelector("button").addEventListener("click", toggleAiMode);
   document.body.appendChild(backBtn);
 
-  observer.observe(document.body, { childList: true, subtree: true });
   setupChatObserver();
   injectCards();
 }

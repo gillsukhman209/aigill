@@ -14,7 +14,7 @@
   },
   "content_scripts": [
     {
-      "matches": ["https://relay.amazon.com/loadboard/*"],
+      "matches": ["https://relay.amazon.com/*"],
       "js": ["content.js"],
       "run_at": "document_start"
     }
