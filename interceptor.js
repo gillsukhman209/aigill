@@ -3,6 +3,7 @@
 (function () {
   let capturedCsrfToken = null;
   let lastSearchPayload = null;
+  let autoSearchSeq = 0;
   const _origFetch = window.fetch;
   const _origXHROpen = XMLHttpRequest.prototype.open;
   const _origXHRSend = XMLHttpRequest.prototype.send;
@@ -56,14 +57,25 @@
         const parsed = JSON.parse(config.body);
         if (!parsed._isRelayFetcher) {
           lastSearchPayload = parsed;
+          const searchSeq = ++autoSearchSeq;
           // Intercept the response to broadcast to content script
           const response = await _origFetch.apply(this, args);
           const clone = response.clone();
           try {
             const data = await clone.json();
-            window.dispatchEvent(new CustomEvent("relay-fetcher-auto-update", {
-              detail: JSON.stringify({ data, payload: parsed }),
-            }));
+            const firstPageLoads = data.workOpportunities || [];
+            const totalResults = data.totalResultsSize || firstPageLoads.length;
+            const hasMorePages = data.nextItemToken != null && firstPageLoads.length > 0 && firstPageLoads.length < totalResults;
+            if (hasMorePages) {
+              window.dispatchEvent(new CustomEvent("relay-fetcher-auto-update", {
+                detail: JSON.stringify({ data: { ...data, _rfxPartialPage: true }, payload: parsed, seq: searchSeq }),
+              }));
+              fetchRemainingSearchPages(parsed, data, capturedCsrfToken, searchSeq);
+            } else {
+              window.dispatchEvent(new CustomEvent("relay-fetcher-auto-update", {
+                detail: JSON.stringify({ data, payload: parsed, seq: searchSeq }),
+              }));
+            }
           } catch (e) {}
           return response;
         }
@@ -90,6 +102,61 @@
 
     return _origFetch.apply(this, args);
   };
+
+  async function fetchRemainingSearchPages(basePayload, firstPageData, csrfToken, searchSeq) {
+    const allLoads = [...(firstPageData.workOpportunities || [])];
+    let carrierDetails = firstPageData.carrierDetails || null;
+    let searchAuditId = firstPageData.searchAuditId || null;
+    let nextToken = firstPageData.nextItemToken;
+    let totalResults = firstPageData.totalResultsSize || allLoads.length;
+    let pageNum = 1;
+
+    try {
+      while (nextToken != null && allLoads.length < totalResults && pageNum < 10) {
+        pageNum++;
+        const payload = { ...basePayload, nextItemToken: nextToken, resultSize: 50, _isRelayFetcher: true };
+        const response = await _origFetch("https://relay.amazon.com/api/loadboard/search", {
+          method: "POST",
+          headers: { "Content-Type": "application/json", ...(csrfToken ? { "x-csrf-token": csrfToken } : {}) },
+          credentials: "include",
+          body: JSON.stringify(payload),
+        });
+        const data = await response.json();
+        if (data.errorCode) throw new Error(data.message || data.errorCode);
+        carrierDetails = data.carrierDetails || carrierDetails;
+        searchAuditId = data.searchAuditId || searchAuditId;
+        const loads = data.workOpportunities || [];
+        allLoads.push(...loads);
+        totalResults = data.totalResultsSize || totalResults;
+        nextToken = data.nextItemToken;
+        if (!loads.length) break;
+      }
+
+      window.dispatchEvent(new CustomEvent("relay-fetcher-auto-update", {
+        detail: JSON.stringify({
+          data: {
+            ...firstPageData,
+            workOpportunities: allLoads,
+            totalResultsSize: totalResults,
+            carrierDetails,
+            searchAuditId,
+            nextItemToken: nextToken,
+            _rfxPaginated: true,
+          },
+          payload: basePayload,
+          seq: searchSeq,
+        }),
+      }));
+    } catch (err) {
+      window.dispatchEvent(new CustomEvent("relay-fetcher-auto-update", {
+        detail: JSON.stringify({
+          data: { ...firstPageData, _rfxPaginationFailed: true },
+          payload: basePayload,
+          seq: searchSeq,
+        }),
+      }));
+    }
+  }
 
   // Manual paginated fetch triggered by content script
   window.addEventListener("relay-fetcher-fetch", async (e) => {

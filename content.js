@@ -27,6 +27,7 @@ let shadowRoot = null;
 let carrierDetails = null;
 let currentSearchAuditId = null;
 let currentSearchSignature = "";
+let latestAutoSearchSeq = 0;
 let suppressAutoUpdateDetectionUntil = 0;
 let lastNonEmptySearchAt = 0;
 
@@ -5329,8 +5330,15 @@ function fetchAllLoads() {
 // ============================================================
 window.addEventListener("relay-fetcher-auto-update", (e) => {
   try {
-    const { data, payload } = JSON.parse(e.detail);
+    const { data, payload, seq } = JSON.parse(e.detail);
+    if (Number.isFinite(Number(seq))) {
+      if (Number(seq) < latestAutoSearchSeq) return;
+      latestAutoSearchSeq = Number(seq);
+    }
     if (data?.workOpportunities) {
+      if (data._rfxPartialPage) {
+        return;
+      }
       carrierDetails = data?.carrierDetails || carrierDetails;
       currentSearchAuditId = data?.searchAuditId || currentSearchAuditId;
       const rawPageLoads = data.workOpportunities || [];
