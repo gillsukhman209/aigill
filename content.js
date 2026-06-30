@@ -98,6 +98,7 @@ const DEFAULT_SETTINGS = {
   showLegDistance: true,
   showDwellTime: true,
   showCheckoutTime: false,
+  showFlexibleArrivalWindow: true,
   showLoadTypeBadge: true,
   showPostedAge: true,
   showDriverType: true,
@@ -107,6 +108,7 @@ const DEFAULT_SETTINGS = {
   showExtraStopMeta: true,
   showTimingRisk: true,
   amazonOnlyFacilities: false,
+  patEnabled: false,
   fastBook: false,
   autoBook: false,
   autoResume: false,
@@ -156,6 +158,8 @@ const LOOKOUT_ALERTS_KEY = "rfx_lookout_alerts_v1";
 const LOOKOUT_MAX_ALERTS_PER_PASS = 5;
 const LOOKOUT_HISTORY_TTL_MS = 7 * 24 * 60 * 60 * 1000;
 let lookoutProcessing = false;
+const PAT_ENDPOINT_KEY = "rfx_pat_endpoint_v1";
+const PAT_TEMPLATE_KEY = "rfx_pat_template_v1";
 
 // Negotiation state
 const negotiationState = new Map();
@@ -163,6 +167,8 @@ const negotiationState = new Map();
 // Booking state — key: woId, value: 'idle'|'pending'|'failed'
 const bookingState = new Map();
 const armedFastBookLoads = new Set();
+const patState = new Map();
+let patModalWoId = null;
 
 // Bot state
 let botRunning = false;
@@ -267,6 +273,44 @@ function getAllStops(wo) {
   });
 }
 
+function getFlexibleArrivalWindow(wo, tz) {
+  const windows = Array.isArray(wo?.workOpportunityArrivalWindows)
+    ? wo.workOpportunityArrivalWindows
+    : [];
+  const stops = getAllStops(wo);
+  const firstStop = stops[0];
+  const zone = tz || firstStop?.location?.timeZone || "America/Los_Angeles";
+
+  const bestWindow = windows.reduce((best, window) => {
+    const startMs = window?.start ? new Date(window.start).getTime() : NaN;
+    const endMs = window?.end ? new Date(window.end).getTime() : NaN;
+    if (!Number.isFinite(startMs) || !Number.isFinite(endMs) || endMs <= startMs) {
+      return best;
+    }
+
+    const candidate = {
+      start: window.start,
+      end: window.end,
+      durationMs: endMs - startMs,
+    };
+
+    return !best || candidate.durationMs > best.durationMs ? candidate : best;
+  }, null);
+
+  if (!bestWindow) return null;
+
+  const start = fmtStopDateTime(bestWindow.start, zone);
+  const end = fmtStopDateTime(bestWindow.end, zone);
+  if (!start || !end) return null;
+
+  return {
+    start,
+    end,
+    duration: fmtDur(bestWindow.durationMs),
+    label: `Flexible ${start} → ${end}`,
+  };
+}
+
 function getStopCheckin(stop) {
   return stop?.actions?.find(a => a.type === "CHECKIN")?.plannedTime || "";
 }
@@ -299,6 +343,228 @@ function stopDistanceMiles(a, b) {
 function stopCityState(stop) {
   const loc = stop?.location || {};
   return [loc.city, loc.state].filter(Boolean).join(", ") || "?";
+}
+
+function getSavedPatTemplate() {
+  try {
+    return JSON.parse(localStorage.getItem(PAT_TEMPLATE_KEY) || "null");
+  } catch {
+    return null;
+  }
+}
+
+function getSavedPatEndpoint() {
+  return localStorage.getItem(PAT_ENDPOINT_KEY) || "";
+}
+
+function cityInfoFromStop(stop) {
+  const loc = stop?.location || {};
+  const city = loc.city || "";
+  const state = loc.state || loc.stateCode || "";
+  return {
+    name: city,
+    stateCode: state,
+    country: loc.country || "US",
+    latitude: Number(loc.latitude) || null,
+    longitude: Number(loc.longitude) || null,
+    nearestDomicileCode: loc.nearestDomicileCode || null,
+    displayValue: [city, state].filter(Boolean).join(", "),
+  };
+}
+
+function getPatRunType(wo) {
+  const raw = String(wo?.workOpportunityType || wo?.tripType || "").toUpperCase();
+  if (raw.includes("ROUND")) return "ROUND_TRIP";
+  return "ONE_WAY";
+}
+
+function getPatDriverTypes(wo) {
+  return [wo?.transitOperatorType === "TEAM_DRIVER" ? "TEAM" : "SOLO"];
+}
+
+function getPatLoadingTypes(wo) {
+  const values = new Set();
+  for (const load of wo?.loads || []) {
+    const raw = String(load?.loadingType || load?.loadType || "").toUpperCase();
+    if (raw.includes("PRELOAD")) values.add("PRELOADED");
+    if (raw.includes("LIVE")) values.add("LIVE");
+    if (raw.includes("DROP")) values.add("LIVE");
+  }
+  if (!values.size) {
+    values.add(hasPreloadedStop(wo) ? "PRELOADED" : "LIVE");
+  }
+  return Array.from(values);
+}
+
+function getPatPrefill(wo) {
+  const stops = getAllStops(wo);
+  const first = stops[0] || null;
+  const last = stops[stops.length - 1] || first;
+  const pay = Number(wo?.payout?.value) || 0;
+  const dist = Number(wo?.totalDistance?.value) || 0;
+  const startIso = getStopCheckin(first) || getStopCheckout(first) || "";
+  const endIso = getStopCheckout(last) || getStopCheckin(last) || startIso;
+  const pricePerMi = dist > 0 ? pay / dist : 0;
+  return {
+    startTime: startIso,
+    endTime: endIso,
+    payout: Math.round(pay),
+    pricePerMi: Number(pricePerMi.toFixed(2)),
+    distanceMin: dist ? Math.max(0, Math.floor(dist - 1)) : 0,
+    distanceMax: dist ? Math.ceil(dist + 1) : 0,
+    stemTime: 60,
+    origin: cityInfoFromStop(first),
+    destination: cityInfoFromStop(last),
+    originRadius: 25,
+    destinationRadius: 25,
+    runType: getPatRunType(wo),
+    driverTypes: getPatDriverTypes(wo),
+    loadingTypeList: getPatLoadingTypes(wo),
+    maxStops: Math.max(Number(wo?.stopCount) || stops.length || 1, 1),
+  };
+}
+
+function buildPatPayload(wo, values) {
+  const template = getSavedPatTemplate() || {};
+  const origin = values.origin || getPatPrefill(wo).origin;
+  const destination = values.destination || getPatPrefill(wo).destination;
+  const payout = Number(values.payout) || 0;
+  const pricePerMi = Number(values.pricePerMi) || 0;
+  const distanceMin = Number(values.distanceMin) || 0;
+  const distanceMax = Number(values.distanceMax) || 0;
+  const stemTime = Number(values.stemTime) || 60;
+  const payload = {
+    ...template,
+    auditMetaData: template.auditMetaData || { suggestedCostPerDistance: null, matchOutlookScore: "LOW" },
+    cancellationDetails: template.cancellationDetails ?? null,
+    costPerDistance: pricePerMi > 0 ? { value: pricePerMi, currencyUnit: "USD", distanceUnit: "mi" } : null,
+    destinationCityInfo: null,
+    destinationCityInfoForFilter: null,
+    destinationCityRadius: { value: Number(values.destinationRadius) || 25, unit: "mi" },
+    distanceOrDuration: "DISTANCE",
+    driverTypes: values.driverTypes || getPatDriverTypes(wo),
+    endLocationList: [destination],
+    endRegionList: [],
+    endTime: values.endTime,
+    equipmentTypes: template.equipmentTypes || [
+      "FIFTY_THREE_FOOT_TRUCK",
+      "SKIRTED_FIFTY_THREE_FOOT_TRUCK",
+      "FIFTY_THREE_FOOT_DRY_VAN",
+      "FIFTY_THREE_FOOT_A5_AIR_TRAILER",
+      "FORTY_FIVE_FOOT_TRUCK",
+    ],
+    excludeSpecialServices: template.excludeSpecialServices || ["SWING_DOOR"],
+    exclusionCityList: template.exclusionCityList || [],
+    isAnywhereDestination: false,
+    isCheckingMatchingWork: false,
+    isLinkedOrder: false,
+    isMatchingWorkLoaded: false,
+    isRepostingAllowed: template.isRepostingAllowed ?? true,
+    loadingTypeList: values.loadingTypeList || getPatLoadingTypes(wo),
+    matchingDemands: [],
+    matchingWork: 0,
+    maxDistance: distanceMax > 0 ? { value: distanceMax, unit: "mi" } : null,
+    maxDurationInMinutes: null,
+    maxNumberOfStops: Number(values.maxStops) || Math.max(Number(wo?.stopCount) || getAllStops(wo).length || 1, 1),
+    minDistance: distanceMin > 0 ? { value: distanceMin, unit: "mi" } : null,
+    minDurationInMinutes: null,
+    minPickUpBufferInMinutes: stemTime,
+    originCityInfo: origin,
+    originCityRadius: { value: Number(values.originRadius) || 25, unit: "mi" },
+    patOrderContext: null,
+    payoutType: "FLAT_RATE",
+    providedTrailerType: template.providedTrailerType || "AMAZON_PROVIDED",
+    repostingDetails: template.repostingDetails ?? null,
+    runType: values.runType || getPatRunType(wo),
+    startTime: values.startTime,
+    startTimeWindow: template.startTimeWindow ?? null,
+    supplyDriverIdList: template.supplyDriverIdList || [],
+    supplyTransientDriverIdList: template.supplyTransientDriverIdList || [],
+    totalCost: { value: payout, unit: "USD" },
+    visibleEquipmentTypes: template.visibleEquipmentTypes || "FIFTY_THREE_FOOT_TRUCK",
+    visibleProvidedTrailerType: template.visibleProvidedTrailerType || "AMAZON_PROVIDED",
+  };
+  delete payload.id;
+  delete payload.alias;
+  delete payload.version;
+  delete payload.status;
+  delete payload.creationTime;
+  delete payload.demandId;
+  delete payload.demandVersion;
+  delete payload.demandOptionId;
+  delete payload.matchType;
+  delete payload.linkedOrderId;
+  return payload;
+}
+
+function parseCityInfoInput(value, fallback) {
+  const raw = String(value || "").trim();
+  if (!raw) return fallback;
+  const parts = raw.split(",").map(v => v.trim()).filter(Boolean);
+  const city = parts[0] || fallback?.name || "";
+  const state = parts[1] || fallback?.stateCode || "";
+  return {
+    ...(fallback || {}),
+    name: city,
+    stateCode: state,
+    country: fallback?.country || "US",
+    displayValue: [city, state].filter(Boolean).join(", "),
+  };
+}
+
+function renderPatButton(wo) {
+  if (!settings.patEnabled || !wo?.id) return "";
+  const state = patState.get(wo.id) || "idle";
+  if (state === "posted") {
+    return `<button type="button" class="rfx-pat-btn done" data-pat-wo-id="${wo.id}" disabled>PAT Posted</button>`;
+  }
+  if (state === "posting") {
+    return `<button type="button" class="rfx-pat-btn" data-pat-wo-id="${wo.id}" disabled>Posting...</button>`;
+  }
+  return `<button type="button" class="rfx-pat-btn" data-pat-wo-id="${wo.id}">Post A Truck</button>`;
+}
+
+function renderPatModal() {
+  if (!patModalWoId) return "";
+  const wo = findLoadForAction(patModalWoId);
+  if (!wo) return "";
+  const p = getPatPrefill(wo);
+  const originLabel = p.origin.displayValue || "";
+  const destinationLabel = p.destination.displayValue || "";
+  const endpointKnown = !!getSavedPatEndpoint();
+  return `<div class="rfx-pat-backdrop" id="rfx-pat-backdrop">
+    <form class="rfx-pat-modal" id="rfx-pat-form" data-pat-wo-id="${escapeHtml(wo.id)}">
+      <div class="rfx-pat-head">
+        <div class="rfx-pat-title">Create Post-A-Truck Order</div>
+        <button type="button" class="rfx-pat-close" id="rfx-pat-close" aria-label="Close">×</button>
+      </div>
+      <div class="rfx-pat-grid">
+        <div class="rfx-pat-field"><label>Start Time</label><input type="datetime-local" name="startTime" value="${escapeHtml(toLocalDateTimeInputValue(p.startTime))}" required></div>
+        <div class="rfx-pat-field"><label>End Time</label><input type="datetime-local" name="endTime" value="${escapeHtml(toLocalDateTimeInputValue(p.endTime))}" required></div>
+        <div class="rfx-pat-field"><label>Payout (min)</label><input type="number" name="payout" min="0" step="1" value="${escapeHtml(p.payout)}" required></div>
+        <div class="rfx-pat-field"><label>Price/mi (min)</label><input type="number" name="pricePerMi" min="0" step="0.01" value="${escapeHtml(p.pricePerMi)}"></div>
+        <div class="rfx-pat-field"><label>Distance min</label><input type="number" name="distanceMin" min="0" step="1" value="${escapeHtml(p.distanceMin)}"></div>
+        <div class="rfx-pat-field"><label>Distance max</label><input type="number" name="distanceMax" min="0" step="1" value="${escapeHtml(p.distanceMax)}"></div>
+        <div class="rfx-pat-field"><label>Stem Time</label><select name="stemTime">
+          ${[15, 30, 45, 60, 90, 120].map(v => `<option value="${v}" ${v === p.stemTime ? "selected" : ""}>${v < 60 ? `${v}m` : `${v / 60} hr`}</option>`).join("")}
+        </select></div>
+        <div class="rfx-pat-field"><label>Run Type</label><select name="runType">
+          <option value="ONE_WAY" ${p.runType === "ONE_WAY" ? "selected" : ""}>One-way</option>
+          <option value="ROUND_TRIP" ${p.runType === "ROUND_TRIP" ? "selected" : ""}>Round trip</option>
+        </select></div>
+        <div class="rfx-pat-field"><label>Origin</label><input type="text" name="origin" value="${escapeHtml(originLabel)}" required></div>
+        <div class="rfx-pat-field"><label>Radius</label><select name="originRadius">
+          ${[15, 25, 50, 100, 250].map(v => `<option value="${v}" ${v === p.originRadius ? "selected" : ""}>${v} mi</option>`).join("")}
+        </select></div>
+        <div class="rfx-pat-field"><label>Destination</label><input type="text" name="destination" value="${escapeHtml(destinationLabel)}" required></div>
+        <div class="rfx-pat-field"><label>Radius</label><select name="destinationRadius">
+          ${[15, 25, 50, 100, 250].map(v => `<option value="${v}" ${v === p.destinationRadius ? "selected" : ""}>${v} mi</option>`).join("")}
+        </select></div>
+      </div>
+      <button type="submit" class="rfx-pat-submit">Submit</button>
+      ${endpointKnown ? "" : `<div class="rfx-pat-help">Open Amazon's Post A Truck page and submit or preview one PAT order once so this extension can learn Amazon's current PAT endpoint.</div>`}
+    </form>
+  </div>`;
 }
 
 function getLoadEndpointInfo(wo) {
@@ -2480,6 +2746,7 @@ const CSS = `
 .rfx-stop-meta { display: flex; gap: 8px; align-items: center; margin-top: 4px; flex-wrap: wrap; }
 .rfx-stop-time { font-size: 13px; color: #565959; }
 .rfx-stop-dwell { font-size: 12px; color: #888; }
+.rfx-flex-window { font-size: 11px; padding: 3px 7px; border-radius: 5px; background: #fff4d6; color: #8a4b00; font-weight: 800; }
 .rfx-extra { font-size: 11px; padding: 3px 7px; border-radius: 5px; background: #f3f4f6; color: #374151; font-weight: 600; }
 .rfx-badge { font-size: 11px; padding: 2px 8px; border-radius: 4px; font-weight: 600; text-transform: uppercase; }
 .rfx-badge.preloaded { background: #e6f7f2; color: #067d62; }
@@ -2503,6 +2770,47 @@ const CSS = `
   background: #ff9900; color: #0f1111; border: none; border-radius: 8px; cursor: pointer; font-family: inherit;
 }
 .rfx-book-btn:hover { background: #e88b00; }
+.rfx-card-actions { margin-left: auto; display: flex; flex-direction: column; align-items: flex-end; gap: 8px; }
+.rfx-left-actions { display: flex; align-items: center; gap: 8px; margin: 0 0 8px 32px; }
+.rfx-pat-btn {
+  padding: 7px 14px; font-size: 12px; font-weight: 800;
+  background: #0b7285; color: #fff; border: none; border-radius: 8px; cursor: pointer; font-family: inherit;
+}
+.rfx-pat-btn:hover { background: #075965; }
+.rfx-pat-btn:disabled { opacity: 0.65; cursor: default; }
+.rfx-pat-btn.done { background: #067d62; }
+.rfx-pat-backdrop {
+  position: fixed; inset: 0; background: rgba(15, 17, 17, 0.45);
+  z-index: 2147483646; display: flex; align-items: center; justify-content: center; padding: 16px;
+}
+.rfx-pat-modal {
+  width: min(430px, calc(100vw - 32px)); background: #fff; border: 1px solid #d5d9d9; border-radius: 10px;
+  box-shadow: 0 18px 45px rgba(0, 0, 0, 0.28); padding: 14px; color: #0f1111; box-sizing: border-box; overflow: hidden;
+}
+.rfx-pat-head { display: flex; align-items: center; justify-content: space-between; gap: 12px; margin-bottom: 12px; }
+.rfx-pat-title { font-size: 16px; font-weight: 800; }
+.rfx-pat-close { border: 0; background: transparent; font-size: 24px; line-height: 1; cursor: pointer; color: #565959; }
+.rfx-pat-grid { display: grid; grid-template-columns: minmax(0, 1fr) minmax(0, 1fr); gap: 10px; }
+.rfx-pat-field { display: grid; gap: 4px; min-width: 0; }
+.rfx-pat-field label { font-size: 11px; font-weight: 800; color: #565959; }
+.rfx-pat-field input,
+.rfx-pat-field select {
+  border: 1px solid #8d979b; border-radius: 4px; padding: 8px; min-height: 38px;
+  font: inherit; font-size: 13px; background: #fff; color: #0f1111; width: 100%; box-sizing: border-box;
+}
+.rfx-pat-field.full { grid-column: 1 / -1; }
+.rfx-pat-submit {
+  margin-top: 12px; width: 100%; min-height: 42px; border: 0; border-radius: 7px;
+  background: #007185; color: #fff; font: inherit; font-weight: 800; cursor: pointer;
+}
+.rfx-pat-submit:hover { background: #005f70; }
+.rfx-pat-submit:disabled { opacity: 0.6; cursor: default; }
+.rfx-pat-help { margin-top: 8px; color: #8a5a00; font-size: 12px; line-height: 1.35; }
+@media (max-width: 560px) {
+  .rfx-pat-backdrop { align-items: flex-start; padding-top: 24px; }
+  .rfx-pat-grid { grid-template-columns: 1fr; }
+  .rfx-pat-field.full { grid-column: auto; }
+}
 
 /* Negotiation */
 .rfx-neg-btn {
@@ -2952,8 +3260,17 @@ function renderCard(wo, extraClass, changeBadge) {
   const timingRisk = settings.showTimingRisk ? getTimingRisk(wo) : null;
   const privateLoad = isPrivateLoad(wo);
   const loadDisplayId = getLoadDisplayId(wo);
+  const flexibleArrival = settings.showFlexibleArrivalWindow
+    ? getFlexibleArrivalWindow(wo, firstTz)
+    : null;
   const bState = bookingState.get(wo.id) || "idle";
   const armedForFastBook = settings.fastBook || armedFastBookLoads.has(wo.id);
+  const bookButtonHtml = bState === "confirmed"
+    ? `<button class="rfx-book-btn" style="background:#067d62;color:#fff;cursor:default" disabled>✅ Booked</button>`
+    : bState === "pending"
+      ? `<button class="rfx-book-btn pending" data-wo-id="${wo.id}" disabled>Booking...</button>`
+      : `<button class="rfx-book-btn" data-wo-id="${wo.id}" data-action="${armedForFastBook ? "fastbook" : "arm"}">${armedForFastBook ? (bState === "failed" ? "RETRY FASTBOOK" : "FASTBOOK") : "BOOK"}</button>`;
+  const patButtonHtml = renderPatButton(wo);
   const cls = [
     "rfx-card",
     goneLoads.has(wo.id) ? "gone" : "",
@@ -3005,6 +3322,7 @@ function renderCard(wo, extraClass, changeBadge) {
         </div>
         ${settings.showStopAddress ? `<div class="rfx-stop-addr">${[loc.line1, loc.line2].filter(Boolean).join(", ")}</div>` : ""}
         <div class="rfx-stop-meta">
+          ${i === 0 && flexibleArrival ? `<span class="rfx-flex-window" title="${escapeHtml(flexibleArrival.duration)} editable pickup window">${escapeHtml(flexibleArrival.label)}</span>` : ""}
           ${dwell && settings.showDwellTime ? `<span class="rfx-stop-dwell">${dwell}</span>` : ""}
           ${extraMeta}
         </div>
@@ -3048,6 +3366,7 @@ function renderCard(wo, extraClass, changeBadge) {
 	    ${badgeHtml}
 	    <div class="rfx-body">
       <div class="rfx-left">
+        ${patButtonHtml ? `<div class="rfx-left-actions">${patButtonHtml}</div>` : ""}
         ${settings.showScoreBar ? `<div class="rfx-score-row">
           <div class="rfx-score-bg"><div class="rfx-score-fill" style="width:${score}%;background:${sc}"></div></div>
           <span class="rfx-score-label" style="color:${sc}">${score}</span>
@@ -3058,13 +3377,7 @@ function renderCard(wo, extraClass, changeBadge) {
       </div>
       <div class="rfx-right">
         <div class="rfx-stats-group">${statsHtml}</div>
-        ${
-          bState === "confirmed"
-            ? `<button class="rfx-book-btn" style="background:#067d62;color:#fff;cursor:default" disabled>✅ Booked</button>`
-            : bState === "pending"
-              ? `<button class="rfx-book-btn pending" data-wo-id="${wo.id}" disabled>Booking...</button>`
-              : `<button class="rfx-book-btn" data-wo-id="${wo.id}" data-action="${armedForFastBook ? "fastbook" : "arm"}">${armedForFastBook ? (bState === "failed" ? "RETRY FASTBOOK" : "FASTBOOK") : "BOOK"}</button>`
-        }
+        <div class="rfx-card-actions">${bookButtonHtml}</div>
       </div>
     </div>
   </div>`;
@@ -3372,6 +3685,7 @@ function injectCards() {
           ${chk("autoBook", "Auto-Book — automatically book new loads when detected (clicks Book only, not Confirm)")}
           ${chk("autoResume", "Auto-resume after stop — restart bot after 5 seconds")}
           ${chk("amazonOnlyFacilities", "Amazon facilities only")}
+          ${chk("patEnabled", "PAT — show Post A Truck button on loads")}
         </div>
         <div class="rfx-settings-section">
           <div class="rfx-settings-section-title">Bot Speed</div>
@@ -3440,6 +3754,7 @@ function injectCards() {
         ${chk("showStopAddress", "Street addresses")}
         ${chk("showDwellTime", "Time at stop")}
         ${chk("showCheckoutTime", "Checkout time")}
+        ${chk("showFlexibleArrivalWindow", "Flexible arrival window")}
         ${chk("showLoadTypeBadge", "Preloaded badge")}
         ${chk("showDriverType", "Driver type (Solo/Team)")}
         ${chk("showEquipment", "Equipment (53' Trailer)")}
@@ -3475,7 +3790,7 @@ function injectCards() {
     ? `<div class="rfx-autobook-warn">⚠ AUTO-BOOK ARMED — New loads will be booked automatically ⚠</div>` : "";
 
   const customLoadBoard = renderCustomLoadBoard();
-  shadowRoot.innerHTML = `<style>${CSS}</style>${statusBar}${autoBookWarning}${settingsPanel}${customLoadBoard}`;
+  shadowRoot.innerHTML = `<style>${CSS}</style>${statusBar}${autoBookWarning}${settingsPanel}${customLoadBoard}${renderPatModal()}`;
   syncChatVisibility();
 
   // Bind control panel listeners
@@ -3668,6 +3983,32 @@ function injectCards() {
     });
   });
 
+  shadowRoot.querySelectorAll(".rfx-pat-btn[data-pat-wo-id]").forEach(btn => {
+    btn.addEventListener("click", (e) => {
+      e.preventDefault();
+      e.stopPropagation();
+      const woId = btn.dataset.patWoId;
+      if (!woId || btn.disabled) return;
+      openPatModal(woId);
+    });
+  });
+
+  const patClose = shadowRoot.getElementById("rfx-pat-close");
+  if (patClose) patClose.addEventListener("click", closePatModal);
+  const patBackdrop = shadowRoot.getElementById("rfx-pat-backdrop");
+  if (patBackdrop) {
+    patBackdrop.addEventListener("click", (e) => {
+      if (e.target === patBackdrop) closePatModal();
+    });
+  }
+  const patForm = shadowRoot.getElementById("rfx-pat-form");
+  if (patForm) {
+    patForm.addEventListener("submit", (e) => {
+      e.preventDefault();
+      submitPatForm(patForm);
+    });
+  }
+
   updateLastRefresh();
   applyHideAmazonLoads();
 }
@@ -3720,6 +4061,7 @@ function styleAmazonLoadCards() {
       .load-card .rfx-i-badge.live { background: #fef3cd; color: #856404; }
       .load-card .rfx-i-badge.drop { background: #e8f0fe; color: #1a56db; }
       .load-card .rfx-i-extra { font-size: 11px; padding: 2px 6px; border-radius: 4px; background: #f3f4f6; color: #374151; font-weight: 500; }
+      .load-card .rfx-i-flex-window { font-size: 11px; padding: 2px 6px; border-radius: 4px; background: #fff4d6; color: #8a4b00; font-weight: 800; }
       .load-card .rfx-i-timing-risk { font-size: 11px; padding: 3px 7px; border-radius: 6px; font-weight: 800; display: inline-flex; align-items: center; gap: 4px; }
       .load-card .rfx-i-timing-risk.warn { background:#fff8e1; color:#8a5a00; border:1px solid #f3d27a; }
       .load-card .rfx-i-timing-risk.bad { background:#fdecea; color:#b12704; border:1px solid #f1b8b0; }
@@ -3729,8 +4071,14 @@ function styleAmazonLoadCards() {
       .load-card .rfx-i-version { font-size: 11px; padding: 2px 6px; border-radius: 4px; font-weight: 600; }
       .load-card .rfx-i-version.ok { background: #f0f0f0; color: #565959; }
       .load-card .rfx-i-version.bad { background: #fdecea; color: #cc3333; }
+	      .load-card .rfx-i-actions { display: flex; flex-direction: column; align-items: flex-end; gap: 7px; }
+	      .load-card .rfx-i-left-actions { display: flex; align-items: center; gap: 8px; margin: 0 0 8px 32px; }
 	      .load-card .rfx-i-book { padding: 8px 20px; font-size: 14px; font-weight: 600; background: #ff9900; color: #0f1111; border: none; border-radius: 8px; cursor: pointer; font-family: inherit; }
 	      .load-card .rfx-i-book:hover { background: #e88b00; }
+	      .load-card .rfx-i-pat { padding: 7px 12px; font-size: 12px; font-weight: 800; background: #0b7285; color: #fff; border: none; border-radius: 8px; cursor: pointer; font-family: inherit; }
+	      .load-card .rfx-i-pat:hover { background: #075965; }
+	      .load-card .rfx-i-pat:disabled { opacity: 0.65; cursor: default; }
+	      .load-card .rfx-i-pat.done { background: #067d62; }
 	      .load-card .rfx-i-hide { position: absolute; top: 6px; left: 6px; width: 22px; height: 22px; border: 1px solid #d5d9d9; border-radius: 50%; background: #fff; color: #565959; font-size: 15px; line-height: 1; cursor: pointer; display: flex; align-items: center; justify-content: center; z-index: 2; }
 	      .load-card .rfx-i-hide:hover { background: #fdecea; border-color: #cc3333; color: #cc3333; }
 	      .load-card.rfx-styled { border: 1px solid #d5d9d9; border-radius: 10px; margin-bottom: 10px; overflow: hidden; }
@@ -3742,6 +4090,7 @@ function styleAmazonLoadCards() {
         .load-card .rfx-card-right { flex-direction: row; align-items: center; gap: 10px; min-width: 0; text-align: left; flex-wrap: wrap; border-top: 1px solid #f0f0f0; padding-top: 8px; }
         .load-card .rfx-i-payout { font-size: 20px; }
         .load-card .rfx-i-book { min-height: 44px; }
+        .load-card .rfx-i-actions { flex-direction: row; align-items: center; }
       }
     `;
     document.head.appendChild(style);
@@ -3853,6 +4202,9 @@ function styleAmazonLoadCards() {
     const driver = wo.transitOperatorType === "TEAM_DRIVER" ? "Team" : "Solo";
     const firstTz = stops[0]?.location?.timeZone || "America/Los_Angeles";
     const timingRisk = settings.showTimingRisk ? getTimingRisk(wo) : null;
+    const flexibleArrival = settings.showFlexibleArrivalWindow
+      ? getFlexibleArrivalWindow(wo, firstTz)
+      : null;
 
     let vBadge = "";
     if (settings.showVersionBadge) {
@@ -3893,6 +4245,7 @@ function styleAmazonLoadCards() {
           </div>
           ${settings.showStopAddress ? `<div class="rfx-i-stop-addr">${[loc.line1, loc.line2].filter(Boolean).join(", ")}</div>` : ""}
           <div class="rfx-i-stop-meta">
+            ${i === 0 && flexibleArrival ? `<span class="rfx-i-flex-window" title="${escapeHtml(flexibleArrival.duration)} editable pickup window">${escapeHtml(flexibleArrival.label)}</span>` : ""}
             ${dwell && settings.showDwellTime ? `<span style="font-size:12px;color:#888">${dwell}</span>` : ""}
             ${extraMeta}
           </div>
@@ -3941,6 +4294,14 @@ function styleAmazonLoadCards() {
           ? `<button class="rfx-i-book" style="background:#b8860b;color:#fff;cursor:default" disabled>Booking...</button>`
           : `<button class="rfx-i-book" data-wo-id="${woId}" data-action="${armedForFastBook ? "fastbook" : "arm"}">${armedForFastBook ? (bState === "failed" ? "RETRY FASTBOOK" : "FASTBOOK") : "BOOK"}</button>`
     );
+    const patBtn = settings.patEnabled
+      ? (() => {
+          const pState = patState.get(woId) || "idle";
+          if (pState === "posted") return `<button type="button" class="rfx-i-pat done" data-pat-wo-id="${woId}" disabled>PAT Posted</button>`;
+          if (pState === "posting") return `<button type="button" class="rfx-i-pat" data-pat-wo-id="${woId}" disabled>Posting...</button>`;
+          return `<button type="button" class="rfx-i-pat" data-pat-wo-id="${woId}">Post A Truck</button>`;
+        })()
+      : "";
 
     // Alert badge if this is a new/changed load
     let alertBadge = "";
@@ -3960,8 +4321,8 @@ function styleAmazonLoadCards() {
         <span class="rfx-i-score-tag" style="background:${scoreBg(score)};color:${sc}">${score >= 70 ? "Great" : score >= 40 ? "OK" : "Low"}</span>
       </div>` : ""}
       <div class="rfx-card-body">
-        <div class="rfx-card-left">${stopsHtml}${footer ? `<div class="rfx-i-footer">${footer}</div>` : ""}</div>
-        <div class="rfx-card-right"><div>${statsHtml}</div>${bookBtn}</div>
+        <div class="rfx-card-left">${patBtn ? `<div class="rfx-i-left-actions">${patBtn}</div>` : ""}${stopsHtml}${footer ? `<div class="rfx-i-footer">${footer}</div>` : ""}</div>
+        <div class="rfx-card-right"><div>${statsHtml}</div><div class="rfx-i-actions">${bookBtn}</div></div>
       </div>
     </div>`;
 
@@ -3980,6 +4341,15 @@ function styleAmazonLoadCards() {
           styleAmazonLoadCards();
           showToast("Fastbook armed for this load. Click FASTBOOK to book.");
         }
+      });
+    }
+
+    const patBtnEl = inject.querySelector(".rfx-i-pat[data-pat-wo-id]");
+    if (patBtnEl) {
+      patBtnEl.addEventListener("click", (e) => {
+        e.stopPropagation();
+        e.preventDefault();
+        if (!patBtnEl.disabled) openPatModal(patBtnEl.dataset.patWoId);
       });
     }
 
@@ -4972,6 +5342,69 @@ function buildBookingPayload(wo) {
   };
 }
 
+function openPatModal(woId) {
+  if (!findLoadForAction(woId)) {
+    showToast("PAT: load data not found. Refresh search first.");
+    return;
+  }
+  patModalWoId = woId;
+  if (aiModeActive) injectCards();
+}
+
+function closePatModal() {
+  patModalWoId = null;
+  if (aiModeActive) injectCards();
+}
+
+function submitPatForm(form) {
+  const woId = form?.dataset?.patWoId;
+  const wo = findLoadForAction(woId);
+  if (!wo) {
+    showToast("PAT: load data not found.");
+    return;
+  }
+  const endpoint = getSavedPatEndpoint();
+  if (!endpoint) {
+    showToast("PAT endpoint not learned yet. Use Amazon Post A Truck once first.");
+    return;
+  }
+
+  const prefill = getPatPrefill(wo);
+  const fd = new FormData(form);
+  const values = {
+    startTime: localDateTimeInputToIso(fd.get("startTime")),
+    endTime: localDateTimeInputToIso(fd.get("endTime")),
+    payout: Number(fd.get("payout")) || 0,
+    pricePerMi: Number(fd.get("pricePerMi")) || 0,
+    distanceMin: Number(fd.get("distanceMin")) || 0,
+    distanceMax: Number(fd.get("distanceMax")) || 0,
+    stemTime: Number(fd.get("stemTime")) || 60,
+    runType: String(fd.get("runType") || prefill.runType),
+    originRadius: Number(fd.get("originRadius")) || 25,
+    destinationRadius: Number(fd.get("destinationRadius")) || 25,
+    origin: parseCityInfoInput(fd.get("origin"), prefill.origin),
+    destination: parseCityInfoInput(fd.get("destination"), prefill.destination),
+    driverTypes: prefill.driverTypes,
+    loadingTypeList: prefill.loadingTypeList,
+    maxStops: prefill.maxStops,
+  };
+
+  if (!values.startTime || !values.endTime) {
+    showToast("PAT: start and end time are required.");
+    return;
+  }
+
+  const payload = buildPatPayload(wo, values);
+  patState.set(woId, "posting");
+  patModalWoId = null;
+  if (aiModeActive) injectCards();
+  showToast("Posting truck order...");
+
+  window.dispatchEvent(new CustomEvent("relay-fetcher-pat-post", {
+    detail: JSON.stringify({ woId, url: endpoint, payload }),
+  }));
+}
+
 function bookLoadDirectFromSearch(woId) {
   const wo = findLoadForAction(woId);
   if (!wo) {
@@ -5024,6 +5457,34 @@ window.addEventListener("relay-fetcher-book-direct-result", (e) => {
     if (aiModeActive) injectCards();
   } catch (err) {
     console.error("[DirectBook] Result handler error:", err);
+  }
+});
+
+window.addEventListener("relay-fetcher-pat-template", (e) => {
+  try {
+    const { url, payload } = JSON.parse(e.detail);
+    if (url) localStorage.setItem(PAT_ENDPOINT_KEY, url);
+    if (payload) localStorage.setItem(PAT_TEMPLATE_KEY, JSON.stringify(payload));
+  } catch (err) {
+    console.warn("[PAT] Could not save captured template:", err);
+  }
+});
+
+window.addEventListener("relay-fetcher-pat-post-result", (e) => {
+  try {
+    const { woId, status, ok, data, error } = JSON.parse(e.detail);
+    if (error || !ok) {
+      console.error("[PAT] Post failed:", { woId, status, error, data });
+      patState.set(woId, "failed");
+      showToast(`PAT post failed${status ? ` (${status})` : ""}`);
+      if (aiModeActive) injectCards();
+      return;
+    }
+    patState.set(woId, "posted");
+    showToast("Post A Truck order created.");
+    if (aiModeActive) injectCards();
+  } catch (err) {
+    console.error("[PAT] Result handler error:", err);
   }
 });
 

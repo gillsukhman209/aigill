@@ -3,6 +3,7 @@
 (function () {
   let capturedCsrfToken = null;
   let lastSearchPayload = null;
+  let lastPatRequest = null;
   let autoSearchSeq = 0;
   const _origFetch = window.fetch;
   const _origXHROpen = XMLHttpRequest.prototype.open;
@@ -15,6 +16,36 @@
     } catch {
       return /amazon\..*similar|\/similar(?:\/|\?|$)/i.test(String(url || ""));
     }
+  }
+
+  function getCsrfToken() {
+    if (capturedCsrfToken) return capturedCsrfToken;
+    const cookies = document.cookie.split(";");
+    for (const c of cookies) {
+      const t = c.trim();
+      const eq = t.indexOf("=");
+      if (eq === -1) continue;
+      const n = t.substring(0, eq);
+      const v = t.substring(eq + 1);
+      if (n === "x-csrf-token" || n === "csrf-token" || n === "anti-csrftoken-a2z") {
+        capturedCsrfToken = decodeURIComponent(v);
+        break;
+      }
+    }
+    return capturedCsrfToken;
+  }
+
+  function looksLikePatPayload(payload) {
+    return !!(
+      payload &&
+      typeof payload === "object" &&
+      payload.runType &&
+      payload.payoutType === "FLAT_RATE" &&
+      payload.originCityInfo &&
+      Array.isArray(payload.endLocationList) &&
+      payload.totalCost &&
+      payload.providedTrailerType
+    );
   }
 
   XMLHttpRequest.prototype.open = function (method, url, ...rest) {
@@ -96,6 +127,23 @@
             }));
           } catch (e) {}
           return response;
+        }
+      } catch (e) {}
+    }
+
+    // Capture Amazon's own Post-A-Truck create/update request so our content script can reuse the
+    // current endpoint and baseline request shape instead of guessing private routes.
+    if (config?.method === "POST" && config?.body) {
+      try {
+        const parsed = JSON.parse(config.body);
+        if (!parsed._isRelayFetcher && !parsed._isNegotiator && looksLikePatPayload(parsed)) {
+          lastPatRequest = {
+            url: new URL(url, window.location.href).href,
+            payload: parsed,
+          };
+          window.dispatchEvent(new CustomEvent("relay-fetcher-pat-template", {
+            detail: JSON.stringify(lastPatRequest),
+          }));
         }
       } catch (e) {}
     }
@@ -372,6 +420,43 @@
       }));
     } catch (err) {
       window.dispatchEvent(new CustomEvent("relay-fetcher-book-direct-result", {
+        detail: JSON.stringify({ woId: req.woId, error: err.message }),
+      }));
+    }
+  });
+
+  // Post-A-Truck request — reuses the most recently captured Amazon PAT endpoint.
+  window.addEventListener("relay-fetcher-pat-post", async (e) => {
+    const req = JSON.parse(e.detail);
+    const url = req.url || lastPatRequest?.url;
+    if (!url) {
+      window.dispatchEvent(new CustomEvent("relay-fetcher-pat-post-result", {
+        detail: JSON.stringify({ woId: req.woId, error: "No PAT endpoint captured" }),
+      }));
+      return;
+    }
+
+    const csrfToken = getCsrfToken();
+    try {
+      const response = await _origFetch(url, {
+        method: "POST",
+        headers: { "Content-Type": "application/json", ...(csrfToken ? { "x-csrf-token": csrfToken } : {}) },
+        credentials: "include",
+        body: JSON.stringify(req.payload),
+      });
+
+      let data = null;
+      const text = await response.text();
+      if (text) {
+        try { data = JSON.parse(text); }
+        catch { data = { raw: text }; }
+      }
+
+      window.dispatchEvent(new CustomEvent("relay-fetcher-pat-post-result", {
+        detail: JSON.stringify({ woId: req.woId, status: response.status, ok: response.ok, data }),
+      }));
+    } catch (err) {
+      window.dispatchEvent(new CustomEvent("relay-fetcher-pat-post-result", {
         detail: JSON.stringify({ woId: req.woId, error: err.message }),
       }));
     }
