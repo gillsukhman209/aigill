@@ -139,6 +139,8 @@ const DEFAULT_SETTINGS = {
   customDateFilterEnabled: false,
   customDateFilterStart: "",
   customDateFilterEnd: "",
+  bookedTimeBlocks: [],
+  bookedTimeBlockMode: "warn",
   showProfitEstimate: true,
   profitMpg: 8,
   profitFuelPrice: 6.50,
@@ -149,6 +151,8 @@ let settings = { ...DEFAULT_SETTINGS };
 function loadSettings() {
   try { const s = JSON.parse(localStorage.getItem(SETTINGS_KEY)); if (s) settings = { ...DEFAULT_SETTINGS, ...s }; } catch {}
   settings.customExcludedCities = normalizeCustomExcludedCityList(settings.customExcludedCities);
+  settings.bookedTimeBlocks = normalizeBookedTimeBlocks(settings.bookedTimeBlocks);
+  if (!["warn", "hide"].includes(settings.bookedTimeBlockMode)) settings.bookedTimeBlockMode = "warn";
 }
 function saveSettings() {
   try { localStorage.setItem(SETTINGS_KEY, JSON.stringify(settings)); } catch {}
@@ -604,6 +608,63 @@ function passesCustomDateFilter(wo) {
   if (Number.isFinite(startLimit) && (!Number.isFinite(loadStart) || loadStart < startLimit)) return false;
   if (Number.isFinite(endLimit) && (!Number.isFinite(loadEnd) || loadEnd > endLimit)) return false;
   return true;
+}
+
+function normalizeBookedTimeBlocks(blocks) {
+  return (blocks || [])
+    .map((block, index) => {
+      const startMs = new Date(block?.startIso || "").getTime();
+      const endMs = new Date(block?.endIso || "").getTime();
+      if (!Number.isFinite(startMs) || !Number.isFinite(endMs) || endMs <= startMs) return null;
+      return {
+        id: String(block?.id || `block-${Date.now()}-${index}`),
+        label: String(block?.label || "").trim(),
+        startIso: new Date(startMs).toISOString(),
+        endIso: new Date(endMs).toISOString(),
+        createdAt: block?.createdAt || new Date().toISOString(),
+      };
+    })
+    .filter(Boolean)
+    .sort((a, b) => new Date(a.startIso).getTime() - new Date(b.startIso).getTime());
+}
+
+function getBookedTimeBlocks() {
+  return normalizeBookedTimeBlocks(settings.bookedTimeBlocks);
+}
+
+function saveBookedTimeBlocks(blocks) {
+  settings.bookedTimeBlocks = normalizeBookedTimeBlocks(blocks);
+  saveSettings();
+}
+
+function fmtBookedTimeBlockRange(block) {
+  const startMs = new Date(block?.startIso || "").getTime();
+  const endMs = new Date(block?.endIso || "").getTime();
+  if (!Number.isFinite(startMs) || !Number.isFinite(endMs)) return "";
+  const sameDay = new Date(startMs).toLocaleDateString() === new Date(endMs).toLocaleDateString();
+  const datePart = new Date(startMs).toLocaleDateString([], { month: "numeric", day: "numeric" });
+  const startTime = new Date(startMs).toLocaleTimeString([], { hour: "numeric", minute: "2-digit" });
+  const endFormat = sameDay
+    ? new Date(endMs).toLocaleTimeString([], { hour: "numeric", minute: "2-digit" })
+    : `${new Date(endMs).toLocaleDateString([], { month: "numeric", day: "numeric" })} ${new Date(endMs).toLocaleTimeString([], { hour: "numeric", minute: "2-digit" })}`;
+  return `${datePart} ${startTime}-${endFormat}`;
+}
+
+function getBookedTimeConflict(wo) {
+  const blocks = getBookedTimeBlocks();
+  if (!blocks.length) return null;
+  const loadStart = getLoadStartMs(wo);
+  const loadEnd = getLoadEndMs(wo);
+  if (!Number.isFinite(loadStart) || !Number.isFinite(loadEnd)) return null;
+  return blocks.find(block => {
+    const blockStart = new Date(block.startIso).getTime();
+    const blockEnd = new Date(block.endIso).getTime();
+    return Number.isFinite(blockStart) && Number.isFinite(blockEnd) && loadStart < blockEnd && loadEnd > blockStart;
+  }) || null;
+}
+
+function passesBookedTimeBlockFilter(wo) {
+  return settings.bookedTimeBlockMode !== "hide" || !getBookedTimeConflict(wo);
 }
 
 function fmtWait(ms) {
@@ -1435,6 +1496,7 @@ function passesDetectionDisplayRules(wo) {
 
 function passesDetectionAlertRules(wo) {
   if (!passesCustomDateFilter(wo)) return false;
+  if (!passesBookedTimeBlockFilter(wo)) return false;
   if (!settings.detectionOnlyAlertMatchingRules || !getActiveDetectionRules().length) return true;
   return getDetectionRuleMatch(wo).ok;
 }
@@ -2442,6 +2504,40 @@ function renderCustomDateFilter() {
   </div>`;
 }
 
+function renderBookedTimeBlockSettings() {
+  const mode = settings.bookedTimeBlockMode === "hide" ? "hide" : "warn";
+  const blocks = getBookedTimeBlocks();
+  const blockRows = blocks.length
+    ? blocks.map(block => `
+      <div class="rfx-time-block-item">
+        <div>
+          <b>${escapeHtml(block.label || "Booked load")}</b>
+          <span>${escapeHtml(fmtBookedTimeBlockRange(block))}</span>
+        </div>
+        <button type="button" data-remove-time-block="${escapeHtml(block.id)}">Remove</button>
+      </div>
+    `).join("")
+    : `<div class="rfx-time-block-empty">No booked time blocks yet.</div>`;
+  return `<div class="rfx-time-block-box">
+    <div class="rfx-time-block-mode">
+      <label>Conflict action
+        <select id="rfx-time-block-mode">
+          <option value="warn" ${mode === "warn" ? "selected" : ""}>Warn on conflicts</option>
+          <option value="hide" ${mode === "hide" ? "selected" : ""}>Hide conflicting loads</option>
+        </select>
+      </label>
+      <span>Any load that overlaps a saved block will be warned or hidden.</span>
+    </div>
+    <div class="rfx-time-block-form">
+      <input type="text" id="rfx-time-block-label" placeholder="Label, e.g. Stockton booked load">
+      <label>Start <input type="datetime-local" id="rfx-time-block-start"></label>
+      <label>End <input type="datetime-local" id="rfx-time-block-end"></label>
+      <button type="button" id="rfx-add-time-block">Add block</button>
+    </div>
+    <div class="rfx-time-block-list">${blockRows}</div>
+  </div>`;
+}
+
 // ============================================================
 // SOUND — mp3 files from Sounds folder
 // ============================================================
@@ -2802,6 +2898,11 @@ const CSS = `
   padding: 4px 8px; font-size: 12px; font-weight: 800;
   background: #fdecea; color: #b12704; border: 1px solid #f1b8b0;
 }
+.rfx-time-conflict {
+  display: inline-flex; align-items: center; gap: 4px; border-radius: 6px;
+  padding: 4px 8px; font-size: 12px; font-weight: 800;
+  background: #fff8e1; color: #8a5a00; border: 1px solid #f3d27a;
+}
 .rfx-book-btn {
   margin-left: auto; padding: 8px 22px; font-size: 14px; font-weight: 600;
   background: #ff9900; color: #0f1111; border: none; border-radius: 8px; cursor: pointer; font-family: inherit;
@@ -2887,6 +2988,42 @@ const CSS = `
 }
 .rfx-hide-load-btn:hover { background: #fdecea; border-color: #cc3333; color: #cc3333; }
 .rfx-hidden-loads-row { display: flex; align-items: center; justify-content: space-between; gap: 10px; font-size: 13px; color: #565959; }
+.rfx-time-block-box { display: grid; gap: 10px; }
+.rfx-time-block-mode {
+  display: flex; align-items: center; justify-content: space-between; gap: 12px;
+  padding: 10px; border: 1px solid #eef0f0; border-radius: 8px; background: #fbfbfb;
+}
+.rfx-time-block-mode label { display: inline-flex; align-items: center; gap: 8px; font-size: 13px; font-weight: 800; color: #0f1111; }
+.rfx-time-block-mode select,
+.rfx-time-block-form input {
+  height: 36px; border: 1px solid #d5d9d9; border-radius: 8px; background: #fff;
+  padding: 0 10px; font: inherit; font-size: 13px; min-width: 0;
+}
+.rfx-time-block-mode span { font-size: 12px; color: #565959; line-height: 1.35; }
+.rfx-time-block-form {
+  display: grid; grid-template-columns: minmax(160px, 1fr) auto auto auto;
+  gap: 8px; align-items: end;
+}
+.rfx-time-block-form label { display: grid; gap: 4px; font-size: 11px; font-weight: 800; color: #565959; }
+.rfx-time-block-form button,
+.rfx-time-block-item button {
+  height: 36px; border: 1px solid #d5d9d9; border-radius: 8px; background: #fff;
+  padding: 0 12px; font: inherit; font-size: 12px; font-weight: 800; cursor: pointer; white-space: nowrap;
+}
+.rfx-time-block-form button:hover,
+.rfx-time-block-item button:hover { background: #f7fafa; }
+.rfx-time-block-list { display: grid; gap: 6px; }
+.rfx-time-block-item {
+  display: flex; align-items: center; justify-content: space-between; gap: 10px;
+  padding: 9px 10px; border: 1px solid #eef0f0; border-radius: 8px; background: #fff;
+}
+.rfx-time-block-item b { display: block; font-size: 13px; color: #0f1111; }
+.rfx-time-block-item span { display: block; margin-top: 2px; font-size: 12px; color: #565959; }
+.rfx-time-block-empty { padding: 10px; border: 1px dashed #d5d9d9; border-radius: 8px; color: #565959; font-size: 12px; }
+@media (max-width: 720px) {
+  .rfx-time-block-mode { align-items: flex-start; flex-direction: column; }
+  .rfx-time-block-form { grid-template-columns: 1fr; }
+}
 .rfx-discord-row {
   display: flex; align-items: center; justify-content: space-between; gap: 12px;
   padding: 8px 10px; background: #fbfbfb; border: 1px solid #eef0f0; border-radius: 8px;
@@ -3296,6 +3433,7 @@ function renderCard(wo, extraClass, changeBadge) {
   const firstTz = stops[0]?.location?.timeZone || "America/Los_Angeles";
   const timingRisk = settings.showTimingRisk ? getTimingRisk(wo) : null;
   const stemWarning = getStemTimeWarning(wo);
+  const timeConflict = settings.bookedTimeBlockMode === "warn" ? getBookedTimeConflict(wo) : null;
   const privateLoad = isPrivateLoad(wo);
   const loadDisplayId = getLoadDisplayId(wo);
   const flexibleArrival = settings.showFlexibleArrivalWindow
@@ -3399,6 +3537,11 @@ function renderCard(wo, extraClass, changeBadge) {
   if (settings.showStopCount) footerTags += `<span class="rfx-tag">${wo.stopCount || stops.length} stops</span>`;
   if (timingRisk) footerTags += `<span class="rfx-timing-risk ${timingRisk.level}" title="${escapeHtml(timingRisk.detail)}">Timing issue · ${escapeHtml(timingRisk.label)}</span>`;
   if (stemWarning) footerTags += `<span class="rfx-stem-risk" title="${escapeHtml(stemWarning.detail)}">Stem warning · ${escapeHtml(stemWarning.label)}</span>`;
+  if (timeConflict) {
+    const conflictRange = fmtBookedTimeBlockRange(timeConflict);
+    const conflictLabel = timeConflict.label ? `${timeConflict.label} · ${conflictRange}` : conflictRange;
+    footerTags += `<span class="rfx-time-conflict" title="${escapeHtml(conflictLabel)}">Time conflict · ${escapeHtml(conflictRange)}</span>`;
+  }
 
 	  return `<div class="${cls}" data-id="${wo.id}">
 	    <button type="button" class="rfx-hide-load-btn" data-hide-load-id="${wo.id}" title="Hide this load">×</button>
@@ -3518,17 +3661,18 @@ function renderCustomLoadBoard() {
   const alerted = [];
   for (const alert of alertedLoads) {
     const wo = loadMap.get(alert.wo.id) || alert.wo;
-    if (wo && passesCustomExcludedCities(wo) && passesAmazonOnlyFacilities(wo) && passesDetectionDisplayRules(wo) && passesCustomDateFilter(wo) && !isIgnoredLoad(wo.id)) alerted.push({ wo, alert });
+    if (wo && passesCustomExcludedCities(wo) && passesAmazonOnlyFacilities(wo) && passesDetectionDisplayRules(wo) && passesCustomDateFilter(wo) && passesBookedTimeBlockFilter(wo) && !isIgnoredLoad(wo.id)) alerted.push({ wo, alert });
   }
 
   const regularLoads = sortLoads(
-    Array.from(loadMap.values()).filter(wo => !alertMap.has(wo.id) && passesCustomExcludedCities(wo) && passesAmazonOnlyFacilities(wo) && passesDetectionDisplayRules(wo) && passesCustomDateFilter(wo) && !isIgnoredLoad(wo.id))
+    Array.from(loadMap.values()).filter(wo => !alertMap.has(wo.id) && passesCustomExcludedCities(wo) && passesAmazonOnlyFacilities(wo) && passesDetectionDisplayRules(wo) && passesCustomDateFilter(wo) && passesBookedTimeBlockFilter(wo) && !isIgnoredLoad(wo.id))
   );
   const hiddenByCity = Array.from(loadMap.values()).filter(wo => !passesCustomExcludedCities(wo)).length;
   const hiddenByFacility = Array.from(loadMap.values()).filter(wo => passesCustomExcludedCities(wo) && !passesAmazonOnlyFacilities(wo)).length;
   const hiddenByDetection = Array.from(loadMap.values()).filter(wo => passesCustomExcludedCities(wo) && passesAmazonOnlyFacilities(wo) && !passesDetectionDisplayRules(wo)).length;
   const hiddenByDate = Array.from(loadMap.values()).filter(wo => passesCustomExcludedCities(wo) && passesAmazonOnlyFacilities(wo) && passesDetectionDisplayRules(wo) && !passesCustomDateFilter(wo)).length;
-  const hiddenByLoad = Array.from(loadMap.values()).filter(wo => passesCustomExcludedCities(wo) && passesAmazonOnlyFacilities(wo) && passesDetectionDisplayRules(wo) && passesCustomDateFilter(wo) && isIgnoredLoad(wo.id)).length;
+  const hiddenByTimeBlock = Array.from(loadMap.values()).filter(wo => passesCustomExcludedCities(wo) && passesAmazonOnlyFacilities(wo) && passesDetectionDisplayRules(wo) && passesCustomDateFilter(wo) && !passesBookedTimeBlockFilter(wo)).length;
+  const hiddenByLoad = Array.from(loadMap.values()).filter(wo => passesCustomExcludedCities(wo) && passesAmazonOnlyFacilities(wo) && passesDetectionDisplayRules(wo) && passesCustomDateFilter(wo) && passesBookedTimeBlockFilter(wo) && isIgnoredLoad(wo.id)).length;
 
   const sortBtn = (key, label) => {
     const active = currentSort === key ? " active" : "";
@@ -3543,14 +3687,15 @@ function renderCustomLoadBoard() {
     })),
     ...regularLoads.map(wo => renderCard(wo, "", null)),
   ].join("");
-  const boardLoads = Array.from(loadMap.values()).filter(wo => passesCustomExcludedCities(wo) && passesAmazonOnlyFacilities(wo) && passesDetectionDisplayRules(wo) && passesCustomDateFilter(wo) && !isIgnoredLoad(wo.id));
+  const boardLoads = Array.from(loadMap.values()).filter(wo => passesCustomExcludedCities(wo) && passesAmazonOnlyFacilities(wo) && passesDetectionDisplayRules(wo) && passesCustomDateFilter(wo) && passesBookedTimeBlockFilter(wo) && !isIgnoredLoad(wo.id));
   const roundTripsHtml = renderRoundTripMatches(boardLoads, alertMap);
-  const hiddenTotal = hiddenByCity + hiddenByFacility + hiddenByDetection + hiddenByDate + hiddenByLoad;
+  const hiddenTotal = hiddenByCity + hiddenByFacility + hiddenByDetection + hiddenByDate + hiddenByTimeBlock + hiddenByLoad;
   const hiddenReasons = [
     hiddenByCity ? `${hiddenByCity} excluded city` : "",
     hiddenByFacility ? `${hiddenByFacility} non-Amazon/private` : "",
     hiddenByDetection ? `${hiddenByDetection} detection rule` : "",
     hiddenByDate ? `${hiddenByDate} date window` : "",
+    hiddenByTimeBlock ? `${hiddenByTimeBlock} time block` : "",
     hiddenByLoad ? `${hiddenByLoad} hidden load` : "",
   ].filter(Boolean);
   const emptyText = loadMap.size
@@ -3734,6 +3879,7 @@ function injectCards() {
         <div class="rfx-settings-section">
           <div class="rfx-settings-section-title">Alerts</div>
           <div class="rfx-range-row"><label>Min price increase</label><input type="range" id="rfx-s-minPrice" min="0" max="200" step="5" value="${settings.minPriceIncrease}" data-key="minPriceIncrease"><span class="rfx-range-val" id="rfx-s-minPrice-val">${fmtRangeSettingValue("minPriceIncrease", settings.minPriceIncrease)}</span></div>
+          <div class="rfx-range-row"><label>Min stem warning</label><input type="range" id="rfx-s-minStemTime" min="0" max="240" step="15" value="${settings.minStemTimeMinutes}" data-key="minStemTimeMinutes"><span class="rfx-range-val" id="rfx-s-minStemTime-val">${fmtRangeSettingValue("minStemTimeMinutes", settings.minStemTimeMinutes)}</span></div>
           <div class="rfx-settings-help">Only alert on price increases above this amount. Set to 0 to alert on all changes.</div>
         </div>
         <div class="rfx-settings-section">
@@ -3759,6 +3905,10 @@ function injectCards() {
     `)}
     ${settingsPanelWrap("filters", `
       <div class="rfx-settings-grid">
+        <div class="rfx-settings-section rfx-settings-section-full">
+          <div class="rfx-settings-section-title">Booked Time Blocks</div>
+          ${renderBookedTimeBlockSettings()}
+        </div>
         <div class="rfx-settings-section rfx-settings-section-full">
           <div class="rfx-settings-section-title">Custom Excluded Cities</div>
           ${renderCustomExcludedCitySettings()}
@@ -3799,7 +3949,6 @@ function injectCards() {
         ${chk("showEquipment", "Equipment (53' Trailer)")}
         ${chk("showPostedAge", "Posted age")}
         ${chk("showTimingRisk", "Timing issue badge")}
-        <div class="rfx-range-row"><label>Min stem warning</label><input type="range" id="rfx-s-minStemTime" min="0" max="240" step="15" value="${settings.minStemTimeMinutes}" data-key="minStemTimeMinutes"><span class="rfx-range-val" id="rfx-s-minStemTime-val">${fmtRangeSettingValue("minStemTimeMinutes", settings.minStemTimeMinutes)}</span></div>
         ${chk("showDuration", "Duration")}
         ${chk("showExtraStopMeta", "Loaded/empty badge")}
         ${chk("showScoreBar", "Score bar")}
@@ -3950,6 +4099,53 @@ function injectCards() {
       }
       saveSettings();
       injectCards();
+    });
+  });
+
+  const timeBlockMode = shadowRoot.getElementById("rfx-time-block-mode");
+  if (timeBlockMode) {
+    timeBlockMode.addEventListener("change", () => {
+      settings.bookedTimeBlockMode = timeBlockMode.value === "hide" ? "hide" : "warn";
+      saveSettings();
+      injectCards();
+    });
+  }
+  const addTimeBlock = () => {
+    const labelInput = shadowRoot.getElementById("rfx-time-block-label");
+    const startInput = shadowRoot.getElementById("rfx-time-block-start");
+    const endInput = shadowRoot.getElementById("rfx-time-block-end");
+    const startIso = localDateTimeInputToIso(startInput?.value || "");
+    const endIso = localDateTimeInputToIso(endInput?.value || "");
+    const startMs = new Date(startIso || "").getTime();
+    const endMs = new Date(endIso || "").getTime();
+    if (!Number.isFinite(startMs) || !Number.isFinite(endMs)) {
+      showToast("Add a valid start and end time block.");
+      return;
+    }
+    if (endMs <= startMs) {
+      showToast("Time block end must be after start.");
+      return;
+    }
+    saveBookedTimeBlocks([
+      ...getBookedTimeBlocks(),
+      {
+        id: `btb-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`,
+        label: String(labelInput?.value || "").trim(),
+        startIso,
+        endIso,
+        createdAt: new Date().toISOString(),
+      },
+    ]);
+    injectCards();
+    showToast("Booked time block added");
+  };
+  const addTimeBlockBtn = shadowRoot.getElementById("rfx-add-time-block");
+  if (addTimeBlockBtn) addTimeBlockBtn.addEventListener("click", addTimeBlock);
+  shadowRoot.querySelectorAll("[data-remove-time-block]").forEach(btn => {
+    btn.addEventListener("click", () => {
+      saveBookedTimeBlocks(getBookedTimeBlocks().filter(block => block.id !== btn.dataset.removeTimeBlock));
+      injectCards();
+      showToast("Booked time block removed");
     });
   });
 
