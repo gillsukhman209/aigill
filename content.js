@@ -107,6 +107,7 @@ const DEFAULT_SETTINGS = {
   showStopCode: true,
   showExtraStopMeta: true,
   showTimingRisk: true,
+  minStemTimeMinutes: 0,
   amazonOnlyFacilities: false,
   patEnabled: false,
   fastBook: false,
@@ -610,9 +611,19 @@ function fmtWait(ms) {
   return fmtDur(ms);
 }
 
+function fmtMinutesShort(minutes) {
+  const m = Math.max(0, Math.round(Number(minutes) || 0));
+  if (!m) return "Off";
+  if (m < 60) return `${m}m`;
+  const h = Math.floor(m / 60);
+  const rem = m % 60;
+  return rem ? `${h}h ${rem}m` : `${h}h`;
+}
+
 function fmtRangeSettingValue(key, value) {
   const n = Number(value) || 0;
   if (key === "minPriceIncrease") return n === 0 ? "Off" : `$${n}`;
+  if (key === "minStemTimeMinutes") return fmtMinutesShort(n);
   if (key === "roundTripConnectionRadiusMiles" || key === "roundTripReturnRadiusMiles") return `${n} mi`;
   if (key === "roundTripMinBufferMinutes") return `${n}m`;
   if (key === "roundTripMaxWaitHours") return n === 0 ? "Off" : `${n}h`;
@@ -833,6 +844,26 @@ function getTimingRisk(wo) {
     detail: `${ratio.toFixed(1)}x expected`,
     ratio,
     expectedMs: expectedHours * 3600000,
+  };
+}
+
+function getStemTimeWarning(wo) {
+  const minMinutes = Number(settings.minStemTimeMinutes) || 0;
+  if (minMinutes <= 0) return null;
+  const first = getAllStops(wo)[0];
+  const startIso = first ? (getStopCheckin(first) || getStopCheckout(first)) : "";
+  if (!startIso) return null;
+  const startMs = new Date(startIso).getTime();
+  if (!Number.isFinite(startMs)) return null;
+
+  const now = Date.now();
+  const cutoff = now + minMinutes * 60000;
+  if (startMs >= cutoff) return null;
+
+  const minutesUntil = Math.round((startMs - now) / 60000);
+  return {
+    label: minutesUntil <= 0 ? "pickup due now" : `starts in ${fmtMinutesShort(minutesUntil)}`,
+    detail: `Minimum stem time is ${fmtMinutesShort(minMinutes)}.`,
   };
 }
 
@@ -2237,6 +2268,7 @@ function getDisplaySettingsSignature() {
     settings.showLoadTypeBadge,
     settings.showPostedAge,
     settings.showTimingRisk,
+    settings.minStemTimeMinutes,
     settings.showDriverType,
     settings.showEquipment,
     settings.showStopCount,
@@ -2765,6 +2797,11 @@ const CSS = `
 }
 .rfx-timing-risk.warn { background: #fff8e1; color: #8a5a00; border: 1px solid #f3d27a; }
 .rfx-timing-risk.bad { background: #fdecea; color: #b12704; border: 1px solid #f1b8b0; }
+.rfx-stem-risk {
+  display: inline-flex; align-items: center; gap: 4px; border-radius: 6px;
+  padding: 4px 8px; font-size: 12px; font-weight: 800;
+  background: #fdecea; color: #b12704; border: 1px solid #f1b8b0;
+}
 .rfx-book-btn {
   margin-left: auto; padding: 8px 22px; font-size: 14px; font-weight: 600;
   background: #ff9900; color: #0f1111; border: none; border-radius: 8px; cursor: pointer; font-family: inherit;
@@ -3258,6 +3295,7 @@ function renderCard(wo, extraClass, changeBadge) {
   const driver = wo.transitOperatorType === "TEAM_DRIVER" ? "Team" : "Solo";
   const firstTz = stops[0]?.location?.timeZone || "America/Los_Angeles";
   const timingRisk = settings.showTimingRisk ? getTimingRisk(wo) : null;
+  const stemWarning = getStemTimeWarning(wo);
   const privateLoad = isPrivateLoad(wo);
   const loadDisplayId = getLoadDisplayId(wo);
   const flexibleArrival = settings.showFlexibleArrivalWindow
@@ -3360,6 +3398,7 @@ function renderCard(wo, extraClass, changeBadge) {
   if (settings.showPostedAge && postedAge) footerTags += `<span class="rfx-tag">${postedAge}</span>`;
   if (settings.showStopCount) footerTags += `<span class="rfx-tag">${wo.stopCount || stops.length} stops</span>`;
   if (timingRisk) footerTags += `<span class="rfx-timing-risk ${timingRisk.level}" title="${escapeHtml(timingRisk.detail)}">Timing issue · ${escapeHtml(timingRisk.label)}</span>`;
+  if (stemWarning) footerTags += `<span class="rfx-stem-risk" title="${escapeHtml(stemWarning.detail)}">Stem warning · ${escapeHtml(stemWarning.label)}</span>`;
 
 	  return `<div class="${cls}" data-id="${wo.id}">
 	    <button type="button" class="rfx-hide-load-btn" data-hide-load-id="${wo.id}" title="Hide this load">×</button>
@@ -3760,6 +3799,7 @@ function injectCards() {
         ${chk("showEquipment", "Equipment (53' Trailer)")}
         ${chk("showPostedAge", "Posted age")}
         ${chk("showTimingRisk", "Timing issue badge")}
+        <div class="rfx-range-row"><label>Min stem warning</label><input type="range" id="rfx-s-minStemTime" min="0" max="240" step="15" value="${settings.minStemTimeMinutes}" data-key="minStemTimeMinutes"><span class="rfx-range-val" id="rfx-s-minStemTime-val">${fmtRangeSettingValue("minStemTimeMinutes", settings.minStemTimeMinutes)}</span></div>
         ${chk("showDuration", "Duration")}
         ${chk("showExtraStopMeta", "Loaded/empty badge")}
         ${chk("showScoreBar", "Score bar")}
@@ -4065,6 +4105,7 @@ function styleAmazonLoadCards() {
       .load-card .rfx-i-timing-risk { font-size: 11px; padding: 3px 7px; border-radius: 6px; font-weight: 800; display: inline-flex; align-items: center; gap: 4px; }
       .load-card .rfx-i-timing-risk.warn { background:#fff8e1; color:#8a5a00; border:1px solid #f3d27a; }
       .load-card .rfx-i-timing-risk.bad { background:#fdecea; color:#b12704; border:1px solid #f1b8b0; }
+      .load-card .rfx-i-stem-risk { font-size: 11px; padding: 3px 7px; border-radius: 6px; font-weight: 800; display: inline-flex; align-items: center; gap: 4px; background:#fdecea; color:#b12704; border:1px solid #f1b8b0; }
       .load-card .rfx-i-leg { font-size: 12px; color: #888; padding: 2px 0 4px 32px; }
       .load-card .rfx-i-footer { display: flex; align-items: center; gap: 10px; flex-wrap: wrap; padding-top: 8px; margin-top: 6px; border-top: 1px solid #f0f0f0; font-size: 13px; color: #565959; }
       .load-card .rfx-i-footer b { color: #0f1111; }
@@ -4202,6 +4243,7 @@ function styleAmazonLoadCards() {
     const driver = wo.transitOperatorType === "TEAM_DRIVER" ? "Team" : "Solo";
     const firstTz = stops[0]?.location?.timeZone || "America/Los_Angeles";
     const timingRisk = settings.showTimingRisk ? getTimingRisk(wo) : null;
+    const stemWarning = getStemTimeWarning(wo);
     const flexibleArrival = settings.showFlexibleArrivalWindow
       ? getFlexibleArrivalWindow(wo, firstTz)
       : null;
@@ -4283,6 +4325,7 @@ function styleAmazonLoadCards() {
     if (settings.showPostedAge && postedAge) footer += `<span>${postedAge}</span>`;
     if (settings.showStopCount) footer += ` <span>${wo.stopCount || stops.length} stops</span>`;
     if (timingRisk) footer += ` <span class="rfx-i-timing-risk ${timingRisk.level}" title="${escapeHtml(timingRisk.detail)}">Timing issue · ${escapeHtml(timingRisk.label)}</span>`;
+    if (stemWarning) footer += ` <span class="rfx-i-stem-risk" title="${escapeHtml(stemWarning.detail)}">Stem warning · ${escapeHtml(stemWarning.label)}</span>`;
 
     const armedForFastBook = settings.fastBook || armedFastBookLoads.has(woId);
 
