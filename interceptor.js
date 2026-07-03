@@ -131,6 +131,20 @@
       } catch (e) {}
     }
 
+    // Capture Amazon's own Post-A-Truck order list so the content script can cancel only visible
+    // active PAT orders instead of guessing which orders exist.
+    if (url.includes("/api/loadboard/orders/get") && config?.method === "POST") {
+      const response = await _origFetch.apply(this, args);
+      const clone = response.clone();
+      try {
+        const data = await clone.json();
+        window.dispatchEvent(new CustomEvent("relay-fetcher-pat-orders", {
+          detail: JSON.stringify({ data }),
+        }));
+      } catch (e) {}
+      return response;
+    }
+
     // Capture Amazon's own Post-A-Truck create/update request so our content script can reuse the
     // current endpoint and baseline request shape instead of guessing private routes.
     if (config?.method === "POST" && config?.body) {
@@ -460,6 +474,62 @@
         detail: JSON.stringify({ woId: req.woId, error: err.message }),
       }));
     }
+  });
+
+  window.addEventListener("relay-fetcher-pat-cancel-all", async (e) => {
+    let req = {};
+    try {
+      req = JSON.parse(e.detail || "{}");
+    } catch (err) {
+      window.dispatchEvent(new CustomEvent("relay-fetcher-pat-cancel-all-result", {
+        detail: JSON.stringify({ error: "Invalid cancel request" }),
+      }));
+      return;
+    }
+
+    const orders = Array.isArray(req.orders) ? req.orders : [];
+    if (!orders.length) {
+      window.dispatchEvent(new CustomEvent("relay-fetcher-pat-cancel-all-result", {
+        detail: JSON.stringify({ results: [] }),
+      }));
+      return;
+    }
+
+    const csrfToken = getCsrfToken();
+    const results = [];
+    for (const order of orders) {
+      const id = String(order?.id || "");
+      const version = Number(order?.version || 1);
+      if (!id || !Number.isFinite(version) || version <= 0) {
+        results.push({ id, version, ok: false, error: "Missing order id/version" });
+        continue;
+      }
+
+      try {
+        const response = await _origFetch(`https://relay.amazon.com/api/loadboard/orders/cancel/${encodeURIComponent(id)}/${encodeURIComponent(String(version))}`, {
+          method: "POST",
+          headers: { "Content-Type": "application/json", ...(csrfToken ? { "x-csrf-token": csrfToken } : {}) },
+          credentials: "include",
+          body: JSON.stringify({
+            cancellationReason: "BOOKED_LOAD_ON_RELAY_LOADBOARD",
+            cancellationComment: "",
+          }),
+        });
+        let data = null;
+        const text = await response.text();
+        if (text) {
+          try { data = JSON.parse(text); }
+          catch { data = { raw: text }; }
+        }
+        results.push({ id, version, status: response.status, ok: response.ok, data });
+      } catch (err) {
+        results.push({ id, version, ok: false, error: err.message });
+      }
+    }
+
+    window.dispatchEvent(new CustomEvent("relay-fetcher-pat-cancel-all-result", {
+      detail: JSON.stringify({ results }),
+    }));
   });
 
 })();

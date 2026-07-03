@@ -110,6 +110,8 @@ const DEFAULT_SETTINGS = {
   minStemTimeMinutes: 0,
   amazonOnlyFacilities: false,
   patEnabled: false,
+  hideFuzzyPatFooter: true,
+  hideFuzzyPatFooterUserSet: false,
   fastBook: false,
   autoBook: false,
   autoResume: false,
@@ -153,11 +155,68 @@ function loadSettings() {
   settings.customExcludedCities = normalizeCustomExcludedCityList(settings.customExcludedCities);
   settings.bookedTimeBlocks = normalizeBookedTimeBlocks(settings.bookedTimeBlocks);
   if (!["warn", "hide"].includes(settings.bookedTimeBlockMode)) settings.bookedTimeBlockMode = "warn";
+  if (!settings.hideFuzzyPatFooterUserSet) settings.hideFuzzyPatFooter = true;
 }
 function saveSettings() {
   try { localStorage.setItem(SETTINGS_KEY, JSON.stringify(settings)); } catch {}
 }
 loadSettings();
+
+function isFuzzyPatFooterBanner(el) {
+  if (!el || el.nodeType !== 1) return false;
+  const id = String(el.id || "");
+  const text = String(el.textContent || "").replace(/\s+/g, " ").trim();
+  return /FuzzyMatchNotification/i.test(id) ||
+    /There are new loads that match your truck posting\(s\) closely\./i.test(text);
+}
+
+function applyFuzzyPatFooterVisibility() {
+  const hiddenAttr = "data-rfx-hidden-fuzzy-pat-footer";
+  if (!settings.hideFuzzyPatFooter) {
+    document.querySelectorAll(`[${hiddenAttr}="1"]`).forEach(el => {
+      el.style.display = el.dataset.rfxPreviousDisplay || "";
+      delete el.dataset.rfxPreviousDisplay;
+      delete el.dataset.rfxHiddenFuzzyPatFooter;
+    });
+    document.querySelectorAll("[data-rfx-hidden-empty-footer='1']").forEach(el => {
+      el.style.display = el.dataset.rfxPreviousDisplay || "";
+      delete el.dataset.rfxPreviousDisplay;
+      delete el.dataset.rfxHiddenEmptyFooter;
+    });
+    return;
+  }
+
+  const candidates = [
+    ...document.querySelectorAll("#footer-notification-area"),
+    ...document.querySelectorAll("#footer-notification-area *"),
+  ];
+  const unique = new Set(candidates);
+  unique.forEach(el => {
+    const banner = el.closest?.(".optimus-banner-alert-footer, .footer-notification > div") || el;
+    if (!isFuzzyPatFooterBanner(banner)) return;
+    if (!banner.dataset.rfxHiddenFuzzyPatFooter) {
+      banner.dataset.rfxPreviousDisplay = banner.style.display || "";
+      banner.dataset.rfxHiddenFuzzyPatFooter = "1";
+    }
+    banner.style.display = "none";
+  });
+
+  document.querySelectorAll("#footer-notification-area").forEach(area => {
+    const visibleChildren = Array.from(area.querySelectorAll(".footer-notification > div"))
+      .filter(el => getComputedStyle(el).display !== "none");
+    if (!visibleChildren.length && area.querySelector("[data-rfx-hidden-fuzzy-pat-footer='1']")) {
+      if (!area.dataset.rfxHiddenEmptyFooter) {
+        area.dataset.rfxPreviousDisplay = area.style.display || "";
+        area.dataset.rfxHiddenEmptyFooter = "1";
+      }
+      area.style.display = "none";
+    } else if (area.dataset.rfxHiddenEmptyFooter) {
+      area.style.display = area.dataset.rfxPreviousDisplay || "";
+      delete area.dataset.rfxPreviousDisplay;
+      delete area.dataset.rfxHiddenEmptyFooter;
+    }
+  });
+}
 
 const LOOKOUT_ALERTS_KEY = "rfx_lookout_alerts_v1";
 const LOOKOUT_MAX_ALERTS_PER_PASS = 5;
@@ -165,6 +224,7 @@ const LOOKOUT_HISTORY_TTL_MS = 7 * 24 * 60 * 60 * 1000;
 let lookoutProcessing = false;
 const PAT_ENDPOINT_KEY = "rfx_pat_endpoint_v1";
 const PAT_TEMPLATE_KEY = "rfx_pat_template_v1";
+const PAT_ORDERS_KEY = "rfx_pat_orders_v1";
 
 // Negotiation state
 const negotiationState = new Map();
@@ -173,6 +233,8 @@ const negotiationState = new Map();
 const bookingState = new Map();
 const armedFastBookLoads = new Set();
 const patState = new Map();
+let patOrders = loadSavedPatOrders();
+let patCancelInFlight = false;
 let patModalWoId = null;
 
 // Bot state
@@ -360,6 +422,85 @@ function getSavedPatTemplate() {
 
 function getSavedPatEndpoint() {
   return localStorage.getItem(PAT_ENDPOINT_KEY) || "";
+}
+
+function isUuidLike(value) {
+  return /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i.test(String(value || ""));
+}
+
+function isOpenPatStatus(status) {
+  const s = String(status || "OPEN").toUpperCase();
+  return !["CANCELED", "CANCELLED", "CLOSED", "EXPIRED", "DELETED"].includes(s);
+}
+
+function normalizePatOrders(orders) {
+  const unique = new Map();
+  for (const order of orders || []) {
+    const id = String(order?.id || order?.orderId || "").trim();
+    if (!isUuidLike(id)) continue;
+    const version = Number(order?.version ?? order?.majorVersion ?? 1);
+    if (!Number.isFinite(version) || version <= 0) continue;
+    const status = String(order?.status || "OPEN");
+    if (!isOpenPatStatus(status)) continue;
+    unique.set(id, {
+      id,
+      version,
+      status,
+      alias: order?.alias || order?.orderAlias || "",
+      startTime: order?.startTime || "",
+      endTime: order?.endTime || "",
+      capturedAt: Date.now(),
+    });
+  }
+  return [...unique.values()];
+}
+
+function collectPatOrdersFromValue(value, out = [], seen = new WeakSet()) {
+  if (!value || typeof value !== "object") return out;
+  if (seen.has(value)) return out;
+  seen.add(value);
+
+  if (
+    isUuidLike(value.id || value.orderId) &&
+    value.runType &&
+    value.totalCost &&
+    (value.originCityInfo || Array.isArray(value.endLocationList))
+  ) {
+    out.push(value);
+  }
+
+  if (Array.isArray(value)) {
+    value.forEach(item => collectPatOrdersFromValue(item, out, seen));
+  } else {
+    Object.values(value).forEach(item => collectPatOrdersFromValue(item, out, seen));
+  }
+  return out;
+}
+
+function extractPatOrders(data) {
+  return normalizePatOrders(collectPatOrdersFromValue(data));
+}
+
+function loadSavedPatOrders() {
+  try {
+    const saved = JSON.parse(localStorage.getItem(PAT_ORDERS_KEY) || "null");
+    return normalizePatOrders(saved?.orders || []);
+  } catch {
+    return [];
+  }
+}
+
+function savePatOrders(orders) {
+  patOrders = normalizePatOrders(orders);
+  try {
+    localStorage.setItem(PAT_ORDERS_KEY, JSON.stringify({ capturedAt: Date.now(), orders: patOrders }));
+  } catch (err) {
+    console.warn("[PAT] Could not save captured orders:", err);
+  }
+}
+
+function getOpenPatOrders() {
+  return normalizePatOrders(patOrders);
 }
 
 function cityInfoFromStop(stop) {
@@ -2485,6 +2626,7 @@ function renderCustomDateFilter() {
   const enabled = !!settings.customDateFilterEnabled;
   const startValue = toLocalDateTimeInputValue(settings.customDateFilterStart);
   const endValue = toLocalDateTimeInputValue(settings.customDateFilterEnd);
+  const openPatCount = getOpenPatOrders().length;
   return `<div class="rfx-date-filter ${enabled ? "active" : ""}">
     <div class="rfx-date-filter-main">
       <label class="rfx-date-toggle">
@@ -2500,6 +2642,7 @@ function renderCustomDateFilter() {
       <button type="button" data-date-preset="today">Today</button>
       <button type="button" data-date-preset="24h">Next 24h</button>
       <button type="button" data-date-preset="clear">Clear</button>
+      <button type="button" id="rfx-cancel-pat-orders" class="rfx-cancel-pat-btn" ${patCancelInFlight ? "disabled" : ""}>${patCancelInFlight ? "Canceling..." : `Cancel PAT${openPatCount ? ` (${openPatCount})` : ""}`}</button>
     </div>
   </div>`;
 }
@@ -2781,6 +2924,13 @@ const CSS = `
   color: #0f1111; font: inherit; font-size: 12px; font-weight: 800; padding: 0 10px; cursor: pointer;
 }
 .rfx-date-actions button:hover { background: #f7fafa; }
+.rfx-date-actions .rfx-cancel-pat-btn {
+  border-color: #d13212; color: #d13212; background: #fff;
+}
+.rfx-date-actions .rfx-cancel-pat-btn:hover { background: #fff4f1; }
+.rfx-date-actions .rfx-cancel-pat-btn:disabled {
+  opacity: .65; cursor: wait; background: #f7fafa;
+}
 .rfx-load-board { margin-top: 8px; }
 .rfx-section-title { font-size: 14px; font-weight: 700; color: #0f1111; margin: 0 0 10px 0; }
 .rfx-roundtrip-section {
@@ -3870,6 +4020,7 @@ function injectCards() {
           ${chk("autoResume", "Auto-resume after stop — restart bot after 5 seconds")}
           ${chk("amazonOnlyFacilities", "Amazon facilities only")}
           ${chk("patEnabled", "PAT — show Post A Truck button on loads")}
+          ${chk("hideFuzzyPatFooter", "Hide close-match PAT footer")}
         </div>
         <div class="rfx-settings-section">
           <div class="rfx-settings-section-title">Bot Speed</div>
@@ -4028,7 +4179,9 @@ function injectCards() {
       if ((key === "fastBook" && !cb.checked) || (key === "autoBook" && cb.checked)) armedFastBookLoads.clear();
       if (key === "autoResume" && !cb.checked) cancelAutoResume();
       if (key === "autoResume" && cb.checked && !botRunning && !botStarting) scheduleAutoResume("setting enabled");
+      if (key === "hideFuzzyPatFooter") settings.hideFuzzyPatFooterUserSet = true;
       saveSettings();
+      if (key === "hideFuzzyPatFooter") applyFuzzyPatFooterVisibility();
       injectCards();
       if (key === "lookoutEnabled" && cb.checked) processLookoutAlerts(allLoads, "lookout-enabled");
     });
@@ -4101,6 +4254,8 @@ function injectCards() {
       injectCards();
     });
   });
+  const cancelPatBtn = shadowRoot.getElementById("rfx-cancel-pat-orders");
+  if (cancelPatBtn) cancelPatBtn.addEventListener("click", cancelAllPatOrders);
 
   const timeBlockMode = shadowRoot.getElementById("rfx-time-block-mode");
   if (timeBlockMode) {
@@ -5595,6 +5750,25 @@ function closePatModal() {
   if (aiModeActive) injectCards();
 }
 
+function cancelAllPatOrders() {
+  const orders = getOpenPatOrders();
+  if (!orders.length) {
+    showToast("No active PAT orders captured. Open Post A Truck once so Amazon sends /orders/get.");
+    return;
+  }
+  const count = orders.length;
+  const ok = window.confirm(`Cancel ${count} active Post-A-Truck order${count === 1 ? "" : "s"}?`);
+  if (!ok) return;
+
+  patCancelInFlight = true;
+  if (aiModeActive) injectCards();
+  showToast(`Canceling ${count} PAT order${count === 1 ? "" : "s"}...`);
+
+  window.dispatchEvent(new CustomEvent("relay-fetcher-pat-cancel-all", {
+    detail: JSON.stringify({ orders }),
+  }));
+}
+
 function submitPatForm(form) {
   const woId = form?.dataset?.patWoId;
   const wo = findLoadForAction(woId);
@@ -5709,6 +5883,17 @@ window.addEventListener("relay-fetcher-pat-template", (e) => {
   }
 });
 
+window.addEventListener("relay-fetcher-pat-orders", (e) => {
+  try {
+    const { data } = JSON.parse(e.detail);
+    const orders = extractPatOrders(data);
+    savePatOrders(orders);
+    if (orders.length && aiModeActive) injectCards();
+  } catch (err) {
+    console.warn("[PAT] Could not read captured orders:", err);
+  }
+});
+
 window.addEventListener("relay-fetcher-pat-post-result", (e) => {
   try {
     const { woId, status, ok, data, error } = JSON.parse(e.detail);
@@ -5724,6 +5909,34 @@ window.addEventListener("relay-fetcher-pat-post-result", (e) => {
     if (aiModeActive) injectCards();
   } catch (err) {
     console.error("[PAT] Result handler error:", err);
+  }
+});
+
+window.addEventListener("relay-fetcher-pat-cancel-all-result", (e) => {
+  patCancelInFlight = false;
+  try {
+    const { results = [], error } = JSON.parse(e.detail);
+    if (error) {
+      showToast(`PAT cancel failed: ${error}`);
+      if (aiModeActive) injectCards();
+      return;
+    }
+
+    const succeeded = results.filter(r => r.ok).map(r => r.id);
+    const failed = results.filter(r => !r.ok);
+    if (succeeded.length) {
+      const canceled = new Set(succeeded);
+      savePatOrders(getOpenPatOrders().filter(order => !canceled.has(order.id)));
+    }
+    showToast(failed.length
+      ? `Canceled ${succeeded.length}; ${failed.length} failed`
+      : `Canceled ${succeeded.length} PAT order${succeeded.length === 1 ? "" : "s"}`
+    );
+    if (aiModeActive) injectCards();
+  } catch (err) {
+    console.error("[PAT] Cancel result handler error:", err);
+    showToast("PAT cancel result could not be read");
+    if (aiModeActive) injectCards();
   }
 });
 
@@ -6271,6 +6484,9 @@ function applyTripsProfitCalculator() {
 
 // MutationObserver — injects our UI, re-injects if removed, hides Amazon content
 const observer = new MutationObserver((mutations) => {
+  if (settings.hideFuzzyPatFooter) {
+    applyFuzzyPatFooterVisibility();
+  }
   if (isTripsPage()) {
     if (mutations.some(m => m.target?.closest?.(".rfx-trip-profit-badge"))) return;
     scheduleTripsProfitCalculator();
@@ -6300,6 +6516,7 @@ function ensureObserverStarted() {
   if (observerStarted || !document.body) return;
   observer.observe(document.body, { childList: true, subtree: true });
   observerStarted = true;
+  applyFuzzyPatFooterVisibility();
 }
 
 // ============================================================
