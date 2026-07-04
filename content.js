@@ -171,6 +171,8 @@ function getThemeClass() {
   return "rfx-theme-system";
 }
 
+const RFX_SYSTEM_FONT_STACK = '-apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, Arial, sans-serif';
+const PAGE_FONT_RESET_STYLE_ID = "rfx-page-font-reset-style";
 const PAGE_DARK_STYLE_ID = "rfx-page-dark-style";
 let pageThemeMediaListenerInstalled = false;
 
@@ -181,421 +183,189 @@ function isPageDarkThemeActive() {
   return !!(window.matchMedia && window.matchMedia("(prefers-color-scheme: dark)").matches);
 }
 
+const PAGE_FONT_RESET_CSS = `
+html body,
+html body :where(button, input, select, textarea, [role="button"], [role="combobox"], [role="textbox"], [mdn-select-value]) {
+  font-family: ${RFX_SYSTEM_FONT_STACK} !important;
+}
+`;
+
+function ensurePageFontReset() {
+  let style = document.getElementById(PAGE_FONT_RESET_STYLE_ID);
+  if (!style) {
+    style = document.createElement("style");
+    style.id = PAGE_FONT_RESET_STYLE_ID;
+  }
+  style.textContent = PAGE_FONT_RESET_CSS;
+  (document.head || document.documentElement).appendChild(style);
+}
+
+ensurePageFontReset();
+
 const PAGE_DARK_CSS = `
 html.rfx-page-dark {
   color-scheme: dark !important;
   background: #0f1418 !important;
 }
+
 html.rfx-page-dark body,
-html.rfx-page-dark #root,
-html.rfx-page-dark main,
-html.rfx-page-dark section,
-html.rfx-page-dark article,
-html.rfx-page-dark footer,
-html.rfx-page-dark [id*="root"],
-html.rfx-page-dark [class*="page"],
-html.rfx-page-dark [class*="Page"],
-html.rfx-page-dark [class*="content"],
-html.rfx-page-dark [class*="Content"] {
-  background-color: #0f1418 !important;
-  color: #f3f6f7 !important;
-}
-html.rfx-page-dark nav,
-html.rfx-page-dark aside,
-html.rfx-page-dark form,
-html.rfx-page-dark fieldset,
-html.rfx-page-dark [class*="panel"],
-html.rfx-page-dark [class*="Panel"],
-html.rfx-page-dark [class*="filter"],
-html.rfx-page-dark [class*="Filter"],
-html.rfx-page-dark [class*="search"],
-html.rfx-page-dark [class*="Search"],
-html.rfx-page-dark [class*="result"],
-html.rfx-page-dark [class*="Result"],
-html.rfx-page-dark [class*="summary"],
-html.rfx-page-dark [class*="Summary"],
-html.rfx-page-dark [class*="tab"],
-html.rfx-page-dark [class*="Tab"],
-html.rfx-page-dark [class*="footer"],
-html.rfx-page-dark [class*="Footer"] {
-  background-color: #11181f !important;
-  color: #f3f6f7 !important;
-  border-color: #33404a !important;
-}
-html.rfx-page-dark .load-list,
-html.rfx-page-dark .search-results-summary__panel,
-html.rfx-page-dark .search-results-summary__filters,
-html.rfx-page-dark .search-results-summary__header,
-html.rfx-page-dark .search-results-summary__sort,
-html.rfx-page-dark .search-sidebar,
-html.rfx-page-dark .search-filters,
-html.rfx-page-dark #utility-bar,
-html.rfx-page-dark .utility-bar__default,
-html.rfx-page-dark .refresh-and-chat-box,
-html.rfx-page-dark [class*="load-card"],
-html.rfx-page-dark [class*="LoadCard"] {
-  background-color: #0f1418 !important;
-  color: #f3f6f7 !important;
-  border-color: #33404a !important;
-}
-html.rfx-page-dark #utility-bar,
-html.rfx-page-dark .utility-bar__default {
-  border-top: 1px solid #33404a !important;
-  box-shadow: none !important;
-  outline: none !important;
-}
-html.rfx-page-dark #utility-bar::before,
-html.rfx-page-dark #utility-bar::after,
-html.rfx-page-dark .utility-bar__default::before,
-html.rfx-page-dark .utility-bar__default::after {
+html.rfx-page-dark #application,
+html.rfx-page-dark #app-container,
+html.rfx-page-dark #base-container-body,
+html.rfx-page-dark main {
   background: #0f1418 !important;
+  color: #f3f6f7 !important;
+}
+
+html.rfx-page-dark #application :where(div, section, main, aside, form, header, footer, nav, article) {
+  background-color: transparent !important;
   border-color: #33404a !important;
+  color: inherit;
 }
-html.rfx-page-dark #utility-bar *,
-html.rfx-page-dark .utility-bar__default *,
-html.rfx-page-dark .refresh-and-chat-box * {
-  color: #f3f6f7 !important;
-  border-color: #33404a !important;
+
+html.rfx-page-dark #application :where([style*="background"], [style*="background-color"]) {
+  background-color: transparent !important;
 }
-html.rfx-page-dark #utility-bar button,
-html.rfx-page-dark .utility-bar__default button,
-html.rfx-page-dark .refresh-and-chat-box button {
-  background: #11181f !important;
-  background-color: #11181f !important;
-  color: #f3f6f7 !important;
+
+html.rfx-page-dark #application :where(label, span, p, h1, h2, h3, h4, h5, h6, strong, small),
+html.rfx-page-dark #utility-bar :where(label, span, p, div, button) {
+  color: inherit;
 }
-html.rfx-page-dark .utility-bar__divider,
-html.rfx-page-dark #utility-bar [style*="background: rgb(187, 192, 193)"] {
-  background: #33404a !important;
-  background-color: #33404a !important;
+
+html.rfx-page-dark #application :where(a) {
+  color: #7dd3fc !important;
 }
-html.rfx-page-dark input,
-html.rfx-page-dark select,
-html.rfx-page-dark textarea,
-html.rfx-page-dark [role="combobox"],
-html.rfx-page-dark [role="textbox"],
-html.rfx-page-dark [contenteditable="true"] {
-  background-color: #151d24 !important;
-  background-image: none !important;
-  color: #f3f6f7 !important;
-  -webkit-text-fill-color: #f3f6f7 !important;
-  border-color: #51606b !important;
-  box-shadow: none !important;
+
+html.rfx-page-dark #application :where([aria-disabled="true"], [disabled]) {
+  opacity: .58 !important;
 }
-html.rfx-page-dark body input:not([type="checkbox"]):not([type="radio"]),
-html.rfx-page-dark body select,
-html.rfx-page-dark body textarea,
-html.rfx-page-dark body [role="combobox"],
-html.rfx-page-dark body [role="textbox"],
-html.rfx-page-dark body [class*="input"] input,
-html.rfx-page-dark body [class*="Input"] input,
-html.rfx-page-dark body [class*="select"] select,
-html.rfx-page-dark body [class*="Select"] select {
+
+html.rfx-page-dark #application :where([mdn-input-box]) {
   background: #151d24 !important;
-  background-color: #151d24 !important;
-  background-image: none !important;
-  color: #f3f6f7 !important;
-  -webkit-text-fill-color: #f3f6f7 !important;
-  border-color: transparent !important;
-  box-shadow: none !important;
-}
-html.rfx-page-dark input:not([type="checkbox"]):not([type="radio"]),
-html.rfx-page-dark select,
-html.rfx-page-dark textarea {
-  border: 0 !important;
-  box-shadow: none !important;
-  outline: none !important;
-  -webkit-appearance: none !important;
-  appearance: none !important;
-}
-html.rfx-page-dark input:disabled,
-html.rfx-page-dark select:disabled,
-html.rfx-page-dark textarea:disabled,
-html.rfx-page-dark [aria-disabled="true"] input,
-html.rfx-page-dark [aria-disabled="true"] select {
-  background-color: #101820 !important;
-  color: #98a6af !important;
-  -webkit-text-fill-color: #98a6af !important;
-  border-color: #2a3640 !important;
-  opacity: 1 !important;
-}
-html.rfx-page-dark *:has(> input:not([type="checkbox"]):not([type="radio"])),
-html.rfx-page-dark *:has(> select),
-html.rfx-page-dark *:has(> textarea),
-html.rfx-page-dark [class*="input"],
-html.rfx-page-dark [class*="Input"],
-html.rfx-page-dark [class*="select"],
-html.rfx-page-dark [class*="Select"] {
-  background-color: #151d24 !important;
-  background-image: none !important;
-  color: #f3f6f7 !important;
-  border-color: #51606b !important;
-}
-html.rfx-page-dark body *:has(> input:not([type="checkbox"]):not([type="radio"])),
-html.rfx-page-dark body *:has(> select),
-html.rfx-page-dark body *:has(> textarea) {
-  background: #151d24 !important;
-  color: #f3f6f7 !important;
-  border-color: #51606b !important;
-  box-shadow: none !important;
-}
-html.rfx-page-dark body *:has(> input[type="date"]),
-html.rfx-page-dark body *:has(> input[type="time"]),
-html.rfx-page-dark body *:has(> input[type="datetime-local"]) {
-  background: #151d24 !important;
-  border-color: #51606b !important;
-}
-html.rfx-page-dark [mdn-select-value],
-html.rfx-page-dark [id$="-filter-value"],
-html.rfx-page-dark [aria-labelledby*="-filter-value"] + div,
-html.rfx-page-dark div:has(> input[role="combobox"]) > div {
-  background: #151d24 !important;
-  background-color: #151d24 !important;
-  color: #f3f6f7 !important;
-  -webkit-text-fill-color: #f3f6f7 !important;
-  border: 0 !important;
-  box-shadow: none !important;
-  outline: none !important;
-}
-html.rfx-page-dark div:has(> input[role="combobox"]),
-html.rfx-page-dark div:has(> [mdn-select-value]) {
-  background: #151d24 !important;
-  background-color: #151d24 !important;
-  border: 1px solid #51606b !important;
-  color: #f3f6f7 !important;
-  box-shadow: none !important;
-}
-html.rfx-page-dark [mdn-input-box],
-html.rfx-page-dark [mdn-input-box] > div,
-html.rfx-page-dark [mdn-input-box] [class],
-html.rfx-page-dark [mdn-input-box-suffix] {
-  background: #151d24 !important;
-  background-color: #151d24 !important;
-  background-image: none !important;
-  color: #f3f6f7 !important;
-  border-color: #51606b !important;
-  box-shadow: none !important;
-}
-html.rfx-page-dark [mdn-input-box] *,
-html.rfx-page-dark [mdn-input-box] *::before,
-html.rfx-page-dark [mdn-input-box] *::after {
-  border: 0 !important;
-  box-shadow: none !important;
-  outline: none !important;
-}
-html.rfx-page-dark [mdn-input-box] {
   border: 1px solid #51606b !important;
   border-radius: 4px !important;
+  box-shadow: none !important;
+  color: #f3f6f7 !important;
 }
-html.rfx-page-dark [mdn-input-box] label {
+
+html.rfx-page-dark #application :where([mdn-input-box] *) {
+  background: transparent !important;
+  border: 0 !important;
+  box-shadow: none !important;
+  outline: none !important;
+  color: inherit;
+}
+
+html.rfx-page-dark #application :where([mdn-input-box] label) {
   color: #cbd5dd !important;
   -webkit-text-fill-color: #cbd5dd !important;
 }
-html.rfx-page-dark [mdn-input-box] input,
-html.rfx-page-dark [mdn-input-box] [mdn-select-value] {
-  background: transparent !important;
-  background-color: transparent !important;
+
+html.rfx-page-dark #application :where(input:not([type="checkbox"]):not([type="radio"]), select, textarea, [mdn-select-value], [role="combobox"], [role="textbox"]) {
   color: #f3f6f7 !important;
   -webkit-text-fill-color: #f3f6f7 !important;
-  border: 0 !important;
   box-shadow: none !important;
   outline: none !important;
 }
-html.rfx-page-dark body [mdn-input-box] *,
-html.rfx-page-dark body [mdn-input-box] *::before,
-html.rfx-page-dark body [mdn-input-box] *::after,
-html.rfx-page-dark body [mdn-input-box] [mdn-select-value],
-html.rfx-page-dark body [mdn-input-box] div:has(> input[role="combobox"]),
-html.rfx-page-dark body [mdn-input-box] div:has(> [mdn-select-value]) {
-  border: 0 !important;
-  box-shadow: none !important;
-  outline: none !important;
-}
-html.rfx-page-dark body [mdn-input-box] input,
-html.rfx-page-dark body [mdn-input-box] [mdn-select-value],
-html.rfx-page-dark body [mdn-input-box] div:has(> input[role="combobox"]),
-html.rfx-page-dark body [mdn-input-box] div:has(> [mdn-select-value]) {
-  background: transparent !important;
-  background-color: transparent !important;
-  background-image: none !important;
-  -webkit-appearance: none !important;
-  appearance: none !important;
-}
-html.rfx-page-dark body [mdn-input-box] {
+
+html.rfx-page-dark #application :where(input:not([type="checkbox"]):not([type="radio"]), select, textarea):not([mdn-input-box] *) {
   background: #151d24 !important;
-  background-color: #151d24 !important;
   border: 1px solid #51606b !important;
-  box-shadow: none !important;
 }
-html.rfx-page-dark [mdn-input-box][aria-disabled="true"],
-html.rfx-page-dark [mdn-input-box]:has(input[aria-disabled="true"]),
-html.rfx-page-dark [mdn-input-box]:has(input:disabled) {
-  background: #101820 !important;
-  background-color: #101820 !important;
-  border-color: #2a3640 !important;
-}
-html.rfx-page-dark div:has(> input[role="combobox"]) input[role="combobox"] {
-  background: transparent !important;
-  background-color: transparent !important;
-  box-shadow: none !important;
-}
-html.rfx-page-dark input::-webkit-date-and-time-value,
-html.rfx-page-dark input::-webkit-datetime-edit,
-html.rfx-page-dark input::-webkit-datetime-edit-fields-wrapper,
-html.rfx-page-dark input::-webkit-datetime-edit-text,
-html.rfx-page-dark input::-webkit-datetime-edit-month-field,
-html.rfx-page-dark input::-webkit-datetime-edit-day-field,
-html.rfx-page-dark input::-webkit-datetime-edit-year-field,
-html.rfx-page-dark input::-webkit-datetime-edit-hour-field,
-html.rfx-page-dark input::-webkit-datetime-edit-minute-field,
-html.rfx-page-dark input::-webkit-datetime-edit-ampm-field {
-  color: #f3f6f7 !important;
-  -webkit-text-fill-color: #f3f6f7 !important;
-}
-html.rfx-page-dark input[type="checkbox"],
-html.rfx-page-dark input[type="radio"] {
-  accent-color: #078b75 !important;
-  -webkit-text-fill-color: initial !important;
-}
-html.rfx-page-dark input[type="date"]::-webkit-calendar-picker-indicator,
-html.rfx-page-dark input[type="time"]::-webkit-calendar-picker-indicator,
-html.rfx-page-dark input[type="datetime-local"]::-webkit-calendar-picker-indicator {
-  filter: invert(1) brightness(1.4) !important;
-  opacity: .9 !important;
-}
-html.rfx-page-dark option,
-html.rfx-page-dark optgroup {
-  background-color: #151d24 !important;
-  color: #f3f6f7 !important;
-}
-html.rfx-page-dark input::placeholder,
-html.rfx-page-dark textarea::placeholder {
+
+html.rfx-page-dark #application :where(input::placeholder, textarea::placeholder) {
   color: #94a3ad !important;
   -webkit-text-fill-color: #94a3ad !important;
 }
-html.rfx-page-dark button:not(#rfx-back-btn button),
-html.rfx-page-dark [role="button"],
-html.rfx-page-dark [class*="button"],
-html.rfx-page-dark [class*="Button"] {
-  border-color: #33404a !important;
+
+html.rfx-page-dark #application :where(input[type="checkbox"], input[type="radio"]) {
+  accent-color: #078b75 !important;
+  -webkit-text-fill-color: initial !important;
+}
+
+html.rfx-page-dark #application :where(input[type="date"]::-webkit-calendar-picker-indicator, input[type="time"]::-webkit-calendar-picker-indicator, input[type="datetime-local"]::-webkit-calendar-picker-indicator) {
+  filter: invert(1) brightness(1.4) !important;
+  opacity: .9 !important;
+}
+
+html.rfx-page-dark #application :where(option, optgroup) {
+  background: #151d24 !important;
   color: #f3f6f7 !important;
 }
-html.rfx-page-dark button:not([disabled]):not(#rfx-back-btn button),
-html.rfx-page-dark [role="button"]:not([aria-disabled="true"]) {
-  background-color: #151d24 !important;
-}
-html.rfx-page-dark button[disabled],
-html.rfx-page-dark [aria-disabled="true"],
-html.rfx-page-dark [class*="disabled"],
-html.rfx-page-dark [class*="Disabled"] {
-  opacity: .56 !important;
-}
-html.rfx-page-dark a {
-  color: #7dd3fc !important;
-}
-html.rfx-page-dark label,
-html.rfx-page-dark span,
-html.rfx-page-dark p,
-html.rfx-page-dark div,
-html.rfx-page-dark h1,
-html.rfx-page-dark h2,
-html.rfx-page-dark h3,
-html.rfx-page-dark h4,
-html.rfx-page-dark h5,
-html.rfx-page-dark h6 {
-  color: inherit;
-  border-color: #33404a;
-}
-html.rfx-page-dark body *:not(input):not(textarea):not(select):not(option) {
-  color: inherit;
-  border-color: #33404a;
-}
-html.rfx-page-dark body #utility-bar,
-html.rfx-page-dark body .utility-bar__default,
-html.rfx-page-dark body #utility-bar > div,
-html.rfx-page-dark body .utility-bar__default > div,
-html.rfx-page-dark body #utility-bar [class*="utility-bar"],
-html.rfx-page-dark body #utility-bar .refresh-and-chat-box,
-html.rfx-page-dark body #utility-bar .refresh-and-chat-box > div {
-  background: #0f1418 !important;
-  background-color: #0f1418 !important;
-  border-color: #33404a !important;
+
+html.rfx-page-dark #application :where(button, [role="button"]):not([class^="rfx-"]):not([class*=" rfx-"]):not([id^="rfx-"]):not([id*=" rfx-"]) {
+  background-color: transparent !important;
   box-shadow: none !important;
-  outline: none !important;
-}
-html.rfx-page-dark body #utility-bar {
-  border: 0 !important;
-  border-top: 1px solid #33404a !important;
-}
-html.rfx-page-dark body #utility-bar [style*="background: rgb(187, 192, 193)"],
-html.rfx-page-dark body #utility-bar .utility-bar__divider {
-  background: #33404a !important;
-  background-color: #33404a !important;
-}
-html.rfx-page-dark [style*="background: rgb(255"],
-html.rfx-page-dark [style*="background-color: rgb(255"],
-html.rfx-page-dark [style*="background:white"],
-html.rfx-page-dark [style*="background: white"],
-html.rfx-page-dark [style*="background-color:white"],
-html.rfx-page-dark [style*="background-color: white"] {
-  background-color: #11181f !important;
+  border-color: #33404a !important;
   color: #f3f6f7 !important;
 }
-html.rfx-page-dark [style*="color: rgb(0"],
-html.rfx-page-dark [style*="color:rgb(0"],
-html.rfx-page-dark [style*="color: black"],
-html.rfx-page-dark [style*="color:black"] {
-  color: #f3f6f7 !important;
-}
-html.rfx-page-dark [class*="nav"],
-html.rfx-page-dark [class*="Nav"],
-html.rfx-page-dark [class*="menu"],
-html.rfx-page-dark [class*="Menu"],
-html.rfx-page-dark [class*="sidebar"],
-html.rfx-page-dark [class*="Sidebar"] {
-  background-color: #0f171d !important;
-  color: #f3f6f7 !important;
-}
-html.rfx-page-dark [class*="active"],
-html.rfx-page-dark [aria-selected="true"] {
-  color: #ffffff !important;
-}
-html.rfx-page-dark svg {
+
+html.rfx-page-dark #application :where(svg) {
   color: #e5edf0 !important;
   stroke: currentColor;
 }
-html.rfx-page-dark [class*="chip"],
-html.rfx-page-dark [class*="Chip"],
-html.rfx-page-dark [class*="tag"],
-html.rfx-page-dark [class*="Tag"],
-html.rfx-page-dark [class*="pill"],
-html.rfx-page-dark [class*="Pill"] {
+
+html.rfx-page-dark #application :where([class*="chip"], [class*="Chip"], [class*="tag"], [class*="Tag"], [class*="pill"], [class*="Pill"]) {
   background-color: #173044 !important;
   color: #dff7ff !important;
   border-color: #2f6f8f !important;
 }
-html.rfx-page-dark table,
-html.rfx-page-dark tr,
-html.rfx-page-dark td,
-html.rfx-page-dark th {
+
+html.rfx-page-dark #utility-bar,
+html.rfx-page-dark .utility-bar__default,
+html.rfx-page-dark #utility-bar > div,
+html.rfx-page-dark .utility-bar__default > div,
+html.rfx-page-dark #utility-bar .refresh-and-chat-box {
+  background: #0f1418 !important;
+  background-color: #0f1418 !important;
+  border-color: #33404a !important;
+  box-shadow: none !important;
+  color: #f3f6f7 !important;
+}
+
+html.rfx-page-dark #utility-bar {
+  border: 0 !important;
+  border-top: 1px solid #33404a !important;
+}
+
+html.rfx-page-dark #utility-bar :where(button, [role="button"]) {
+  background: transparent !important;
+  background-color: transparent !important;
+  color: #f3f6f7 !important;
+  border-color: #33404a !important;
+  box-shadow: none !important;
+}
+
+html.rfx-page-dark #utility-bar .utility-bar__divider,
+html.rfx-page-dark #utility-bar [style*="background: rgb(187, 192, 193)"] {
+  background: #33404a !important;
+  background-color: #33404a !important;
+}
+
+html.rfx-page-dark :where(table, tr, td, th) {
   background-color: #101820 !important;
   color: #f3f6f7 !important;
   border-color: #33404a !important;
 }
+
 html.rfx-page-dark hr {
   border-color: #33404a !important;
 }
+
 html.rfx-page-dark ::selection {
   background: #0e7490 !important;
   color: #fff !important;
 }
+
 html.rfx-page-dark ::-webkit-scrollbar {
   width: 12px;
   height: 12px;
 }
+
 html.rfx-page-dark ::-webkit-scrollbar-track {
   background: #0f1418;
 }
+
 html.rfx-page-dark ::-webkit-scrollbar-thumb {
   background: #33404a;
   border: 3px solid #0f1418;
@@ -688,6 +458,36 @@ function applyFuzzyPatFooterVisibility() {
       delete area.dataset.rfxHiddenEmptyFooter;
     }
   });
+}
+
+let amazonAutoRefreshDisableTimer = null;
+let amazonAutoRefreshDisableAttempts = 0;
+let amazonAutoRefreshDisabledOnThisLoad = false;
+
+function disableAmazonAutoRefreshIfEnabled() {
+  if (!isLoadBoardPage() || amazonAutoRefreshDisabledOnThisLoad) return false;
+  const utilityBar = document.getElementById("utility-bar");
+  if (!utilityBar) return false;
+
+  const enabledSwitch = utilityBar.querySelector('input[role="switch"][aria-checked="true"], input[role="switch"]:checked');
+  if (!enabledSwitch) return false;
+
+  const clickTarget = enabledSwitch.closest("label") || enabledSwitch;
+  clickTarget.click();
+  amazonAutoRefreshDisabledOnThisLoad = true;
+  return true;
+}
+
+function scheduleDisableAmazonAutoRefresh(delay = 500) {
+  if (amazonAutoRefreshDisableTimer) clearTimeout(amazonAutoRefreshDisableTimer);
+  amazonAutoRefreshDisableTimer = setTimeout(() => {
+    amazonAutoRefreshDisableTimer = null;
+    amazonAutoRefreshDisableAttempts += 1;
+    const disabled = disableAmazonAutoRefreshIfEnabled();
+    if (!disabled && amazonAutoRefreshDisableAttempts < 20) {
+      scheduleDisableAmazonAutoRefresh(500);
+    }
+  }, delay);
 }
 
 const LOOKOUT_ALERTS_KEY = "rfx_lookout_alerts_v1";
@@ -3299,7 +3099,7 @@ function detectChanges(newLoads) {
 // CSS
 // ============================================================
 const CSS = `
-:host { all: initial; font-family: "Amazon Ember", -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif; font-size: 14px; color: #0f1111; }
+:host { all: initial; font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, Arial, sans-serif; font-size: 14px; color: #0f1111; }
 * { box-sizing: border-box; margin: 0; padding: 0; }
 .rfx-root {
   --rfx-page: #ffffff;
@@ -3324,6 +3124,14 @@ const CSS = `
   --rfx-new-bg: #fff5e0;
   --rfx-profit-bg: #e6f7f2;
   --rfx-profit-border: #b7e4d2;
+  --rfx-chip-bg: #eef7ff;
+  --rfx-chip-border: #a6d8ff;
+  --rfx-chip-text: #0f1111;
+  --rfx-chip-input-bg: #ffffff;
+  --rfx-chip-remove-bg: #111827;
+  --rfx-chip-remove-text: #ffffff;
+  --rfx-choice-selected-bg: #effbf7;
+  --rfx-choice-selected-border: #07876b;
   --rfx-shadow: 0 2px 8px rgba(0,0,0,0.1);
   color: var(--rfx-text);
   background: transparent;
@@ -3351,6 +3159,14 @@ const CSS = `
   --rfx-new-bg: #2c2110;
   --rfx-profit-bg: #0f3129;
   --rfx-profit-border: #1f6d5b;
+  --rfx-chip-bg: #132433;
+  --rfx-chip-border: #2f6589;
+  --rfx-chip-text: #dff3ff;
+  --rfx-chip-input-bg: #0f171f;
+  --rfx-chip-remove-bg: #dff3ff;
+  --rfx-chip-remove-text: #0f171f;
+  --rfx-choice-selected-bg: #0f3129;
+  --rfx-choice-selected-border: #19a987;
   --rfx-shadow: 0 2px 10px rgba(0,0,0,0.35);
 }
 @media (prefers-color-scheme: dark) {
@@ -3377,6 +3193,14 @@ const CSS = `
     --rfx-new-bg: #2c2110;
     --rfx-profit-bg: #0f3129;
     --rfx-profit-border: #1f6d5b;
+    --rfx-chip-bg: #132433;
+    --rfx-chip-border: #2f6589;
+    --rfx-chip-text: #dff3ff;
+    --rfx-chip-input-bg: #0f171f;
+    --rfx-chip-remove-bg: #dff3ff;
+    --rfx-chip-remove-text: #0f171f;
+    --rfx-choice-selected-bg: #0f3129;
+    --rfx-choice-selected-border: #19a987;
     --rfx-shadow: 0 2px 10px rgba(0,0,0,0.35);
   }
 }
@@ -3829,9 +3653,11 @@ const CSS = `
 }
 .rfx-detection-choice.selected,
 .rfx-detection-choice:has(input:checked) {
-  border-color: #07876b; background: #effbf7; box-shadow: inset 0 0 0 1px #07876b;
+  border-color: var(--rfx-choice-selected-border);
+  background: var(--rfx-choice-selected-bg);
+  box-shadow: inset 0 0 0 1px var(--rfx-choice-selected-border);
 }
-.rfx-detection-choice input { width: 16px; height: 16px; accent-color: #07876b; flex: 0 0 auto; }
+.rfx-detection-choice input { width: 16px; height: 16px; accent-color: var(--rfx-primary); flex: 0 0 auto; }
 .rfx-detection-choice span { margin: 0; min-width: 0; }
 .rfx-detection-choice b {
   display: block; font-size: 13px; line-height: 1.15; color: var(--rfx-text); white-space: nowrap; overflow: hidden; text-overflow: ellipsis;
@@ -3863,16 +3689,18 @@ const CSS = `
 .rfx-lookout-places { display: flex; flex-wrap: wrap; gap: 6px; margin-top: 6px; }
 .rfx-lookout-place-chip {
   display: inline-flex !important; align-items: center; gap: 6px;
-  background: #eef7ff; border: 1px solid #a6d8ff; border-radius: 999px;
-  padding: 5px 8px; font-size: 12px; font-weight: 700; color: #0f1111 !important;
+  background: var(--rfx-chip-bg); border: 1px solid var(--rfx-chip-border); border-radius: 999px;
+  padding: 5px 8px; font-size: 12px; font-weight: 700; color: var(--rfx-chip-text) !important;
 }
 .rfx-lookout-place-chip input {
-  width: 56px; height: 24px; border: 1px solid #a6d8ff; border-radius: 999px;
-  padding: 0 6px; font: inherit; font-size: 12px; font-weight: 800; background: #fff;
+  width: 56px; height: 24px; border: 1px solid var(--rfx-chip-border); border-radius: 999px;
+  padding: 0 6px; font: inherit; font-size: 12px; font-weight: 800;
+  background: var(--rfx-chip-input-bg); color: var(--rfx-text);
 }
 .rfx-lookout-place-chip button {
   width: 18px; height: 18px; padding: 0; border-radius: 50%; line-height: 1;
   display: inline-flex; align-items: center; justify-content: center;
+  border: 0; background: var(--rfx-chip-remove-bg); color: var(--rfx-chip-remove-text);
 }
 .rfx-lookout-add-place {
   display: grid; grid-template-columns: minmax(150px, 1fr) 82px auto;
@@ -3914,6 +3742,62 @@ const CSS = `
   padding: 14px; margin-bottom: 12px; display: none;
 }
 .rfx-settings-panel.open { display: block; }
+.rfx-settings-panel input,
+.rfx-settings-panel select,
+.rfx-settings-panel textarea,
+.rfx-date-filter input {
+  color-scheme: light;
+}
+.rfx-root.rfx-theme-dark .rfx-settings-panel input,
+.rfx-root.rfx-theme-dark .rfx-settings-panel select,
+.rfx-root.rfx-theme-dark .rfx-settings-panel textarea,
+.rfx-root.rfx-theme-dark .rfx-date-filter input {
+  color-scheme: dark;
+}
+.rfx-root.rfx-theme-dark .rfx-settings-panel input:not([type="checkbox"]):not([type="radio"]):not([type="range"]),
+.rfx-root.rfx-theme-dark .rfx-settings-panel select,
+.rfx-root.rfx-theme-dark .rfx-settings-panel textarea,
+.rfx-root.rfx-theme-dark .rfx-date-filter input:not([type="checkbox"]):not([type="radio"]):not([type="range"]) {
+  background: var(--rfx-chip-input-bg);
+  color: var(--rfx-text);
+  border-color: var(--rfx-border);
+}
+.rfx-settings-panel input::placeholder,
+.rfx-settings-panel textarea::placeholder { color: var(--rfx-faint); opacity: 1; }
+.rfx-root.rfx-theme-dark .rfx-settings-panel input[type="date"]::-webkit-calendar-picker-indicator,
+.rfx-root.rfx-theme-dark .rfx-settings-panel input[type="time"]::-webkit-calendar-picker-indicator,
+.rfx-root.rfx-theme-dark .rfx-settings-panel input[type="datetime-local"]::-webkit-calendar-picker-indicator,
+.rfx-root.rfx-theme-dark .rfx-date-filter input[type="date"]::-webkit-calendar-picker-indicator,
+.rfx-root.rfx-theme-dark .rfx-date-filter input[type="time"]::-webkit-calendar-picker-indicator,
+.rfx-root.rfx-theme-dark .rfx-date-filter input[type="datetime-local"]::-webkit-calendar-picker-indicator {
+  filter: invert(1);
+  opacity: 0.8;
+}
+@media (prefers-color-scheme: dark) {
+  .rfx-root.rfx-theme-system .rfx-settings-panel input,
+  .rfx-root.rfx-theme-system .rfx-settings-panel select,
+  .rfx-root.rfx-theme-system .rfx-settings-panel textarea,
+  .rfx-root.rfx-theme-system .rfx-date-filter input {
+    color-scheme: dark;
+  }
+  .rfx-root.rfx-theme-system .rfx-settings-panel input:not([type="checkbox"]):not([type="radio"]):not([type="range"]),
+  .rfx-root.rfx-theme-system .rfx-settings-panel select,
+  .rfx-root.rfx-theme-system .rfx-settings-panel textarea,
+  .rfx-root.rfx-theme-system .rfx-date-filter input:not([type="checkbox"]):not([type="radio"]):not([type="range"]) {
+    background: var(--rfx-chip-input-bg);
+    color: var(--rfx-text);
+    border-color: var(--rfx-border);
+  }
+  .rfx-root.rfx-theme-system .rfx-settings-panel input[type="date"]::-webkit-calendar-picker-indicator,
+  .rfx-root.rfx-theme-system .rfx-settings-panel input[type="time"]::-webkit-calendar-picker-indicator,
+  .rfx-root.rfx-theme-system .rfx-settings-panel input[type="datetime-local"]::-webkit-calendar-picker-indicator,
+  .rfx-root.rfx-theme-system .rfx-date-filter input[type="date"]::-webkit-calendar-picker-indicator,
+  .rfx-root.rfx-theme-system .rfx-date-filter input[type="time"]::-webkit-calendar-picker-indicator,
+  .rfx-root.rfx-theme-system .rfx-date-filter input[type="datetime-local"]::-webkit-calendar-picker-indicator {
+    filter: invert(1);
+    opacity: 0.8;
+  }
+}
 .rfx-settings-head {
   display: flex; align-items: flex-end; justify-content: space-between; gap: 14px;
   padding-bottom: 12px; margin-bottom: 12px; border-bottom: 1px solid var(--rfx-border-soft);
@@ -4003,7 +3887,13 @@ const CSS = `
 .rfx-city-input-row button { height: 38px; padding: 0 14px; font-weight: 800; }
 .rfx-city-help { font-size: 12px; color: var(--rfx-muted); line-height: 1.35; }
 .rfx-city-chips { display: flex; flex-wrap: wrap; gap: 6px; }
-.rfx-city-chip { padding: 6px 10px; background: #eef7ff; border-color: #a6d8ff; font-weight: 600; }
+.rfx-city-chip {
+  padding: 6px 10px;
+  background: var(--rfx-chip-bg);
+  border-color: var(--rfx-chip-border);
+  color: var(--rfx-chip-text);
+  font-weight: 600;
+}
 .rfx-city-empty { font-size: 12px; color: var(--rfx-faint); }
 .rfx-select-row {
   display: flex; align-items: center; justify-content: space-between; gap: 12px;
@@ -7114,12 +7004,14 @@ function ensureObserverStarted() {
   applyPageTheme();
   ensurePageThemeMediaListener();
   applyFuzzyPatFooterVisibility();
+  scheduleDisableAmazonAutoRefresh(800);
 }
 
 // ============================================================
 // INIT
 // ============================================================
 function init() {
+  ensurePageFontReset();
   applyPageTheme();
   ensurePageThemeMediaListener();
   ensureObserverStarted();
@@ -7136,13 +7028,15 @@ function init() {
   backBtn.innerHTML = `<button style="
     padding:10px 24px; font-size:14px; font-weight:600;
     border-radius:8px; cursor:pointer; box-shadow:0 1px 4px rgba(0,0,0,0.15);
-    font-family:'Amazon Ember',-apple-system,sans-serif; border:none;
+    font-family:${RFX_SYSTEM_FONT_STACK}; border:none;
     background:#232f3e; color:#fff;
   ">AI Loads</button>`;
   backBtn.querySelector("button").addEventListener("click", toggleAiMode);
   document.body.appendChild(backBtn);
 
   setupChatObserver();
+  scheduleDisableAmazonAutoRefresh(800);
+  setTimeout(disableAmazonAutoRefreshIfEnabled, 2500);
   injectCards();
 }
 
