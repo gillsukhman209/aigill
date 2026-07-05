@@ -4474,13 +4474,9 @@ function injectCards() {
           ${chk("amazonOnlyFacilities", "Amazon facilities only")}
           ${chk("patEnabled", "PAT — show Post A Truck button on loads")}
           ${chk("hideFuzzyPatFooter", "Hide close-match PAT footer")}
-          <div class="rfx-select-row">
-            <label for="rfx-theme-mode">Theme</label>
-            <select id="rfx-theme-mode">
-              <option value="system" ${settings.themeMode === "system" ? "selected" : ""}>System</option>
-              <option value="light" ${settings.themeMode === "light" ? "selected" : ""}>Light</option>
-              <option value="dark" ${settings.themeMode === "dark" ? "selected" : ""}>Dark</option>
-            </select>
+          <div class="rfx-setting-row">
+            <input type="checkbox" id="rfx-theme-dark-toggle" ${isPageDarkThemeActive() ? "checked" : ""}>
+            <label for="rfx-theme-dark-toggle">Dark mode</label>
           </div>
         </div>
         <div class="rfx-settings-section">
@@ -4619,10 +4615,10 @@ function injectCards() {
   if (testDiscordBtn) {
     testDiscordBtn.addEventListener("click", () => sendDiscordTestNotification(testDiscordBtn));
   }
-  const themeModeSelect = shadowRoot.getElementById("rfx-theme-mode");
-  if (themeModeSelect) {
-    themeModeSelect.addEventListener("change", () => {
-      settings.themeMode = ["system", "light", "dark"].includes(themeModeSelect.value) ? themeModeSelect.value : "system";
+  const darkModeToggle = shadowRoot.getElementById("rfx-theme-dark-toggle");
+  if (darkModeToggle) {
+    darkModeToggle.addEventListener("change", () => {
+      settings.themeMode = darkModeToggle.checked ? "dark" : "light";
       saveSettings();
       applyPageTheme();
       injectCards();
@@ -6845,6 +6841,21 @@ function ensureTripsProfitStyle() {
     }
     .rfx-trip-profit-badge small {
       color: inherit; opacity: 0.68; font-weight: 700; margin-left: 3px;
+    }
+    html.rfx-page-dark .rfx-trip-profit-badge {
+      background: #0f3129;
+      border: 1px solid #1f6d5b;
+      color: #7ee7c8;
+      box-shadow: none;
+    }
+    html.rfx-page-dark .rfx-trip-profit-badge.negative {
+      background: #3a1515;
+      border-color: #7f1d1d;
+      color: #fca5a5;
+    }
+    html.rfx-page-dark .rfx-trip-profit-badge small {
+      color: #b8c3ca;
+      opacity: 1;
     }
     @media (max-width: 700px) {
       .rfx-trip-profit-badge { max-width: 165px; font-size: 11px; padding: 2px 6px; }
