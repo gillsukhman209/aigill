@@ -89,6 +89,9 @@
         if (!parsed._isRelayFetcher) {
           lastSearchPayload = parsed;
           const searchSeq = ++autoSearchSeq;
+          window.dispatchEvent(new CustomEvent("relay-fetcher-search-start", {
+            detail: JSON.stringify({ payload: parsed, seq: searchSeq }),
+          }));
           // Intercept the response to broadcast to content script
           const response = await _origFetch.apply(this, args);
           const clone = response.clone();
@@ -175,6 +178,7 @@
 
     try {
       while (nextToken != null && allLoads.length < totalResults && pageNum < 10) {
+        if (searchSeq !== autoSearchSeq) return;
         pageNum++;
         const payload = { ...basePayload, nextItemToken: nextToken, resultSize: 50, _isRelayFetcher: true };
         const response = await _origFetch("https://relay.amazon.com/api/loadboard/search", {
@@ -194,6 +198,8 @@
         if (!loads.length) break;
       }
 
+      if (searchSeq !== autoSearchSeq) return;
+
       window.dispatchEvent(new CustomEvent("relay-fetcher-auto-update", {
         detail: JSON.stringify({
           data: {
@@ -210,6 +216,7 @@
         }),
       }));
     } catch (err) {
+      if (searchSeq !== autoSearchSeq) return;
       window.dispatchEvent(new CustomEvent("relay-fetcher-auto-update", {
         detail: JSON.stringify({
           data: { ...firstPageData, _rfxPaginationFailed: true },
@@ -294,9 +301,10 @@
   window.addEventListener("relay-fetcher-poll", async (e) => {
     const request = JSON.parse(e.detail);
     let basePayload = lastSearchPayload || request.payload;
+    const searchSeq = autoSearchSeq;
     if (!basePayload) {
       window.dispatchEvent(new CustomEvent("relay-fetcher-poll-result", {
-        detail: JSON.stringify({ error: "No search filters. Search on the page first." }),
+        detail: JSON.stringify({ error: "No search filters. Search on the page first.", seq: searchSeq }),
       }));
       return;
     }
@@ -320,6 +328,7 @@
       let nextToken = 0, totalResults = 0, lastStatus = 200;
 
       while (true) {
+        if (searchSeq !== autoSearchSeq) return;
         const payload = { ...basePayload, nextItemToken: nextToken, resultSize: 50, _isRelayFetcher: true };
         const response = await _origFetch("https://relay.amazon.com/api/loadboard/search", {
           method: "POST",
@@ -329,9 +338,10 @@
         });
         lastStatus = response.status;
         const data = await response.json();
+        if (searchSeq !== autoSearchSeq) return;
         if (data.errorCode) {
           window.dispatchEvent(new CustomEvent("relay-fetcher-poll-result", {
-            detail: JSON.stringify({ status: response.status, data }),
+            detail: JSON.stringify({ status: response.status, data, seq: searchSeq }),
           }));
           return;
         }
@@ -353,13 +363,15 @@
       };
 
       // Capture token from our own request
+      if (searchSeq !== autoSearchSeq) return;
       if (csrfToken && !capturedCsrfToken) capturedCsrfToken = csrfToken;
       window.dispatchEvent(new CustomEvent("relay-fetcher-poll-result", {
-        detail: JSON.stringify({ status: lastStatus, data }),
+        detail: JSON.stringify({ status: lastStatus, data, seq: searchSeq }),
       }));
     } catch (err) {
+      if (searchSeq !== autoSearchSeq) return;
       window.dispatchEvent(new CustomEvent("relay-fetcher-poll-result", {
-        detail: JSON.stringify({ error: err.message }),
+        detail: JSON.stringify({ error: err.message, seq: searchSeq }),
       }));
     }
   });

@@ -27,8 +27,8 @@ let shadowRoot = null;
 let carrierDetails = null;
 let currentSearchAuditId = null;
 let currentSearchSignature = "";
+let pendingPartialSearchSignature = "";
 let latestAutoSearchSeq = 0;
-let suppressAutoUpdateDetectionUntil = 0;
 let lastNonEmptySearchAt = 0;
 
 // Settings (persisted to localStorage)
@@ -141,6 +141,7 @@ const DEFAULT_SETTINGS = {
   customDateFilterEnabled: false,
   customDateFilterStart: "",
   customDateFilterEnd: "",
+  customDateFilterCollapsed: false,
   bookedTimeBlocks: [],
   bookedTimeBlockMode: "warn",
   showProfitEstimate: true,
@@ -340,6 +341,73 @@ html.rfx-page-dark #utility-bar .utility-bar__divider,
 html.rfx-page-dark #utility-bar [style*="background: rgb(187, 192, 193)"] {
   background: #33404a !important;
   background-color: #33404a !important;
+}
+
+html.rfx-page-dark #application .chat-box-position,
+html.rfx-page-dark .chat-box-position {
+  color-scheme: light !important;
+  background: #ffffff !important;
+  background-color: #ffffff !important;
+  border-color: #d5d9d9 !important;
+  color: #0f1111 !important;
+  -webkit-text-fill-color: initial !important;
+  box-shadow: 0 2px 8px rgba(15, 17, 17, 0.2) !important;
+}
+
+html.rfx-page-dark #application .chat-box-position :where(div, section, main, aside, form, header, footer, nav, article),
+html.rfx-page-dark .chat-box-position :where(div, section, main, aside, form, header, footer, nav, article) {
+  background-color: transparent !important;
+  border-color: #d5d9d9 !important;
+  color: #0f1111 !important;
+}
+
+html.rfx-page-dark #application .chat-box-position :where(label, span, p, h1, h2, h3, h4, h5, h6, strong, small, li),
+html.rfx-page-dark .chat-box-position :where(label, span, p, h1, h2, h3, h4, h5, h6, strong, small, li) {
+  color: #0f1111 !important;
+  -webkit-text-fill-color: #0f1111 !important;
+}
+
+html.rfx-page-dark #application .chat-box-position :where(input:not([type="checkbox"]):not([type="radio"]), textarea),
+html.rfx-page-dark .chat-box-position :where(input:not([type="checkbox"]):not([type="radio"]), textarea) {
+  background: #ffffff !important;
+  background-color: #ffffff !important;
+  border: 1px solid #879596 !important;
+  color: #0f1111 !important;
+  -webkit-text-fill-color: #0f1111 !important;
+}
+
+html.rfx-page-dark #application .chat-box-position :where(button, [role="button"]):not([id^="rfx-"]):not([class^="rfx-"]):not([class*=" rfx-"]),
+html.rfx-page-dark .chat-box-position :where(button, [role="button"]):not([id^="rfx-"]):not([class^="rfx-"]):not([class*=" rfx-"]) {
+  background-color: transparent !important;
+  color: #0f1111 !important;
+  border-color: #d5d9d9 !important;
+  opacity: 1 !important;
+}
+
+html.rfx-page-dark #application .chat-box-position :where(button, [role="button"]):not([id^="rfx-"]):not([class^="rfx-"]):not([class*=" rfx-"]) :where(span, svg, path, circle, rect, line, polyline, polygon),
+html.rfx-page-dark .chat-box-position :where(button, [role="button"]):not([id^="rfx-"]):not([class^="rfx-"]):not([class*=" rfx-"]) :where(span, svg, path, circle, rect, line, polyline, polygon) {
+  color: #0f1111 !important;
+  -webkit-text-fill-color: #0f1111 !important;
+  fill: currentColor !important;
+  stroke: currentColor !important;
+  opacity: 1 !important;
+}
+
+html.rfx-page-dark #application .chat-box-position :where(svg, path, circle, rect, line, polyline, polygon),
+html.rfx-page-dark .chat-box-position :where(svg, path, circle, rect, line, polyline, polygon) {
+  color: #0f1111 !important;
+  opacity: 1 !important;
+}
+
+html.rfx-page-dark #application .chat-box-position #rfx-chat-neg-container,
+html.rfx-page-dark .chat-box-position #rfx-chat-neg-container {
+  color: #0f1111 !important;
+  -webkit-text-fill-color: initial !important;
+}
+
+html.rfx-page-dark #application .chat-box-position #rfx-chat-neg-container :where(button, button *),
+html.rfx-page-dark .chat-box-position #rfx-chat-neg-container :where(button, button *) {
+  -webkit-text-fill-color: currentColor !important;
 }
 
 html.rfx-page-dark :where(table, tr, td, th) {
@@ -1061,6 +1129,22 @@ function fmtBookedTimeBlockRange(block) {
     ? new Date(endMs).toLocaleTimeString([], { hour: "numeric", minute: "2-digit" })
     : `${new Date(endMs).toLocaleDateString([], { month: "numeric", day: "numeric" })} ${new Date(endMs).toLocaleTimeString([], { hour: "numeric", minute: "2-digit" })}`;
   return `${datePart} ${startTime}-${endFormat}`;
+}
+
+function fmtCustomDateFilterSummary() {
+  if (!settings.customDateFilterEnabled) return "Off";
+  const startMs = new Date(settings.customDateFilterStart || "").getTime();
+  const endMs = new Date(settings.customDateFilterEnd || "").getTime();
+  const fmt = ms => new Date(ms).toLocaleString([], {
+    month: "numeric",
+    day: "numeric",
+    hour: "numeric",
+    minute: "2-digit",
+  });
+  if (Number.isFinite(startMs) && Number.isFinite(endMs)) return `${fmt(startMs)} - ${fmt(endMs)}`;
+  if (Number.isFinite(startMs)) return `After ${fmt(startMs)}`;
+  if (Number.isFinite(endMs)) return `Before ${fmt(endMs)}`;
+  return "On";
 }
 
 function getBookedTimeConflict(wo) {
@@ -2896,25 +2980,33 @@ function sortLoads(loads) {
 
 function renderCustomDateFilter() {
   const enabled = !!settings.customDateFilterEnabled;
+  const collapsed = !!settings.customDateFilterCollapsed;
   const startValue = toLocalDateTimeInputValue(settings.customDateFilterStart);
   const endValue = toLocalDateTimeInputValue(settings.customDateFilterEnd);
   const openPatCount = getOpenPatOrders().length;
-  return `<div class="rfx-date-filter ${enabled ? "active" : ""}">
-    <div class="rfx-date-filter-main">
+  const summary = fmtCustomDateFilterSummary();
+  return `<div class="rfx-date-filter ${enabled ? "active" : ""} ${collapsed ? "collapsed" : ""}">
+    <div class="rfx-date-filter-head">
       <label class="rfx-date-toggle">
         <input type="checkbox" id="rfx-date-filter-enabled" ${enabled ? "checked" : ""}>
         <span>My date filter</span>
       </label>
-      <div class="rfx-date-inputs">
-        <label>Start after <input type="datetime-local" id="rfx-date-filter-start" value="${escapeHtml(startValue)}"></label>
-        <label>End before <input type="datetime-local" id="rfx-date-filter-end" value="${escapeHtml(endValue)}"></label>
-      </div>
+      <span class="rfx-date-filter-summary">${escapeHtml(summary)}</span>
+      <button type="button" id="rfx-date-filter-collapse" class="rfx-date-filter-collapse" aria-expanded="${collapsed ? "false" : "true"}">${collapsed ? "Show" : "Hide"}</button>
     </div>
-    <div class="rfx-date-actions">
-      <button type="button" data-date-preset="today">Today</button>
-      <button type="button" data-date-preset="24h">Next 24h</button>
-      <button type="button" data-date-preset="clear">Clear</button>
-      <button type="button" id="rfx-cancel-pat-orders" class="rfx-cancel-pat-btn" ${patCancelInFlight ? "disabled" : ""}>${patCancelInFlight ? "Canceling..." : `Cancel PAT${openPatCount ? ` (${openPatCount})` : ""}`}</button>
+    <div class="rfx-date-filter-body" ${collapsed ? "hidden" : ""}>
+      <div class="rfx-date-filter-main">
+        <div class="rfx-date-inputs">
+          <label>Start after <input type="datetime-local" id="rfx-date-filter-start" value="${escapeHtml(startValue)}"></label>
+          <label>End before <input type="datetime-local" id="rfx-date-filter-end" value="${escapeHtml(endValue)}"></label>
+        </div>
+      </div>
+      <div class="rfx-date-actions">
+        <button type="button" data-date-preset="today">Today</button>
+        <button type="button" data-date-preset="24h">Next 24h</button>
+        <button type="button" data-date-preset="clear">Clear</button>
+        <button type="button" id="rfx-cancel-pat-orders" class="rfx-cancel-pat-btn" ${patCancelInFlight ? "disabled" : ""}>${patCancelInFlight ? "Canceling..." : `Cancel PAT${openPatCount ? ` (${openPatCount})` : ""}`}</button>
+      </div>
     </div>
   </div>`;
 }
@@ -3280,11 +3372,24 @@ const CSS = `
 }
 .rfx-count { font-size: 13px; color: var(--rfx-muted); margin-left: auto; }
 .rfx-date-filter {
-  display: flex; align-items: center; justify-content: space-between; gap: 12px;
+  display: flex; flex-direction: column; align-items: stretch; gap: 10px;
   padding: 10px 12px; margin: 0 0 10px 0; border: 1px solid var(--rfx-border); border-radius: 10px;
   background: var(--rfx-surface);
 }
 .rfx-date-filter.active { border-color: var(--rfx-primary); background: var(--rfx-profit-bg); }
+.rfx-date-filter.collapsed { padding: 9px 12px; }
+.rfx-date-filter-head { display: flex; align-items: center; gap: 10px; min-width: 0; }
+.rfx-date-filter-summary {
+  margin-left: auto; min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap;
+  font-size: 12px; font-weight: 800; color: var(--rfx-muted);
+}
+.rfx-date-filter-collapse {
+  height: 30px; border: 1px solid var(--rfx-border); border-radius: 8px; background: var(--rfx-surface);
+  color: var(--rfx-text); font: inherit; font-size: 12px; font-weight: 800; padding: 0 10px; cursor: pointer;
+}
+.rfx-date-filter-collapse:hover { background: var(--rfx-surface-soft); }
+.rfx-date-filter-body { display: flex; align-items: center; justify-content: space-between; gap: 12px; min-width: 0; }
+.rfx-date-filter-body[hidden] { display: none; }
 .rfx-date-filter-main { display: flex; align-items: center; gap: 12px; min-width: 0; flex: 1; }
 .rfx-date-toggle { display: inline-flex; align-items: center; gap: 8px; font-size: 13px; font-weight: 800; color: var(--rfx-text); white-space: nowrap; }
 .rfx-date-toggle input { width: 18px; height: 18px; accent-color: var(--rfx-primary); }
@@ -3945,6 +4050,9 @@ const CSS = `
   .rfx-toolbar-filter select { flex: 1; min-height: 36px; }
   .rfx-count { width: 100%; margin-left: 0; font-size: 12px; }
   .rfx-date-filter { flex-direction: column; align-items: stretch; gap: 10px; padding: 10px; }
+  .rfx-date-filter-head { gap: 8px; }
+  .rfx-date-filter-summary { font-size: 11px; }
+  .rfx-date-filter-body { flex-direction: column; align-items: stretch; gap: 8px; }
   .rfx-date-filter-main { flex-direction: column; align-items: stretch; gap: 8px; }
   .rfx-date-inputs { display: grid; grid-template-columns: 1fr; gap: 8px; }
   .rfx-date-inputs label { align-items: stretch; flex-direction: column; gap: 4px; }
@@ -4122,7 +4230,7 @@ function renderCard(wo, extraClass, changeBadge) {
   const fuelProfit = settings.showProfitEstimate ? calcFuelProfit(wo) : null;
   if (fuelProfit) {
     const title = `Fuel-only estimate: ${fuelProfit.totalMiles.toFixed(1)} total mi / ${fuelProfit.mpg.toFixed(1)} MPG × ${fmt$(fuelProfit.fuelPrice)} = ${fmt$(fuelProfit.fuelCost)} fuel`;
-    statsHtml += `<span class="rfx-profit-est ${fuelProfit.profit < 0 ? "negative" : ""}" title="${escapeHtml(title)}">${fmt$(fuelProfit.profit)} after fuel</span>`;
+    statsHtml += `<span class="rfx-profit-est ${fuelProfit.profit < 0 ? "negative" : ""}" title="${escapeHtml(title)}">${fmt$(fuelProfit.profit)} / ${fmt$(fuelProfit.fuelCost)}</span>`;
   }
   const distDur = [];
   if (settings.showDistance) distDur.push(`<b>${dist.toFixed(1)}</b> mi`);
@@ -4621,6 +4729,7 @@ function injectCards() {
       settings.themeMode = darkModeToggle.checked ? "dark" : "light";
       saveSettings();
       applyPageTheme();
+      if (chatWoId && negotiationState.has(chatWoId)) updateChatNegUI(chatWoId);
       injectCards();
     });
   }
@@ -4681,10 +4790,16 @@ function injectCards() {
   const dateEnabled = shadowRoot.getElementById("rfx-date-filter-enabled");
   const dateStart = shadowRoot.getElementById("rfx-date-filter-start");
   const dateEnd = shadowRoot.getElementById("rfx-date-filter-end");
+  const dateCollapse = shadowRoot.getElementById("rfx-date-filter-collapse");
+  if (dateCollapse) dateCollapse.addEventListener("click", () => {
+    settings.customDateFilterCollapsed = !settings.customDateFilterCollapsed;
+    saveSettings();
+    injectCards();
+  });
   const saveDateFilter = () => {
     settings.customDateFilterEnabled = !!dateEnabled?.checked;
-    settings.customDateFilterStart = localDateTimeInputToIso(dateStart?.value || "");
-    settings.customDateFilterEnd = localDateTimeInputToIso(dateEnd?.value || "");
+    settings.customDateFilterStart = dateStart ? localDateTimeInputToIso(dateStart.value || "") : settings.customDateFilterStart;
+    settings.customDateFilterEnd = dateEnd ? localDateTimeInputToIso(dateEnd.value || "") : settings.customDateFilterEnd;
     saveSettings();
     injectCards();
   };
@@ -5128,7 +5243,7 @@ function styleAmazonLoadCards() {
     const fuelProfit = settings.showProfitEstimate ? calcFuelProfit(wo) : null;
     if (fuelProfit) {
       const title = `Fuel-only estimate: ${fuelProfit.totalMiles.toFixed(1)} total mi / ${fuelProfit.mpg.toFixed(1)} MPG × ${fmt$(fuelProfit.fuelPrice)} = ${fmt$(fuelProfit.fuelCost)} fuel`;
-      statsHtml += `<div class="rfx-i-profit ${fuelProfit.profit < 0 ? "negative" : ""}" title="${escapeHtml(title)}">${fmt$(fuelProfit.profit)} after fuel</div>`;
+      statsHtml += `<div class="rfx-i-profit ${fuelProfit.profit < 0 ? "negative" : ""}" title="${escapeHtml(title)}">${fmt$(fuelProfit.profit)} / ${fmt$(fuelProfit.fuelCost)}</div>`;
     }
     const distDur = [];
     if (settings.showDistance) distDur.push(`<b>${dist.toFixed(1)}</b> mi`);
@@ -5445,7 +5560,6 @@ async function startBot(options = {}) {
   }
 
   botStarting = true;
-  suppressAutoUpdateDetectionUntil = Date.now() + 5000;
   if (aiModeActive) injectCards();
   botStartWatchdog = setTimeout(() => {
     if (!botStarting) return;
@@ -5603,7 +5717,9 @@ function doPoll() {
 // Handle poll results
 window.addEventListener("relay-fetcher-poll-result", (e) => {
   try {
-    const { status, data, error } = JSON.parse(e.detail);
+    const { status, data, error, seq } = JSON.parse(e.detail);
+    const pollSeq = Number(seq);
+    if (Number.isFinite(pollSeq) && pollSeq < latestAutoSearchSeq) return;
 
     if (error || data?.errorCode) {
       const msg = error || data?.defaultErrorMessage || "";
@@ -5627,6 +5743,23 @@ window.addEventListener("relay-fetcher-poll-result", (e) => {
     const loads = filterCustomExcludedLoads(rawLoads);
     carrierDetails = data?.carrierDetails || carrierDetails;
     currentSearchAuditId = data?.searchAuditId || currentSearchAuditId;
+
+    // If a filter change has only delivered Amazon's first page so far, this full bot
+    // poll completes the new baseline. Do not classify later pages as newly found loads.
+    if (pendingPartialSearchSignature) {
+      pendingPartialSearchSignature = "";
+      allLoads = dedupeLoads(loads);
+      alertedLoads = [];
+      missingCounts.clear();
+      recentlyMissingLoads.clear();
+      goneLoads.clear();
+      seedSeenLoads(allLoads);
+      isFirstPoll = allLoads.length === 0;
+      if (loads.length > 0) lastNonEmptySearchAt = Date.now();
+      processLookoutAlerts(allLoads, "bot-filter-change-complete");
+      if (aiModeActive) injectCards();
+      return;
+    }
 
     if (loads.length === 0 && shouldIgnoreEmptySearchResult("Bot:Poll")) {
       if (aiModeActive) injectCards();
@@ -5918,6 +6051,22 @@ function stopNegotiation() {
   updateChatNegUI(chatWoId);
 }
 
+function getChatNegTheme() {
+  return {
+    runningBg: "#eff6ff",
+    runningBorder: "#bfdbfe",
+    runningTitle: "#2563eb",
+    doneBg: "#e6f7f2",
+    doneBorder: "#a7f3d0",
+    success: "#067d62",
+    ineligibleBg: "#f5f5f5",
+    ineligibleBorder: "#e5e5e5",
+    ineligible: "#888",
+    text: "#0f1111",
+    muted: "#565959",
+  };
+}
+
 function startChatNegotiation() {
   const btn = document.getElementById("rfx-chat-neg-btn");
   if (btn) { btn.disabled = true; btn.textContent = "Starting..."; }
@@ -5953,14 +6102,17 @@ function updateChatNegUI(woId) {
   if (!statusEl) return;
 
   statusEl.style.display = "block";
+  const theme = getChatNegTheme();
 
   if (state.status === "running") {
     const priceChain = state.prices.map(p => fmt$(p)).join(" → ");
     statusEl.innerHTML = `
-      <div style="font-weight:600; color:#2563eb; animation: rfxNegPulse 1s infinite;">Negotiating... Round ${state.round}</div>
-      <div style="margin-top:4px; font-size:14px; color:#0f1111;">${priceChain}</div>
+      <div style="font-weight:600; color:${theme.runningTitle}; animation: rfxNegPulse 1s infinite;">Negotiating... Round ${state.round}</div>
+      <div style="margin-top:4px; font-size:14px; color:${theme.text};">${priceChain}</div>
     `;
-    statusEl.style.background = "#eff6ff";
+    statusEl.style.background = theme.runningBg;
+    statusEl.style.border = `1px solid ${theme.runningBorder}`;
+    statusEl.style.color = theme.text;
     statusEl.style.padding = "8px";
     statusEl.style.borderRadius = "6px";
     if (btn) { btn.disabled = true; btn.textContent = "Negotiating..."; }
@@ -5971,20 +6123,24 @@ function updateChatNegUI(woId) {
     statusEl.innerHTML = `
       <div style="display:flex; align-items:center; gap:8px;">
         <span style="font-size:18px">✅</span>
-        <span style="font-weight:700; font-size:20px; color:#067d62;">${fmt$(state.bestPay)}</span>
-        ${gain > 0.01 ? `<span style="font-weight:700; color:#067d62; font-size:15px;">+${fmt$(gain)} gained</span>` : ""}
-        <span style="color:#565959; font-size:12px;">${state.round} rounds</span>
+        <span style="font-weight:700; font-size:20px; color:${theme.success};">${fmt$(state.bestPay)}</span>
+        ${gain > 0.01 ? `<span style="font-weight:700; color:${theme.success}; font-size:15px;">+${fmt$(gain)} gained</span>` : ""}
+        <span style="color:${theme.muted}; font-size:12px;">${state.round} rounds</span>
       </div>
-      <div style="margin-top:4px; font-size:13px; color:#0f1111;">${priceChain}</div>
+      <div style="margin-top:4px; font-size:13px; color:${theme.text};">${priceChain}</div>
     `;
-    statusEl.style.background = "#e6f7f2";
+    statusEl.style.background = theme.doneBg;
+    statusEl.style.border = `1px solid ${theme.doneBorder}`;
+    statusEl.style.color = theme.text;
     statusEl.style.padding = "10px";
     statusEl.style.borderRadius = "6px";
     if (btn) { btn.disabled = true; btn.textContent = "Negotiation Complete"; btn.style.background = "#067d62"; }
     if (stopBtn) { stopBtn.style.display = "none"; }
   } else if (state.status === "ineligible") {
-    statusEl.innerHTML = `<div style="color:#888;">Not eligible for negotiation</div>`;
-    statusEl.style.background = "#f5f5f5";
+    statusEl.innerHTML = `<div style="color:${theme.ineligible};">Not eligible for negotiation</div>`;
+    statusEl.style.background = theme.ineligibleBg;
+    statusEl.style.border = `1px solid ${theme.ineligibleBorder}`;
+    statusEl.style.color = theme.text;
     statusEl.style.padding = "8px";
     statusEl.style.borderRadius = "6px";
     if (btn) { btn.disabled = true; btn.textContent = "Not Eligible"; btn.style.background = "#888"; }
@@ -5995,8 +6151,14 @@ function updateChatNegUI(woId) {
 function updateChatNegStatus(text, color) {
   const statusEl = document.getElementById("rfx-chat-neg-status");
   if (statusEl) {
+    const theme = getChatNegTheme();
     statusEl.style.display = "block";
-    statusEl.innerHTML = `<div style="color:${color || "#0f1111"}">${text}</div>`;
+    statusEl.style.background = theme.ineligibleBg;
+    statusEl.style.border = `1px solid ${theme.ineligibleBorder}`;
+    statusEl.style.color = theme.text;
+    statusEl.style.padding = "8px";
+    statusEl.style.borderRadius = "6px";
+    statusEl.innerHTML = `<div style="color:${color || theme.text}">${text}</div>`;
   }
 }
 
@@ -6722,6 +6884,18 @@ function fetchAllLoads() {
 // ============================================================
 // AUTO-UPDATE from page's own search
 // ============================================================
+window.addEventListener("relay-fetcher-search-start", (e) => {
+  try {
+    const { seq } = JSON.parse(e.detail);
+    const searchSeq = Number(seq);
+    if (Number.isFinite(searchSeq) && searchSeq > latestAutoSearchSeq) {
+      latestAutoSearchSeq = searchSeq;
+    }
+  } catch (err) {
+    console.error("[Relay Fetcher] Search-start error:", err);
+  }
+});
+
 window.addEventListener("relay-fetcher-auto-update", (e) => {
   try {
     const { data, payload, seq } = JSON.parse(e.detail);
@@ -6730,49 +6904,43 @@ window.addEventListener("relay-fetcher-auto-update", (e) => {
       latestAutoSearchSeq = Number(seq);
     }
     if (data?.workOpportunities) {
-      if (data._rfxPartialPage) {
-        return;
-      }
       carrierDetails = data?.carrierDetails || carrierDetails;
       currentSearchAuditId = data?.searchAuditId || currentSearchAuditId;
       const rawPageLoads = data.workOpportunities || [];
       const pageLoads = filterCustomExcludedLoads(rawPageLoads);
       const alertPaused = alertedLoads.length > 0;
       const pageSignature = getSearchSignature(payload);
+      const isPartialPage = !!data._rfxPartialPage;
       const filterChanged = !!pageSignature && pageSignature !== currentSearchSignature;
-      const suppressDetection = Date.now() < suppressAutoUpdateDetectionUntil;
-      if (pageSignature) currentSearchSignature = pageSignature;
+      const completesFilterChange = !isPartialPage && !!pageSignature && pageSignature === pendingPartialSearchSignature;
+      const replacesSearchResults = filterChanged || completesFilterChange;
+      if (filterChanged) {
+        currentSearchSignature = pageSignature;
+        pendingPartialSearchSignature = isPartialPage ? pageSignature : "";
+      } else if (completesFilterChange) {
+        pendingPartialSearchSignature = "";
+      }
 
-      if (pageLoads.length === 0 && shouldIgnoreEmptySearchResult("Bot:AutoUpdate")) {
+      // A partial response for the current filters adds no new information. For a newly
+      // changed filter, however, it is the fastest authoritative result set available.
+      if (isPartialPage && !filterChanged) return;
+
+      if (pageLoads.length > 0) lastNonEmptySearchAt = Date.now();
+
+      if (replacesSearchResults) {
+        allLoads = dedupeLoads(pageLoads);
+        alertedLoads = [];
+        missingCounts.clear();
+        recentlyMissingLoads.clear();
+        goneLoads.clear();
+        seedSeenLoads(allLoads);
+        isFirstPoll = allLoads.length === 0;
+        if (!isPartialPage) processLookoutAlerts(allLoads, "page-search-filter-change");
         if (aiModeActive) injectCards();
         return;
       }
-      if (pageLoads.length > 0) lastNonEmptySearchAt = Date.now();
 
-      if (filterChanged) {
-        allLoads = dedupeLoads(pageLoads);
-        processLookoutAlerts(allLoads, "page-search-filter-change");
-        if (suppressDetection) {
-          if (seenLoads.size === 0) {
-            seedSeenLoads(allLoads);
-            isFirstPoll = allLoads.length === 0;
-          }
-          missingCounts.clear();
-          goneLoads.clear();
-        } else if (botRunning && !botStarting && !alertPaused) {
-          const alerts = pageLoads.length > 0 ? detectChanges(pageLoads) : [];
-          if (alerts.length > 0) {
-            handleDetectedAlerts(alerts, "Bot:AutoUpdate");
-          } else {
-          }
-        } else if (alertPaused) {
-        } else {
-          alertedLoads = [];
-          missingCounts.clear();
-          goneLoads.clear();
-          seedSeenLoads(allLoads);
-          isFirstPoll = allLoads.length === 0;
-        }
+      if (pageLoads.length === 0 && shouldIgnoreEmptySearchResult("Bot:AutoUpdate")) {
         if (aiModeActive) injectCards();
         return;
       }
@@ -6974,7 +7142,7 @@ function applyTripsProfitCalculator() {
     badge.dataset.sig = signature;
     badge.classList.toggle("negative", estimate.profit < 0);
     badge.title = `Fuel-only estimate: ${estimate.totalMiles.toFixed(1)} total mi / ${estimate.mpg.toFixed(1)} MPG × ${fmt$(estimate.fuelPrice)} = ${fmt$(estimate.fuelCost)} fuel`;
-    badge.innerHTML = `${fmt$(estimate.profit)} profit <small>fuel ${fmt$(estimate.fuelCost)}</small>`;
+    badge.innerHTML = `${fmt$(estimate.profit)} / <small>${fmt$(estimate.fuelCost)}</small>`;
   }
 }
 
