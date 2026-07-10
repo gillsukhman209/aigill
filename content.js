@@ -159,6 +159,10 @@ function loadSettings() {
   if (!["warn", "hide"].includes(settings.bookedTimeBlockMode)) settings.bookedTimeBlockMode = "warn";
   if (!["system", "light", "dark"].includes(settings.themeMode)) settings.themeMode = "system";
   if (!settings.hideFuzzyPatFooterUserSet) settings.hideFuzzyPatFooter = true;
+  if (settings.autoBook) {
+    settings.autoResume = false;
+    settings.amazonOnlyFacilities = true;
+  }
 }
 function saveSettings() {
   try { localStorage.setItem(SETTINGS_KEY, JSON.stringify(settings)); } catch {}
@@ -294,6 +298,68 @@ html.rfx-page-dark #application :where(option, optgroup) {
   color: #f3f6f7 !important;
 }
 
+/* iOS Safari can render Relay form controls outside #application and paints
+   date/time values through WebKit-only internal parts. Keep every native value readable. */
+html.rfx-page-dark body :where(input:not([type="checkbox"]):not([type="radio"]):not([type="range"]):not([type="button"]):not([type="submit"]):not([type="reset"]):not([type="image"]):not([type="color"]):not([type="file"]):not([type="hidden"]), select, textarea, [mdn-select-value], [role="combobox"], [role="textbox"]) {
+  color-scheme: dark !important;
+  color: #f3f6f7 !important;
+  -webkit-text-fill-color: #f3f6f7 !important;
+  caret-color: #f3f6f7 !important;
+  opacity: 1 !important;
+}
+
+html.rfx-page-dark body [mdn-input-box],
+html.rfx-page-dark body [mdn-input-box] :where(input, select, textarea, [mdn-select-value], [role="combobox"], [role="textbox"]) {
+  color: #f3f6f7 !important;
+  -webkit-text-fill-color: #f3f6f7 !important;
+}
+
+html.rfx-page-dark body :where(input:disabled, select:disabled, textarea:disabled, [aria-disabled="true"] input, [aria-disabled="true"] select, [aria-disabled="true"] textarea) {
+  color: #dce5e9 !important;
+  -webkit-text-fill-color: #dce5e9 !important;
+  opacity: 1 !important;
+  -webkit-opacity: 1 !important;
+}
+
+html.rfx-page-dark body :where(input::placeholder, textarea::placeholder) {
+  color: #94a3ad !important;
+  -webkit-text-fill-color: #94a3ad !important;
+  opacity: 1 !important;
+}
+
+html.rfx-page-dark body input[type="date"]::-webkit-date-and-time-value,
+html.rfx-page-dark body input[type="time"]::-webkit-date-and-time-value,
+html.rfx-page-dark body input[type="datetime-local"]::-webkit-date-and-time-value,
+html.rfx-page-dark body input::-webkit-datetime-edit,
+html.rfx-page-dark body input::-webkit-datetime-edit-fields-wrapper,
+html.rfx-page-dark body input::-webkit-datetime-edit-text,
+html.rfx-page-dark body input::-webkit-datetime-edit-day-field,
+html.rfx-page-dark body input::-webkit-datetime-edit-month-field,
+html.rfx-page-dark body input::-webkit-datetime-edit-year-field,
+html.rfx-page-dark body input::-webkit-datetime-edit-hour-field,
+html.rfx-page-dark body input::-webkit-datetime-edit-minute-field,
+html.rfx-page-dark body input::-webkit-datetime-edit-ampm-field {
+  color: #f3f6f7 !important;
+  -webkit-text-fill-color: #f3f6f7 !important;
+  opacity: 1 !important;
+}
+
+html.rfx-page-dark body :where(input[type="date"], input[type="time"], input[type="datetime-local"])::-webkit-calendar-picker-indicator {
+  filter: invert(1) brightness(1.5) !important;
+  opacity: 1 !important;
+}
+
+html.rfx-page-dark body :where([mdn-input-box], [role="combobox"]) :where(svg, img) {
+  filter: invert(1) brightness(1.5) !important;
+  opacity: 1 !important;
+}
+
+html.rfx-page-dark body :where(option, optgroup) {
+  background: #151d24 !important;
+  color: #f3f6f7 !important;
+  -webkit-text-fill-color: #f3f6f7 !important;
+}
+
 html.rfx-page-dark #application :where(button, [role="button"]):not([class^="rfx-"]):not([class*=" rfx-"]):not([id^="rfx-"]):not([id*=" rfx-"]) {
   background-color: transparent !important;
   box-shadow: none !important;
@@ -367,13 +433,35 @@ html.rfx-page-dark .chat-box-position :where(label, span, p, h1, h2, h3, h4, h5,
   -webkit-text-fill-color: #0f1111 !important;
 }
 
-html.rfx-page-dark #application .chat-box-position :where(input:not([type="checkbox"]):not([type="radio"]), textarea),
-html.rfx-page-dark .chat-box-position :where(input:not([type="checkbox"]):not([type="radio"]), textarea) {
+html.rfx-page-dark #application .chat-box-position :where(input:not([type="checkbox"]):not([type="radio"]), select, textarea, [mdn-select-value], [role="combobox"], [role="textbox"]),
+html.rfx-page-dark .chat-box-position :where(input:not([type="checkbox"]):not([type="radio"]), select, textarea, [mdn-select-value], [role="combobox"], [role="textbox"]) {
+  color-scheme: light !important;
   background: #ffffff !important;
   background-color: #ffffff !important;
   border: 1px solid #879596 !important;
   color: #0f1111 !important;
   -webkit-text-fill-color: #0f1111 !important;
+}
+
+html.rfx-page-dark .chat-box-position input[type="date"]::-webkit-date-and-time-value,
+html.rfx-page-dark .chat-box-position input[type="time"]::-webkit-date-and-time-value,
+html.rfx-page-dark .chat-box-position input[type="datetime-local"]::-webkit-date-and-time-value,
+html.rfx-page-dark .chat-box-position input::-webkit-datetime-edit,
+html.rfx-page-dark .chat-box-position input::-webkit-datetime-edit-fields-wrapper,
+html.rfx-page-dark .chat-box-position input::-webkit-datetime-edit-text,
+html.rfx-page-dark .chat-box-position input::-webkit-datetime-edit-day-field,
+html.rfx-page-dark .chat-box-position input::-webkit-datetime-edit-month-field,
+html.rfx-page-dark .chat-box-position input::-webkit-datetime-edit-year-field,
+html.rfx-page-dark .chat-box-position input::-webkit-datetime-edit-hour-field,
+html.rfx-page-dark .chat-box-position input::-webkit-datetime-edit-minute-field,
+html.rfx-page-dark .chat-box-position input::-webkit-datetime-edit-ampm-field {
+  color: #0f1111 !important;
+  -webkit-text-fill-color: #0f1111 !important;
+}
+
+html.rfx-page-dark .chat-box-position :where(input[type="date"], input[type="time"], input[type="datetime-local"])::-webkit-calendar-picker-indicator {
+  filter: none !important;
+  opacity: 1 !important;
 }
 
 html.rfx-page-dark #application .chat-box-position :where(button, [role="button"]):not([id^="rfx-"]):not([class^="rfx-"]):not([class*=" rfx-"]),
@@ -593,6 +681,8 @@ const missingCounts = new Map(); // id -> consecutive miss count
 const recentlyMissingLoads = new Map(); // id -> expiry timestamp, prevents pagination churn from re-alerting
 let alertedLoads = []; // loads in the "new load detected" section
 let goneLoads = new Set(); // ids fading out
+let autoBookAwaitingBaseline = false;
+let autoBookCandidate = null;
 const RECENTLY_MISSING_TTL_MS = 5 * 60 * 1000;
 
 // ============================================================
@@ -1421,7 +1511,7 @@ function getStemTimeWarning(wo) {
   const minutesUntil = Math.round((startMs - now) / 60000);
   return {
     label: minutesUntil <= 0 ? "pickup due now" : `starts in ${fmtMinutesShort(minutesUntil)}`,
-    detail: `Minimum stem time is ${fmtMinutesShort(minMinutes)}.`,
+    detail: `Minimum stand time is ${fmtMinutesShort(minMinutes)}.`,
   };
 }
 
@@ -1996,6 +2086,53 @@ function passesDetectionAlertRules(wo) {
   if (!passesBookedTimeBlockFilter(wo)) return false;
   if (!settings.detectionOnlyAlertMatchingRules || !getActiveDetectionRules().length) return true;
   return getDetectionRuleMatch(wo).ok;
+}
+
+function passesDisplayedLoadFilters(wo) {
+  return !!wo?.id
+    && passesCustomExcludedCities(wo)
+    && passesAmazonOnlyFacilities(wo)
+    && passesDetectionDisplayRules(wo)
+    && passesCustomDateFilter(wo)
+    && passesBookedTimeBlockFilter(wo)
+    && !isIgnoredLoad(wo.id);
+}
+
+function evaluateAutoBookCandidate(wo, nowMs = Date.now()) {
+  if (!passesDisplayedLoadFilters(wo)) return { ok: false, reason: "hidden-by-filter" };
+  if (isPrivateLoad(wo)) return { ok: false, reason: "not-amazon-facility" };
+
+  const pickupMs = getLoadStartMs(wo);
+  if (!Number.isFinite(pickupMs)) return { ok: false, reason: "missing-pickup-time" };
+
+  const payout = Number(wo?.payout?.value);
+  if (!Number.isFinite(payout) || payout <= 0) return { ok: false, reason: "missing-payout" };
+
+  const minimumMinutes = Math.max(0, Number(settings.minStemTimeMinutes) || 0);
+  const standMinutes = (pickupMs - nowMs) / 60000;
+  if (standMinutes < minimumMinutes) {
+    return { ok: false, reason: "minimum-stand-time", standMinutes, minimumMinutes };
+  }
+
+  return {
+    ok: true,
+    payout,
+    pickupMs,
+    standMinutes,
+    minimumMinutes,
+  };
+}
+
+function selectAutoBookCandidate(newLoadAlerts, nowMs = Date.now()) {
+  let selected = null;
+  for (const alert of newLoadAlerts || []) {
+    const evaluation = evaluateAutoBookCandidate(alert?.wo, nowMs);
+    if (!evaluation.ok) continue;
+    if (!selected || evaluation.payout > selected.evaluation.payout) {
+      selected = { alert, evaluation };
+    }
+  }
+  return selected;
 }
 
 function lookoutRouteSummary(wo) {
@@ -3335,7 +3472,7 @@ const CSS = `
   background: #8b0000; color: #fff; font-size: 13px; font-weight: 700;
   padding: 8px 16px; border-radius: 8px; margin-bottom: 10px;
   animation: rfxAutoBookPulse 1.5s infinite;
-  text-transform: uppercase; letter-spacing: 0.5px;
+  text-transform: uppercase; letter-spacing: 0;
 }
 @keyframes rfxAutoBookPulse { 0%,100% { background: #8b0000; } 50% { background: #cc0000; } }
 
@@ -3350,6 +3487,7 @@ const CSS = `
 .badge-price-up { background: var(--rfx-primary); color: #fff; }
 .badge-price-down { background: var(--rfx-danger); color: #fff; }
 .badge-time { background: #b8860b; color: #fff; }
+.badge-autobook { background: var(--rfx-danger); color: #fff; }
 .badge-updated { background: var(--rfx-muted); color: #fff; }
 .badge-gone { background: var(--rfx-border-soft); color: var(--rfx-faint); }
 
@@ -4246,7 +4384,7 @@ function renderCard(wo, extraClass, changeBadge) {
   if (settings.showPostedAge && postedAge) footerTags += `<span class="rfx-tag">${postedAge}</span>`;
   if (settings.showStopCount) footerTags += `<span class="rfx-tag">${wo.stopCount || stops.length} stops</span>`;
   if (timingRisk) footerTags += `<span class="rfx-timing-risk ${timingRisk.level}" title="${escapeHtml(timingRisk.detail)}">Timing issue · ${escapeHtml(timingRisk.label)}</span>`;
-  if (stemWarning) footerTags += `<span class="rfx-stem-risk" title="${escapeHtml(stemWarning.detail)}">Stem warning · ${escapeHtml(stemWarning.label)}</span>`;
+  if (stemWarning) footerTags += `<span class="rfx-stem-risk" title="${escapeHtml(stemWarning.detail)}">Stand warning · ${escapeHtml(stemWarning.label)}</span>`;
   if (timeConflict) {
     const conflictRange = fmtBookedTimeBlockRange(timeConflict);
     const conflictLabel = timeConflict.label ? `${timeConflict.label} · ${conflictRange}` : conflictRange;
@@ -4371,11 +4509,11 @@ function renderCustomLoadBoard() {
   const alerted = [];
   for (const alert of alertedLoads) {
     const wo = loadMap.get(alert.wo.id) || alert.wo;
-    if (wo && passesCustomExcludedCities(wo) && passesAmazonOnlyFacilities(wo) && passesDetectionDisplayRules(wo) && passesCustomDateFilter(wo) && passesBookedTimeBlockFilter(wo) && !isIgnoredLoad(wo.id)) alerted.push({ wo, alert });
+    if (passesDisplayedLoadFilters(wo)) alerted.push({ wo, alert });
   }
 
   const regularLoads = sortLoads(
-    Array.from(loadMap.values()).filter(wo => !alertMap.has(wo.id) && passesCustomExcludedCities(wo) && passesAmazonOnlyFacilities(wo) && passesDetectionDisplayRules(wo) && passesCustomDateFilter(wo) && passesBookedTimeBlockFilter(wo) && !isIgnoredLoad(wo.id))
+    Array.from(loadMap.values()).filter(wo => !alertMap.has(wo.id) && passesDisplayedLoadFilters(wo))
   );
   const hiddenByCity = Array.from(loadMap.values()).filter(wo => !passesCustomExcludedCities(wo)).length;
   const hiddenByFacility = Array.from(loadMap.values()).filter(wo => passesCustomExcludedCities(wo) && !passesAmazonOnlyFacilities(wo)).length;
@@ -4397,7 +4535,7 @@ function renderCustomLoadBoard() {
     })),
     ...regularLoads.map(wo => renderCard(wo, "", null)),
   ].join("");
-  const boardLoads = Array.from(loadMap.values()).filter(wo => passesCustomExcludedCities(wo) && passesAmazonOnlyFacilities(wo) && passesDetectionDisplayRules(wo) && passesCustomDateFilter(wo) && passesBookedTimeBlockFilter(wo) && !isIgnoredLoad(wo.id));
+  const boardLoads = Array.from(loadMap.values()).filter(passesDisplayedLoadFilters);
   const roundTripsHtml = renderRoundTripMatches(boardLoads, alertMap);
   const hiddenTotal = hiddenByCity + hiddenByFacility + hiddenByDetection + hiddenByDate + hiddenByTimeBlock + hiddenByLoad;
   const hiddenReasons = [
@@ -4533,8 +4671,9 @@ function injectCards() {
 
   // --- Render control panel in shadow DOM ---
   let dotClass = "grey", statusText = "Stopped";
-  if (botStarting) { dotClass = "amber"; statusText = "Starting..."; }
-  else if (botRunning) { dotClass = "green"; statusText = "Running"; }
+  if (botStarting) { dotClass = settings.autoBook ? "red" : "amber"; statusText = settings.autoBook ? "Auto-booker baselining current loads..." : "Starting..."; }
+  else if (botRunning) { dotClass = settings.autoBook ? "red" : "green"; statusText = settings.autoBook ? (autoBookAwaitingBaseline ? "Auto-booker baselining current loads..." : "Auto-booker waiting for new loads") : "Running"; }
+  else if (autoBookCandidate) { dotClass = "red"; statusText = "Auto-booker stopped — candidate selected"; }
   else if (alertedLoads.length > 0) { dotClass = "amber"; statusText = "PAUSED — New Load Detected"; }
 
   const fastBookWarning = settings.fastBook
@@ -4577,8 +4716,10 @@ function injectCards() {
         <div class="rfx-settings-section">
           <div class="rfx-settings-section-title">General</div>
           ${chk("fastBook", "Fast Book — auto-confirm booking (skips manual confirmation)")}
-          ${chk("autoBook", "Auto-Book — automatically book new loads when detected (clicks Book only, not Confirm)")}
-          ${chk("autoResume", "Auto-resume after stop — restart bot after 5 seconds")}
+          ${chk("autoBook", "Auto-Book Simulator — select one new qualifying load without booking")}
+          ${settings.autoBook
+            ? `<div class="rfx-setting-row"><input type="checkbox" id="rfx-s-autoResume" disabled><label for="rfx-s-autoResume">Auto-resume disabled while Auto-Book Simulator is on</label></div>`
+            : chk("autoResume", "Auto-resume after stop — restart bot after 5 seconds")}
           ${chk("amazonOnlyFacilities", "Amazon facilities only")}
           ${chk("patEnabled", "PAT — show Post A Truck button on loads")}
           ${chk("hideFuzzyPatFooter", "Hide close-match PAT footer")}
@@ -4595,7 +4736,7 @@ function injectCards() {
         <div class="rfx-settings-section">
           <div class="rfx-settings-section-title">Alerts</div>
           <div class="rfx-range-row"><label>Min price increase</label><input type="range" id="rfx-s-minPrice" min="0" max="200" step="5" value="${settings.minPriceIncrease}" data-key="minPriceIncrease"><span class="rfx-range-val" id="rfx-s-minPrice-val">${fmtRangeSettingValue("minPriceIncrease", settings.minPriceIncrease)}</span></div>
-          <div class="rfx-range-row"><label>Min stem warning</label><input type="range" id="rfx-s-minStemTime" min="0" max="240" step="15" value="${settings.minStemTimeMinutes}" data-key="minStemTimeMinutes"><span class="rfx-range-val" id="rfx-s-minStemTime-val">${fmtRangeSettingValue("minStemTimeMinutes", settings.minStemTimeMinutes)}</span></div>
+          <div class="rfx-range-row"><label>Minimum stand time</label><input type="range" id="rfx-s-minStemTime" min="0" max="240" step="15" value="${settings.minStemTimeMinutes}" data-key="minStemTimeMinutes"><span class="rfx-range-val" id="rfx-s-minStemTime-val">${fmtRangeSettingValue("minStemTimeMinutes", settings.minStemTimeMinutes)}</span></div>
           <div class="rfx-settings-help">Only alert on price increases above this amount. Set to 0 to alert on all changes.</div>
         </div>
         <div class="rfx-settings-section">
@@ -4692,7 +4833,13 @@ function injectCards() {
   </div>`;
 
   const autoBookWarning = settings.autoBook
-    ? `<div class="rfx-autobook-warn">⚠ AUTO-BOOK ARMED — New loads will be booked automatically ⚠</div>` : "";
+    ? `<div class="rfx-autobook-warn">${autoBookCandidate
+      ? `Simulation only — Would book ${fmt$(autoBookCandidate.payout)} — Auto-booker stopped`
+      : botStarting || autoBookAwaitingBaseline
+        ? "Simulation only — Auto-booker on — Baselining current loads"
+        : botRunning
+          ? `Simulation only — Auto-booker on — Waiting for new loads — Minimum stand ${fmtMinutesShort(settings.minStemTimeMinutes)}`
+          : "Simulation only — Auto-booker ready — Press Start to monitor new loads"}</div>` : "";
 
   const customLoadBoard = renderCustomLoadBoard();
   shadowRoot.innerHTML = `<style>${CSS}</style><div class="rfx-root ${getThemeClass()}">${statusBar}${autoBookWarning}${settingsPanel}${customLoadBoard}${renderPatModal()}</div>`;
@@ -4750,10 +4897,20 @@ function injectCards() {
       const key = cb.dataset.key;
       settings[key] = cb.checked;
       if (key === "fastBook" && cb.checked) settings.autoBook = false;
-      else if (key === "autoBook" && cb.checked) settings.fastBook = false;
+      else if (key === "autoBook" && cb.checked) {
+        settings.fastBook = false;
+        settings.autoResume = false;
+        settings.amazonOnlyFacilities = true;
+      }
+      if (key === "autoBook") {
+        cancelAutoResume();
+        autoBookAwaitingBaseline = false;
+        autoBookCandidate = null;
+        if (botRunning || botStarting) stopBot({ allowAutoResume: false });
+      }
       if ((key === "fastBook" && !cb.checked) || (key === "autoBook" && cb.checked)) armedFastBookLoads.clear();
       if (key === "autoResume" && !cb.checked) cancelAutoResume();
-      if (key === "autoResume" && cb.checked && !botRunning && !botStarting) scheduleAutoResume("setting enabled");
+      if (key === "autoResume" && cb.checked && !settings.autoBook && !botRunning && !botStarting) scheduleAutoResume("setting enabled");
       if (key === "hideFuzzyPatFooter") settings.hideFuzzyPatFooterUserSet = true;
       saveSettings();
       if (key === "hideFuzzyPatFooter") applyFuzzyPatFooterVisibility();
@@ -5257,7 +5414,7 @@ function styleAmazonLoadCards() {
     if (settings.showPostedAge && postedAge) footer += `<span>${postedAge}</span>`;
     if (settings.showStopCount) footer += ` <span>${wo.stopCount || stops.length} stops</span>`;
     if (timingRisk) footer += ` <span class="rfx-i-timing-risk ${timingRisk.level}" title="${escapeHtml(timingRisk.detail)}">Timing issue · ${escapeHtml(timingRisk.label)}</span>`;
-    if (stemWarning) footer += ` <span class="rfx-i-stem-risk" title="${escapeHtml(stemWarning.detail)}">Stem warning · ${escapeHtml(stemWarning.label)}</span>`;
+    if (stemWarning) footer += ` <span class="rfx-i-stem-risk" title="${escapeHtml(stemWarning.detail)}">Stand warning · ${escapeHtml(stemWarning.label)}</span>`;
 
     const armedForFastBook = settings.fastBook || armedFastBookLoads.has(woId);
 
@@ -5282,7 +5439,7 @@ function styleAmazonLoadCards() {
     let alertBadge = "";
     if (alert && !priceDeltaText) {
       const badgeCls = alert.badgeClass || "badge-new";
-      alertBadge = `<span class="rfx-i-badge" style="background:${badgeCls === "badge-new" || badgeCls === "badge-price-up" ? "#067d62" : badgeCls === "badge-price-down" ? "#cc3333" : badgeCls === "badge-time" ? "#b8860b" : "#565959"};color:#fff;margin-bottom:8px;display:inline-block;">${alert.badge}</span>`;
+      alertBadge = `<span class="rfx-i-badge" style="background:${badgeCls === "badge-new" || badgeCls === "badge-price-up" ? "#067d62" : badgeCls === "badge-price-down" || badgeCls === "badge-autobook" ? "#cc3333" : badgeCls === "badge-time" ? "#b8860b" : "#565959"};color:#fff;margin-bottom:8px;display:inline-block;">${alert.badge}</span>`;
     }
 
     const inject = document.createElement("div");
@@ -5547,16 +5704,29 @@ async function startBot(options = {}) {
     botStartWatchdog = null;
   }
 
-  // If auto-book is on, ask for confirmation first
+  // Auto-book is simulation-only and can start only from the user's Start button.
   if (settings.autoBook && !options.skipAutoBookConfirm) {
     const confirmed = window.confirm(
-      "⚠ AUTO-BOOK IS ENABLED ⚠\n\n" +
-      "The bot will automatically BOOK AND CONFIRM any new load it detects.\n\n" +
-      "This WILL commit you to the load. There is no undo.\n\n" +
-      "Make sure your Amazon filters are set correctly — only loads matching your filters will appear.\n\n" +
-      "Are you sure you want to start?"
+      "AUTO-BOOK SIMULATOR\n\n" +
+      "No load will be clicked or booked.\n\n" +
+      "All loads currently on screen will become the baseline. Only a new qualifying load detected afterward can be selected.\n\n" +
+      "The simulator will choose the highest payout and stop after one candidate.\n\n" +
+      "Start monitoring?"
     );
     if (!confirmed) return;
+  }
+
+  if (settings.autoBook) {
+    settings.autoResume = false;
+    autoBookCandidate = null;
+    autoBookAwaitingBaseline = true;
+    seenLoads.clear();
+    missingCounts.clear();
+    recentlyMissingLoads.clear();
+    goneLoads.clear();
+    alertedLoads = [];
+    isFirstPoll = true;
+    saveSettings();
   }
 
   botStarting = true;
@@ -5566,7 +5736,7 @@ async function startBot(options = {}) {
     console.warn("[Bot] Startup watchdog recovered from stuck Starting state.");
     botStarting = false;
     botRunning = true;
-    isFirstPoll = seenLoads.size === 0;
+    isFirstPoll = settings.autoBook ? true : seenLoads.size === 0;
     doPoll();
     scheduleNext();
     if (aiModeActive) injectCards();
@@ -5587,13 +5757,14 @@ async function startBot(options = {}) {
     goneLoads.clear();
     document.querySelectorAll(".load-card.rfx-new-detected").forEach(card => card.classList.remove("rfx-new-detected"));
     botRunning = true;
-    isFirstPoll = seenLoads.size === 0; // Only baseline if this page session has no seen loads yet
+    isFirstPoll = settings.autoBook ? true : seenLoads.size === 0;
     try { chrome.runtime.sendMessage({ action: "botStarted" }).catch(() => {}); } catch {}
     doPoll(); // immediate first poll
     scheduleNext();
   } catch (err) {
     console.error("[Bot] Start failed:", err);
     botRunning = false;
+    autoBookAwaitingBaseline = false;
   } finally {
     botStarting = false;
     if (botStartWatchdog) {
@@ -5613,10 +5784,10 @@ function cancelAutoResume() {
 
 function scheduleAutoResume(reason = "stopped") {
   cancelAutoResume();
-  if (!settings.autoResume || botRunning || botStarting) return;
+  if (settings.autoBook || !settings.autoResume || botRunning || botStarting) return;
   autoResumeTimer = setTimeout(() => {
     autoResumeTimer = null;
-    if (!settings.autoResume || botRunning || botStarting) return;
+    if (settings.autoBook || !settings.autoResume || botRunning || botStarting) return;
     startBot({ skipAutoBookConfirm: true });
   }, 5000);
 }
@@ -5624,11 +5795,12 @@ function scheduleAutoResume(reason = "stopped") {
 function stopBot(options = {}) {
   botStarting = false;
   botRunning = false;
+  autoBookAwaitingBaseline = false;
   if (botStartWatchdog) { clearTimeout(botStartWatchdog); botStartWatchdog = null; }
   if (botTimer) { clearTimeout(botTimer); botTimer = null; }
   try { chrome.runtime.sendMessage({ action: "botStopped" }).catch(() => {}); } catch {}
   if (aiModeActive) injectCards();
-  if (options.allowAutoResume !== false) scheduleAutoResume(options.reason || "stop");
+  if (!settings.autoBook && options.allowAutoResume !== false) scheduleAutoResume(options.reason || "stop");
 }
 
 function resetBot() {
@@ -5639,6 +5811,8 @@ function resetBot() {
   recentlyMissingLoads.clear();
   alertedLoads = [];
   goneLoads.clear();
+  autoBookAwaitingBaseline = false;
+  autoBookCandidate = null;
   isFirstPoll = true;
   lastPollTime = null;
   if (aiModeActive) injectCards();
@@ -5668,23 +5842,38 @@ function handleDetectedAlerts(alerts, sourceLabel = "Bot") {
 
   const newLoads = alerts.filter(a => a.badge === "NEW");
 
-  if (settings.autoBook && newLoads.length > 0) {
-    playAlert();
-    const target = newLoads[0];
-    alertedLoads.push(...alerts);
+  if (settings.autoBook) {
+    const selected = selectAutoBookCandidate(newLoads);
+    if (!selected) return false;
+
+    const wo = selected.alert.wo;
+    autoBookCandidate = {
+      woId: wo.id,
+      payout: selected.evaluation.payout,
+      pickupMs: selected.evaluation.pickupMs,
+      standMinutes: selected.evaluation.standMinutes,
+      selectedAt: Date.now(),
+      source: sourceLabel,
+    };
+    alertedLoads = [{ ...selected.alert, badge: "WOULD BOOK", badgeClass: "badge-autobook" }];
+    botStarting = false;
     botRunning = false;
+    autoBookAwaitingBaseline = false;
+    cancelAutoResume();
+    if (botStartWatchdog) { clearTimeout(botStartWatchdog); botStartWatchdog = null; }
     if (botTimer) { clearTimeout(botTimer); botTimer = null; }
-    if (aiModeActive) injectCards();
-    scheduleAutoResume("new load detected");
-    setTimeout(() => autoBookLoad(target.wo.id), 100);
-  } else {
-    botRunning = false;
-    if (botTimer) { clearTimeout(botTimer); botTimer = null; }
-    alertedLoads.push(...alerts);
+    try { chrome.runtime.sendMessage({ action: "botStopped" }).catch(() => {}); } catch {}
     playAlert();
     if (aiModeActive) injectCards();
-    scheduleAutoResume("new load detected");
+    return true;
   }
+
+  botRunning = false;
+  if (botTimer) { clearTimeout(botTimer); botTimer = null; }
+  alertedLoads.push(...alerts);
+  playAlert();
+  if (aiModeActive) injectCards();
+  scheduleAutoResume("new load detected");
 
   return true;
 }
@@ -5720,6 +5909,7 @@ window.addEventListener("relay-fetcher-poll-result", (e) => {
     const { status, data, error, seq } = JSON.parse(e.detail);
     const pollSeq = Number(seq);
     if (Number.isFinite(pollSeq) && pollSeq < latestAutoSearchSeq) return;
+    if (!botRunning && !botStarting) return;
 
     if (error || data?.errorCode) {
       const msg = error || data?.defaultErrorMessage || "";
@@ -5743,6 +5933,24 @@ window.addEventListener("relay-fetcher-poll-result", (e) => {
     const loads = filterCustomExcludedLoads(rawLoads);
     carrierDetails = data?.carrierDetails || carrierDetails;
     currentSearchAuditId = data?.searchAuditId || currentSearchAuditId;
+
+    // The first poll after a manual auto-booker start is baseline-only. Every load in
+    // this response is treated as pre-existing and can never become a candidate.
+    if (settings.autoBook && autoBookAwaitingBaseline) {
+      autoBookAwaitingBaseline = false;
+      pendingPartialSearchSignature = "";
+      allLoads = dedupeLoads(loads);
+      alertedLoads = [];
+      missingCounts.clear();
+      recentlyMissingLoads.clear();
+      goneLoads.clear();
+      seedSeenLoads(allLoads);
+      isFirstPoll = false;
+      if (loads.length > 0) lastNonEmptySearchAt = Date.now();
+      processLookoutAlerts(allLoads, "auto-book-baseline");
+      if (aiModeActive) injectCards();
+      return;
+    }
 
     // If a filter change has only delivered Amazon's first page so far, this full bot
     // poll completes the new baseline. Do not classify later pages as newly found loads.
@@ -6177,94 +6385,6 @@ window.addEventListener("relay-fetcher-chat-intercepted", (e) => {
     console.error("[Negotiator] Chat intercept error:", err);
   }
 });
-
-// ============================================================
-// AUTO-BOOK — clicks Book only, never Confirm
-// ============================================================
-async function autoBookLoad(woId) {
-  const wo = allLoads.find(w => w.id === woId);
-
-  // Close any open panel
-  document.dispatchEvent(new KeyboardEvent("keydown", { key: "Escape", bubbles: true }));
-  await sleep(200);
-
-  // Refresh and search — up to 5 attempts
-  const loadRow = await refreshUntilFound(woId, wo, 5);
-
-  if (!loadRow) {
-    console.warn("[AutoBook] Could not find load after 5 refresh attempts for:", woId);
-    showToast("Auto-book: Could not find load after multiple refreshes");
-    return;
-  }
-
-  const clickTarget = loadRow.querySelector("a") || loadRow.querySelector("[role='button']") || loadRow;
-  clickTarget.click();
-  await sleep(500);
-
-  // Find the Book button
-  let bookBtn = null;
-  const allButtons = document.querySelectorAll("button, [role='button']");
-  for (const btn of allButtons) {
-    if (btn.closest("#rfx-host")) continue;
-    const txt = (btn.textContent || "").trim().toLowerCase();
-    const label = (btn.getAttribute("aria-label") || "").toLowerCase();
-    if (txt === "book" || txt === "book load" || txt === "book this load" || label.includes("book")) {
-      if (!txt.includes("confirm") && !txt.includes("accept")) {
-        bookBtn = btn;
-        break;
-      }
-    }
-  }
-
-  if (!bookBtn) {
-    console.warn("[AutoBook] Could not find Book button");
-    showToast("Auto-book: Could not find Book button");
-    return;
-  }
-
-  // === BOOKING DISABLED FOR SAFETY — uncomment to enable ===
-  // await sleep(200);
-  // bookBtn.click();
-  // await sleep(500);
-  //
-  // let confirmBtn = null;
-  // const confirmArea = document.querySelector("#confirmation-expander, [data-id='confirmation-expander']");
-  // if (confirmArea) {
-  //   const btns = confirmArea.querySelectorAll("button, [role='button']");
-  //   for (const btn of btns) {
-  //     const txt = (btn.textContent || "").trim().toLowerCase();
-  //     if (txt.includes("book") || txt.includes("confirm") || txt.includes("yes") || txt.includes("accept")) {
-  //       confirmBtn = btn; break;
-  //     }
-  //   }
-  // }
-  // if (!confirmBtn) {
-  //   const allBtns2 = document.querySelectorAll("button, [role='button']");
-  //   for (const btn of allBtns2) {
-  //     if (btn.closest("#rfx-host")) continue;
-  //     if (btn === bookBtn) continue;
-  //     const txt = (btn.textContent || "").trim().toLowerCase();
-  //     if (txt === "confirm" || txt === "yes" || txt === "book this trip" || txt === "confirm booking" || txt.includes("yes") || txt.includes("confirm")) {
-  //       confirmBtn = btn; break;
-  //     }
-  //   }
-  // }
-  // if (!confirmBtn) {
-  //   bookingState.set(woId, "pending");
-  //   if (aiModeActive) injectCards();
-  //   showToast("Auto-book: Book clicked but could not find Confirm — confirm manually");
-  //   return;
-  // }
-  // await sleep(200);
-  // confirmBtn.click();
-  // bookingState.set(woId, "confirmed");
-  // if (aiModeActive) injectCards();
-  // showToast("Auto-book: Load booked successfully!");
-  // playBookedSound();
-  // === END BOOKING DISABLED ===
-
-  showToast("Auto-book: Found load but booking is disabled for safety");
-}
 
 // ============================================================
 // BOOK — multi-step DOM automation (manual)
