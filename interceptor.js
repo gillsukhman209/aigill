@@ -8,6 +8,7 @@
   const _origFetch = window.fetch;
   const _origXHROpen = XMLHttpRequest.prototype.open;
   const _origXHRSend = XMLHttpRequest.prototype.send;
+  const _origXHRSetRequestHeader = XMLHttpRequest.prototype.setRequestHeader;
 
   function isSimilarRequest(url) {
     try {
@@ -36,21 +37,62 @@
   }
 
   function looksLikePatPayload(payload) {
+    const hasOrigin = !!(payload?.originCityInfo || payload?.originLocation || payload?.startLocation);
+    const hasDestination = !!(
+      (Array.isArray(payload?.endLocationList) && payload.endLocationList.length) ||
+      payload?.destinationCityInfo ||
+      payload?.destinationLocation ||
+      payload?.endLocation
+    );
+    const hasPrice = !!(payload?.totalCost || payload?.payout || payload?.minimumPayout);
+    const hasEquipment = !!(payload?.providedTrailerType || payload?.equipmentType || payload?.equipmentTypes);
     return !!(
       payload &&
       typeof payload === "object" &&
-      payload.runType &&
-      payload.payoutType === "FLAT_RATE" &&
-      payload.originCityInfo &&
-      Array.isArray(payload.endLocationList) &&
-      payload.totalCost &&
-      payload.providedTrailerType
+      hasOrigin &&
+      hasDestination &&
+      payload.startTime &&
+      payload.endTime &&
+      hasPrice &&
+      (payload.runType || hasEquipment)
     );
+  }
+
+  function isPatCreateRequest(url, payload) {
+    if (!looksLikePatPayload(payload)) return false;
+    if (payload.id || payload.orderId || payload.alias || payload.status || payload.demandId || payload.linkedOrderId) return false;
+    try {
+      const parsedUrl = new URL(url, window.location.href);
+      if (parsedUrl.hostname !== "relay.amazon.com") return false;
+      const path = parsedUrl.pathname.toLowerCase().replace(/\/+$/, "");
+      const prefix = "/api/loadboard/orders";
+      if (path === prefix) return true;
+      if (!path.startsWith(`${prefix}/`)) return false;
+      const segments = path.slice(prefix.length + 1).split("/").filter(Boolean);
+      if (!segments.length || segments.length > 2) return false;
+      if (segments.some(segment => !/^[a-z][a-z0-9-]*$/.test(segment))) return false;
+      return !segments.some(segment => /^(?:get|list|cancel|update|edit|preview|match|search|delete|status|close|expire|repost)$/.test(segment));
+    } catch {
+      return false;
+    }
+  }
+
+  function capturePatCreateRequest(url, payload) {
+    if (payload?._isRelayFetcher || payload?._isNegotiator || !isPatCreateRequest(url, payload)) return false;
+    lastPatRequest = {
+      url: new URL(url, window.location.href).href,
+      payload,
+    };
+    window.dispatchEvent(new CustomEvent("relay-fetcher-pat-template", {
+      detail: JSON.stringify(lastPatRequest),
+    }));
+    return true;
   }
 
   XMLHttpRequest.prototype.open = function (method, url, ...rest) {
     this.__relayFetcherBlockedSimilar = isSimilarRequest(url);
     this.__relayFetcherBlockedUrl = url;
+    this.__relayFetcherMethod = String(method || "GET").toUpperCase();
     return _origXHROpen.call(this, method, url, ...rest);
   };
 
@@ -61,7 +103,21 @@
       } catch (e) {}
       return;
     }
+    if (this.__relayFetcherMethod === "POST" && this.__relayFetcherBlockedUrl && args[0]) {
+      try {
+        const payload = typeof args[0] === "string" ? JSON.parse(args[0]) : null;
+        if (payload) capturePatCreateRequest(this.__relayFetcherBlockedUrl, payload);
+      } catch (e) {}
+    }
     return _origXHRSend.apply(this, args);
+  };
+
+  XMLHttpRequest.prototype.setRequestHeader = function (name, value) {
+    const headerName = String(name || "").toLowerCase();
+    if (headerName === "x-csrf-token" || headerName === "anti-csrftoken-a2z") {
+      capturedCsrfToken = String(value || "");
+    }
+    return _origXHRSetRequestHeader.call(this, name, value);
   };
 
   window.fetch = async function (...args) {
@@ -72,12 +128,13 @@
       return new Response(null, { status: 204, statusText: "Blocked by Relay Fetcher" });
     }
 
-    if (config?.headers) {
+    const requestHeaders = config?.headers || resource?.headers;
+    if (requestHeaders) {
       let token = null;
-      if (config.headers instanceof Headers) {
-        token = config.headers.get("x-csrf-token") || config.headers.get("anti-csrftoken-a2z");
-      } else if (typeof config.headers === "object") {
-        token = config.headers["x-csrf-token"] || config.headers["anti-csrftoken-a2z"];
+      if (requestHeaders instanceof Headers) {
+        token = requestHeaders.get("x-csrf-token") || requestHeaders.get("anti-csrftoken-a2z");
+      } else if (typeof requestHeaders === "object") {
+        token = requestHeaders["x-csrf-token"] || requestHeaders["anti-csrftoken-a2z"];
       }
       if (token) capturedCsrfToken = token;
     }
@@ -148,20 +205,17 @@
       return response;
     }
 
-    // Capture Amazon's own Post-A-Truck create/update request so our content script can reuse the
+    // Capture Amazon's own Post-A-Truck create request so our content script can reuse the
     // current endpoint and baseline request shape instead of guessing private routes.
-    if (config?.method === "POST" && config?.body) {
+    const requestMethod = String(config?.method || resource?.method || "GET").toUpperCase();
+    if (requestMethod === "POST") {
       try {
-        const parsed = JSON.parse(config.body);
-        if (!parsed._isRelayFetcher && !parsed._isNegotiator && looksLikePatPayload(parsed)) {
-          lastPatRequest = {
-            url: new URL(url, window.location.href).href,
-            payload: parsed,
-          };
-          window.dispatchEvent(new CustomEvent("relay-fetcher-pat-template", {
-            detail: JSON.stringify(lastPatRequest),
-          }));
-        }
+        const bodyText = typeof config?.body === "string"
+          ? config.body
+          : resource?.clone && url.includes("/api/loadboard/orders")
+            ? await resource.clone().text()
+            : "";
+        if (bodyText) capturePatCreateRequest(url, JSON.parse(bodyText));
       } catch (e) {}
     }
 
@@ -175,11 +229,16 @@
     let nextToken = firstPageData.nextItemToken;
     let totalResults = firstPageData.totalResultsSize || allLoads.length;
     let pageNum = 1;
+    const seenPageTokens = new Set();
 
     try {
-      while (nextToken != null && allLoads.length < totalResults && pageNum < 10) {
+      while (nextToken != null && allLoads.length < totalResults) {
         if (searchSeq !== autoSearchSeq) return;
+        const tokenKey = JSON.stringify(nextToken);
+        if (seenPageTokens.has(tokenKey)) throw new Error("Relay repeated a pagination token");
+        seenPageTokens.add(tokenKey);
         pageNum++;
+        if (pageNum > 100) throw new Error("Relay pagination exceeded 100 pages");
         const payload = { ...basePayload, nextItemToken: nextToken, resultSize: 50, _isRelayFetcher: true };
         const response = await _origFetch("https://relay.amazon.com/api/loadboard/search", {
           method: "POST",
@@ -258,10 +317,15 @@
     const allLoads = [];
     let carrierDetails = null, searchAuditId = null;
     let nextToken = 0, totalResults = 0, pageNum = 0;
+    const seenPageTokens = new Set();
 
     try {
       while (true) {
+        const tokenKey = JSON.stringify(nextToken);
+        if (seenPageTokens.has(tokenKey)) throw new Error("Relay repeated a pagination token");
+        seenPageTokens.add(tokenKey);
         pageNum++;
+        if (pageNum > 100) throw new Error("Relay pagination exceeded 100 pages");
         const payload = { ...basePayload, nextItemToken: nextToken, resultSize: 50, _isRelayFetcher: true };
         const response = await _origFetch("https://relay.amazon.com/api/loadboard/search", {
           method: "POST",
@@ -302,9 +366,10 @@
     const request = JSON.parse(e.detail);
     let basePayload = lastSearchPayload || request.payload;
     const searchSeq = autoSearchSeq;
+    const requestId = request.requestId;
     if (!basePayload) {
       window.dispatchEvent(new CustomEvent("relay-fetcher-poll-result", {
-        detail: JSON.stringify({ error: "No search filters. Search on the page first.", seq: searchSeq }),
+        detail: JSON.stringify({ error: "No search filters. Search on the page first.", seq: searchSeq, requestId }),
       }));
       return;
     }
@@ -326,9 +391,16 @@
       const allLoads = [];
       let carrierDetails = null, searchAuditId = null;
       let nextToken = 0, totalResults = 0, lastStatus = 200;
+      let pageNum = 0;
+      const seenPageTokens = new Set();
 
       while (true) {
         if (searchSeq !== autoSearchSeq) return;
+        const tokenKey = JSON.stringify(nextToken);
+        if (seenPageTokens.has(tokenKey)) throw new Error("Relay repeated a pagination token");
+        seenPageTokens.add(tokenKey);
+        pageNum++;
+        if (pageNum > 100) throw new Error("Relay pagination exceeded 100 pages");
         const payload = { ...basePayload, nextItemToken: nextToken, resultSize: 50, _isRelayFetcher: true };
         const response = await _origFetch("https://relay.amazon.com/api/loadboard/search", {
           method: "POST",
@@ -341,7 +413,7 @@
         if (searchSeq !== autoSearchSeq) return;
         if (data.errorCode) {
           window.dispatchEvent(new CustomEvent("relay-fetcher-poll-result", {
-            detail: JSON.stringify({ status: response.status, data, seq: searchSeq }),
+            detail: JSON.stringify({ status: response.status, data, seq: searchSeq, requestId }),
           }));
           return;
         }
@@ -366,12 +438,12 @@
       if (searchSeq !== autoSearchSeq) return;
       if (csrfToken && !capturedCsrfToken) capturedCsrfToken = csrfToken;
       window.dispatchEvent(new CustomEvent("relay-fetcher-poll-result", {
-        detail: JSON.stringify({ status: lastStatus, data, seq: searchSeq }),
+        detail: JSON.stringify({ status: lastStatus, data, seq: searchSeq, requestId }),
       }));
     } catch (err) {
       if (searchSeq !== autoSearchSeq) return;
       window.dispatchEvent(new CustomEvent("relay-fetcher-poll-result", {
-        detail: JSON.stringify({ error: err.message, seq: searchSeq }),
+        detail: JSON.stringify({ error: err.message, seq: searchSeq, requestId }),
       }));
     }
   });
@@ -455,9 +527,9 @@
   window.addEventListener("relay-fetcher-pat-post", async (e) => {
     const req = JSON.parse(e.detail);
     const url = req.url || lastPatRequest?.url;
-    if (!url) {
+    if (!url || !isPatCreateRequest(url, req.payload)) {
       window.dispatchEvent(new CustomEvent("relay-fetcher-pat-post-result", {
-        detail: JSON.stringify({ woId: req.woId, error: "No PAT endpoint captured" }),
+        detail: JSON.stringify({ woId: req.woId, error: "No validated PAT create endpoint captured" }),
       }));
       return;
     }

@@ -5,13 +5,24 @@
 // INJECT INTERCEPTOR INTO MAIN WORLD
 // Safari doesn't support "world": "MAIN" in manifest, so we inject manually
 // ============================================================
-(function injectInterceptor() {
+const INTERCEPTOR_MARKER = "rfxInterceptorInjected";
+function ensureInterceptorInjected() {
   if (!/\/loadboard(?:\/|$)/.test(window.location.pathname || "")) return;
+  const root = document.documentElement || document.head || document.body;
+  if (!root || root.dataset[INTERCEPTOR_MARKER] === "1") return;
+  const runtime = globalThis.chrome?.runtime || globalThis.browser?.runtime;
+  if (!runtime?.getURL) return;
+  root.dataset[INTERCEPTOR_MARKER] = "1";
   const script = document.createElement("script");
-  script.src = chrome.runtime.getURL("interceptor.js");
+  script.src = runtime.getURL("interceptor.js");
   script.onload = () => script.remove();
-  (document.documentElement || document.head || document.body).prepend(script);
-})();
+  script.onerror = () => {
+    delete root.dataset[INTERCEPTOR_MARKER];
+    script.remove();
+  };
+  root.prepend(script);
+}
+ensureInterceptorInjected();
 
 // ============================================================
 // STATE
@@ -29,7 +40,6 @@ let currentSearchAuditId = null;
 let currentSearchSignature = "";
 let pendingPartialSearchSignature = "";
 let latestAutoSearchSeq = 0;
-let lastNonEmptySearchAt = 0;
 
 // Settings (persisted to localStorage)
 const SETTINGS_KEY = "rfx_settings";
@@ -161,7 +171,6 @@ function loadSettings() {
   if (!settings.hideFuzzyPatFooterUserSet) settings.hideFuzzyPatFooter = true;
   if (settings.autoBook) {
     settings.autoResume = false;
-    settings.amazonOnlyFacilities = true;
   }
 }
 function saveSettings() {
@@ -653,6 +662,7 @@ let lookoutProcessing = false;
 const PAT_ENDPOINT_KEY = "rfx_pat_endpoint_v1";
 const PAT_TEMPLATE_KEY = "rfx_pat_template_v1";
 const PAT_ORDERS_KEY = "rfx_pat_orders_v1";
+const PAT_CITIES_KEY = "rfx_pat_cities_v1";
 
 // Negotiation state
 const negotiationState = new Map();
@@ -670,20 +680,23 @@ let botRunning = false;
 let botStarting = false;
 let settingsOpen = false;
 let activeSettingsTab = "quick";
+let pendingInjectAfterEdit = false;
+let injectFocusRoot = null;
 let botTimer = null;
 let botStartWatchdog = null;
 let autoResumeTimer = null;
+let pollInFlight = false;
+let nextPollRequestId = 0;
+let activePollRequestId = 0;
 let lastPollTime = null;
 let lastRefreshInterval = null;
 let isFirstPoll = true;
 const seenLoads = new Map(); // id -> { version, payout, pickupTime }
 const missingCounts = new Map(); // id -> consecutive miss count
-const recentlyMissingLoads = new Map(); // id -> expiry timestamp, prevents pagination churn from re-alerting
 let alertedLoads = []; // loads in the "new load detected" section
 let goneLoads = new Set(); // ids fading out
 let autoBookAwaitingBaseline = false;
 let autoBookCandidate = null;
-const RECENTLY_MISSING_TTL_MS = 5 * 60 * 1000;
 
 // ============================================================
 // UTILITIES
@@ -824,7 +837,7 @@ function getStopTimeMs(stop, preferCheckout = false) {
 
 function hasCoords(stop) {
   const loc = stop?.location;
-  return Number.isFinite(Number(loc?.latitude)) && Number.isFinite(Number(loc?.longitude));
+  return finiteCoordinate(loc?.latitude) !== null && finiteCoordinate(loc?.longitude) !== null;
 }
 
 function stopDistanceMiles(a, b) {
@@ -851,7 +864,25 @@ function getSavedPatTemplate() {
 }
 
 function getSavedPatEndpoint() {
-  return localStorage.getItem(PAT_ENDPOINT_KEY) || "";
+  const endpoint = localStorage.getItem(PAT_ENDPOINT_KEY) || "";
+  return isSafePatCreateEndpoint(endpoint) ? endpoint : "";
+}
+
+function isSafePatCreateEndpoint(value) {
+  try {
+    const url = new URL(String(value || ""), window.location.href);
+    if (url.hostname !== "relay.amazon.com") return false;
+    const path = url.pathname.toLowerCase().replace(/\/+$/, "");
+    const prefix = "/api/loadboard/orders";
+    if (path === prefix) return true;
+    if (!path.startsWith(`${prefix}/`)) return false;
+    const segments = path.slice(prefix.length + 1).split("/").filter(Boolean);
+    if (!segments.length || segments.length > 2) return false;
+    if (segments.some(segment => !/^[a-z][a-z0-9-]*$/.test(segment))) return false;
+    return !segments.some(segment => /^(?:get|list|cancel|update|edit|preview|match|search|delete|status|close|expire|repost)$/.test(segment));
+  } catch {
+    return false;
+  }
 }
 
 function isUuidLike(value) {
@@ -948,6 +979,79 @@ function cityInfoFromStop(stop) {
   };
 }
 
+function patCoordinate(value) {
+  if (value == null || value === "") return null;
+  const coordinate = Number(value);
+  return Number.isFinite(coordinate) ? coordinate : null;
+}
+
+function normalizeCanonicalPatCityInfo(value) {
+  if (!value || typeof value !== "object") return null;
+  const name = String(value.name || value.cityName || "").trim();
+  const stateCode = String(value.stateCode || value.cityStateCode || "").trim().toUpperCase();
+  const latitude = patCoordinate(value.latitude ?? value.cityLatitude);
+  const longitude = patCoordinate(value.longitude ?? value.cityLongitude);
+  if (!name || !stateCode || latitude == null || longitude == null) return null;
+  return {
+    ...value,
+    name,
+    stateCode,
+    country: value.country || "US",
+    latitude,
+    longitude,
+    displayValue: String(value.displayValue || value.cityDisplayValue || `${name}, ${stateCode}`).trim(),
+  };
+}
+
+function patCityKey(value) {
+  const city = normalizeCanonicalPatCityInfo(value);
+  return city ? `${normalizeCityText(city.name)}|${normalizeStateCode(city.stateCode)}` : "";
+}
+
+function collectCanonicalPatCities(value, out = [], seen = new WeakSet()) {
+  if (!value || typeof value !== "object" || seen.has(value)) return out;
+  seen.add(value);
+  const city = normalizeCanonicalPatCityInfo(value);
+  if (city) out.push(city);
+  if (Array.isArray(value)) {
+    value.forEach(item => collectCanonicalPatCities(item, out, seen));
+  } else {
+    Object.values(value).forEach(item => collectCanonicalPatCities(item, out, seen));
+  }
+  return out;
+}
+
+function getSavedPatCities() {
+  try {
+    const values = JSON.parse(localStorage.getItem(PAT_CITIES_KEY) || "[]");
+    return collectCanonicalPatCities(Array.isArray(values) ? values : []);
+  } catch {
+    return [];
+  }
+}
+
+function rememberCanonicalPatCities(...values) {
+  const cities = new Map(getSavedPatCities().map(city => [patCityKey(city), city]));
+  for (const city of collectCanonicalPatCities(values)) {
+    const key = patCityKey(city);
+    if (key) cities.set(key, city);
+  }
+  try { localStorage.setItem(PAT_CITIES_KEY, JSON.stringify([...cities.values()])); } catch {}
+}
+
+function findCanonicalPatCity(cityInfo) {
+  const wantedName = normalizeCityText(cityInfo?.name);
+  const wantedState = normalizeStateCode(cityInfo?.stateCode);
+  if (!wantedName || !wantedState) return null;
+  const candidates = [
+    ...getSavedPatCities(),
+    ...collectCanonicalPatCities(getSavedPatTemplate()),
+  ];
+  return candidates.find(city =>
+    normalizeCityText(city.name) === wantedName && normalizeStateCode(city.stateCode) === wantedState
+  ) || null;
+}
+
 function getPatRunType(wo) {
   const raw = String(wo?.workOpportunityType || wo?.tripType || "").toUpperCase();
   if (raw.includes("ROUND")) return "ROUND_TRIP";
@@ -972,6 +1076,12 @@ function getPatLoadingTypes(wo) {
   return Array.from(values);
 }
 
+function shiftPatTime(isoValue, minutes) {
+  const timestamp = new Date(isoValue || "").getTime();
+  if (!Number.isFinite(timestamp)) return isoValue || "";
+  return new Date(timestamp + minutes * 60000).toISOString();
+}
+
 function getPatPrefill(wo) {
   const stops = getAllStops(wo);
   const first = stops[0] || null;
@@ -980,17 +1090,20 @@ function getPatPrefill(wo) {
   const dist = Number(wo?.totalDistance?.value) || 0;
   const startIso = getStopCheckin(first) || getStopCheckout(first) || "";
   const endIso = getStopCheckout(last) || getStopCheckin(last) || startIso;
-  const pricePerMi = dist > 0 ? pay / dist : 0;
+  const originLabel = cityInfoFromStop(first);
+  const destinationLabel = cityInfoFromStop(last);
   return {
-    startTime: startIso,
-    endTime: endIso,
-    payout: Math.round(pay),
-    pricePerMi: Number(pricePerMi.toFixed(2)),
+    startTime: shiftPatTime(startIso, -20),
+    endTime: shiftPatTime(endIso, 20),
+    payout: Math.ceil(pay + 50),
+    pricePerMi: "",
     distanceMin: dist ? Math.max(0, Math.floor(dist - 1)) : 0,
     distanceMax: dist ? Math.ceil(dist + 1) : 0,
     stemTime: 60,
-    origin: cityInfoFromStop(first),
-    destination: cityInfoFromStop(last),
+    origin: findCanonicalPatCity(originLabel),
+    destination: findCanonicalPatCity(destinationLabel),
+    originLabel: originLabel.displayValue,
+    destinationLabel: destinationLabel.displayValue,
     originRadius: 25,
     destinationRadius: 25,
     runType: getPatRunType(wo),
@@ -1002,8 +1115,9 @@ function getPatPrefill(wo) {
 
 function buildPatPayload(wo, values) {
   const template = getSavedPatTemplate() || {};
-  const origin = values.origin || getPatPrefill(wo).origin;
-  const destination = values.destination || getPatPrefill(wo).destination;
+  const origin = normalizeCanonicalPatCityInfo(values.origin);
+  const destination = normalizeCanonicalPatCityInfo(values.destination);
+  if (!origin || !destination) throw new Error("PAT cities must be selected from Relay city data");
   const payout = Number(values.payout) || 0;
   const pricePerMi = Number(values.pricePerMi) || 0;
   const distanceMin = Number(values.distanceMin) || 0;
@@ -1073,21 +1187,6 @@ function buildPatPayload(wo, values) {
   return payload;
 }
 
-function parseCityInfoInput(value, fallback) {
-  const raw = String(value || "").trim();
-  if (!raw) return fallback;
-  const parts = raw.split(",").map(v => v.trim()).filter(Boolean);
-  const city = parts[0] || fallback?.name || "";
-  const state = parts[1] || fallback?.stateCode || "";
-  return {
-    ...(fallback || {}),
-    name: city,
-    stateCode: state,
-    country: fallback?.country || "US",
-    displayValue: [city, state].filter(Boolean).join(", "),
-  };
-}
-
 function renderPatButton(wo) {
   if (!settings.patEnabled || !wo?.id) return "";
   const state = patState.get(wo.id) || "idle";
@@ -1105,9 +1204,10 @@ function renderPatModal() {
   const wo = findLoadForAction(patModalWoId);
   if (!wo) return "";
   const p = getPatPrefill(wo);
-  const originLabel = p.origin.displayValue || "";
-  const destinationLabel = p.destination.displayValue || "";
+  const originLabel = p.origin?.displayValue || p.originLabel || "";
+  const destinationLabel = p.destination?.displayValue || p.destinationLabel || "";
   const endpointKnown = !!getSavedPatEndpoint();
+  const citiesResolved = !!(p.origin && p.destination);
   return `<div class="rfx-pat-backdrop" id="rfx-pat-backdrop">
     <form class="rfx-pat-modal" id="rfx-pat-form" data-pat-wo-id="${escapeHtml(wo.id)}">
       <div class="rfx-pat-head">
@@ -1128,17 +1228,18 @@ function renderPatModal() {
           <option value="ONE_WAY" ${p.runType === "ONE_WAY" ? "selected" : ""}>One-way</option>
           <option value="ROUND_TRIP" ${p.runType === "ROUND_TRIP" ? "selected" : ""}>Round trip</option>
         </select></div>
-        <div class="rfx-pat-field"><label>Origin</label><input type="text" name="origin" value="${escapeHtml(originLabel)}" required></div>
+        <div class="rfx-pat-field"><label>Origin</label><input type="text" name="origin" value="${escapeHtml(originLabel)}" readonly aria-readonly="true"></div>
         <div class="rfx-pat-field"><label>Radius</label><select name="originRadius">
           ${[15, 25, 50, 100, 250].map(v => `<option value="${v}" ${v === p.originRadius ? "selected" : ""}>${v} mi</option>`).join("")}
         </select></div>
-        <div class="rfx-pat-field"><label>Destination</label><input type="text" name="destination" value="${escapeHtml(destinationLabel)}" required></div>
+        <div class="rfx-pat-field"><label>Destination</label><input type="text" name="destination" value="${escapeHtml(destinationLabel)}" readonly aria-readonly="true"></div>
         <div class="rfx-pat-field"><label>Radius</label><select name="destinationRadius">
-          ${[15, 25, 50, 100, 250].map(v => `<option value="${v}" ${v === p.destinationRadius ? "selected" : ""}>${v} mi</option>`).join("")}
+          ${[25, 50, 100, 250].map(v => `<option value="${v}" ${v === p.destinationRadius ? "selected" : ""}>${v} mi</option>`).join("")}
         </select></div>
       </div>
-      <button type="submit" class="rfx-pat-submit">Submit</button>
-      ${endpointKnown ? "" : `<div class="rfx-pat-help">Open Amazon's Post A Truck page and submit or preview one PAT order once so this extension can learn Amazon's current PAT endpoint.</div>`}
+      <button type="submit" class="rfx-pat-submit" ${endpointKnown && citiesResolved ? "" : "disabled"}>Submit</button>
+      ${endpointKnown ? "" : `<div class="rfx-pat-help">Open Amazon's Post A Truck page and create one PAT order once so this extension can learn Amazon's current PAT endpoint.</div>`}
+      ${citiesResolved ? "" : `<div class="rfx-pat-help">Relay city data is missing for ${escapeHtml([!p.origin ? originLabel : "", !p.destination ? destinationLabel : ""].filter(Boolean).join(" and "))}. Select that city once in Amazon's Post A Truck form so the extension can reuse Relay's exact city record.</div>`}
     </form>
   </div>`;
 }
@@ -1716,7 +1817,6 @@ function ignoreLoad(woId) {
   alertedLoads = alertedLoads.filter(alert => alert?.wo?.id !== woId);
   seenLoads.delete(woId);
   missingCounts.delete(woId);
-  recentlyMissingLoads.delete(woId);
   goneLoads.delete(woId);
   if (aiModeActive) injectCards();
   showIgnoredLoadToast(woId);
@@ -1809,11 +1909,17 @@ function normalizeDetectionRule(rule) {
   };
 }
 
+function finiteCoordinate(value) {
+  if (value == null || value === "") return null;
+  const coordinate = Number(value);
+  return Number.isFinite(coordinate) ? coordinate : null;
+}
+
 function getStopCoordinates(stop) {
   const loc = stop?.location || {};
-  const lat = Number(loc.latitude);
-  const lon = Number(loc.longitude);
-  if (!Number.isFinite(lat) || !Number.isFinite(lon)) return null;
+  const lat = finiteCoordinate(loc.latitude);
+  const lon = finiteCoordinate(loc.longitude);
+  if (lat === null || lon === null) return null;
   return { lat, lon };
 }
 
@@ -1850,8 +1956,8 @@ function buildLookoutPlace(input, radiusMiles) {
     centerLabel: learned.label || String(input || "").trim(),
     cityKey: learned.key,
     radiusMiles: Math.max(1, Number(radiusMiles) || 25),
-    lat: Number.isFinite(Number(learned.lat)) ? Number(learned.lat) : null,
-    lon: Number.isFinite(Number(learned.lon)) ? Number(learned.lon) : null,
+    lat: finiteCoordinate(learned.lat),
+    lon: finiteCoordinate(learned.lon),
   };
 }
 
@@ -1865,8 +1971,8 @@ function normalizeLookoutPlace(place, fallbackRadius = 25) {
     centerLabel: place.centerLabel || fallback?.label || place.centerText || "",
     cityKey: cityKeyValue,
     radiusMiles: Math.max(1, Number(place.radiusMiles || fallbackRadius) || 25),
-    lat: Number.isFinite(Number(place.lat)) ? Number(place.lat) : (fallback ? fallback.lat : null),
-    lon: Number.isFinite(Number(place.lon)) ? Number(place.lon) : (fallback ? fallback.lon : null),
+    lat: finiteCoordinate(place.lat) ?? finiteCoordinate(fallback?.lat),
+    lon: finiteCoordinate(place.lon) ?? finiteCoordinate(fallback?.lon),
   };
 }
 
@@ -1893,8 +1999,10 @@ function normalizeLookoutGroup(group) {
 }
 
 function getLookoutPlaceCoords(place) {
-  if (Number.isFinite(Number(place?.lat)) && Number.isFinite(Number(place?.lon))) {
-    return { lat: Number(place.lat), lon: Number(place.lon) };
+  const lat = finiteCoordinate(place?.lat);
+  const lon = finiteCoordinate(place?.lon);
+  if (lat !== null && lon !== null) {
+    return { lat, lon };
   }
   const fallback = getFallbackCityCoords(place?.cityKey);
   if (fallback) return { lat: fallback.lat, lon: fallback.lon };
@@ -1914,11 +2022,11 @@ function refreshLookoutGroupCoordinates() {
   let changed = false;
   const groups = getLookoutGroups().map(group => {
     const places = (group.places || []).map(place => {
-      if (Number.isFinite(Number(place.lat)) && Number.isFinite(Number(place.lon))) return place;
+      if (finiteCoordinate(place.lat) !== null && finiteCoordinate(place.lon) !== null) return place;
       const learned = findCoordinatesForCityInput(place.centerLabel || place.centerText || "");
-      if (learned && Number.isFinite(Number(learned.lat)) && Number.isFinite(Number(learned.lon))) {
+      if (learned && finiteCoordinate(learned.lat) !== null && finiteCoordinate(learned.lon) !== null) {
         changed = true;
-        return { ...place, cityKey: place.cityKey || learned.key, centerLabel: place.centerLabel || learned.label, lat: Number(learned.lat), lon: Number(learned.lon) };
+        return { ...place, cityKey: place.cityKey || learned.key, centerLabel: place.centerLabel || learned.label, lat: finiteCoordinate(learned.lat), lon: finiteCoordinate(learned.lon) };
       }
       return place;
     });
@@ -1997,11 +2105,11 @@ function refreshDetectionGroupCoordinates() {
   let changed = false;
   const groups = getDetectionGroups().map(group => {
     const places = (group.places || []).map(place => {
-      if (Number.isFinite(Number(place.lat)) && Number.isFinite(Number(place.lon))) return place;
+      if (finiteCoordinate(place.lat) !== null && finiteCoordinate(place.lon) !== null) return place;
       const learned = findCoordinatesForCityInput(place.centerLabel || place.centerText || "");
-      if (learned && Number.isFinite(Number(learned.lat)) && Number.isFinite(Number(learned.lon))) {
+      if (learned && finiteCoordinate(learned.lat) !== null && finiteCoordinate(learned.lon) !== null) {
         changed = true;
-        return { ...place, cityKey: place.cityKey || learned.key, centerLabel: place.centerLabel || learned.label, lat: Number(learned.lat), lon: Number(learned.lon) };
+        return { ...place, cityKey: place.cityKey || learned.key, centerLabel: place.centerLabel || learned.label, lat: finiteCoordinate(learned.lat), lon: finiteCoordinate(learned.lon) };
       }
       return place;
     });
@@ -2409,7 +2517,7 @@ function renderLookoutSettings() {
   const groupOptions = groups.map(group => `<option value="${escapeHtml(group.id)}">${escapeHtml(group.name)}</option>`).join("");
   const groupsHtml = groups.length ? groups.map(group => {
     const places = (group.places || []).map(place => {
-      const coordText = Number.isFinite(Number(place.lat)) && Number.isFinite(Number(place.lon)) ? "" : " (city fallback)";
+      const coordText = finiteCoordinate(place.lat) !== null && finiteCoordinate(place.lon) !== null ? "" : " (city fallback)";
       return `<span class="rfx-lookout-place-chip">
         <span>${escapeHtml(place.centerLabel)}${coordText}</span>
         <input type="number" min="1" max="500" value="${Number(place.radiusMiles || 0)}" data-lookout-edit-place-radius="${escapeHtml(group.id)}:${escapeHtml(place.id)}" title="Radius miles">
@@ -2504,7 +2612,7 @@ function renderDetectionSettings() {
   };
   const groupsHtml = groups.length ? groups.map(group => {
     const places = (group.places || []).map(place => {
-      const coordText = Number.isFinite(Number(place.lat)) && Number.isFinite(Number(place.lon)) ? "" : " (city fallback)";
+      const coordText = finiteCoordinate(place.lat) !== null && finiteCoordinate(place.lon) !== null ? "" : " (city fallback)";
       return `<span class="rfx-lookout-place-chip">
         <span>${escapeHtml(place.centerLabel)}${coordText}</span>
         <input type="number" min="1" max="500" value="${Number(place.radiusMiles || 0)}" data-detection-edit-place-radius="${escapeHtml(group.id)}:${escapeHtml(place.id)}" title="Radius miles">
@@ -3001,20 +3109,6 @@ function dedupeLoads(loads) {
   return Array.from(map.values());
 }
 
-function hasVisibleAmazonLoadCards() {
-  return document.querySelectorAll(".load-card").length > 0;
-}
-
-function shouldIgnoreEmptySearchResult(sourceLabel) {
-  const hasDomLoads = hasVisibleAmazonLoadCards();
-  const recentlyHadLoads = Date.now() - lastNonEmptySearchAt < 5000;
-  const hasCustomLoads = allLoads.length > 0 || alertedLoads.length > 0;
-  const ignore = hasDomLoads || (hasCustomLoads && recentlyHadLoads);
-  if (ignore) {
-  }
-  return ignore;
-}
-
 function stableStringify(value) {
   if (Array.isArray(value)) return `[${value.map(stableStringify).join(",")}]`;
   if (value && typeof value === "object") {
@@ -3044,29 +3138,6 @@ function seedSeenLoads(loads) {
       pickupTime: wo.firstPickupTime || "",
     });
   }
-}
-
-function pruneRecentlyMissingLoads() {
-  const now = Date.now();
-  for (const [id, expiresAt] of recentlyMissingLoads) {
-    if (expiresAt <= now) recentlyMissingLoads.delete(id);
-  }
-}
-
-function markRecentlyMissing(id) {
-  if (!id) return;
-  recentlyMissingLoads.set(id, Date.now() + RECENTLY_MISSING_TTL_MS);
-}
-
-function wasRecentlyMissing(id) {
-  pruneRecentlyMissingLoads();
-  const expiresAt = recentlyMissingLoads.get(id);
-  if (!expiresAt) return false;
-  if (expiresAt <= Date.now()) {
-    recentlyMissingLoads.delete(id);
-    return false;
-  }
-  return true;
 }
 
 // ============================================================
@@ -3186,6 +3257,14 @@ function renderBookedTimeBlockSettings() {
 // SOUND — mp3 files from Sounds folder
 // ============================================================
 let audioCtx = null;
+const soundPlayers = new Map();
+const soundUrls = new Map();
+for (const filename of ["new_load.mp3", "successbook.mp3"]) {
+  try {
+    const runtime = globalThis.chrome?.runtime || globalThis.browser?.runtime;
+    if (runtime?.getURL) soundUrls.set(filename, runtime.getURL(`Sounds/${filename}`));
+  } catch {}
+}
 function ensureAudioCtx() {
   try {
     const AudioCtor = window.AudioContext || window.webkitAudioContext;
@@ -3197,23 +3276,73 @@ function ensureAudioCtx() {
   }
 }
 
-function playSound(filename) {
-  try {
-    const url = chrome.runtime.getURL(`Sounds/${filename}`);
-    const audio = new Audio(url);
-    audio.volume = 1.0;
-    audio.play().catch(e => console.warn("[Sound] Play failed:", e));
-  } catch (e) { console.warn("[Sound] Error:", e); }
+function getSoundPlayer(filename) {
+  let audio = soundPlayers.get(filename);
+  if (audio) return audio;
+  let url = soundUrls.get(filename);
+  if (!url) {
+    const runtime = globalThis.chrome?.runtime || globalThis.browser?.runtime;
+    if (!runtime?.getURL) throw new Error("Extension runtime unavailable. Reload the Relay tab.");
+    url = runtime.getURL(`Sounds/${filename}`);
+    soundUrls.set(filename, url);
+  }
+  audio = new Audio(url);
+  audio.preload = "auto";
+  audio.volume = 1.0;
+  soundPlayers.set(filename, audio);
+  return audio;
 }
 
-function playAlert() { playSound("new_load.mp3"); }
-function playBookedSound() { playSound("successbook.mp3"); }
+function unlockSoundPlayers() {
+  ensureAudioCtx();
+  for (const filename of ["new_load.mp3", "successbook.mp3"]) {
+    try {
+      const audio = getSoundPlayer(filename);
+      const wasMuted = audio.muted;
+      audio.muted = true;
+      const playback = audio.play();
+      if (!playback?.then) {
+        audio.pause();
+        try { audio.currentTime = 0; } catch {}
+        audio.muted = wasMuted;
+        continue;
+      }
+      playback.then(() => {
+        audio.pause();
+        try { audio.currentTime = 0; } catch {}
+        audio.muted = wasMuted;
+      }).catch((err) => {
+        audio.muted = wasMuted;
+        console.warn("[Sound] Unlock failed:", err);
+      });
+    } catch (err) {
+      console.warn("[Sound] Unlock failed:", err);
+    }
+  }
+}
+
+async function playSound(filename) {
+  try {
+    const audio = getSoundPlayer(filename);
+    audio.pause();
+    try { audio.currentTime = 0; } catch {}
+    audio.volume = 1.0;
+    await audio.play();
+    return true;
+  } catch (e) {
+    console.warn("[Sound] Play failed:", e);
+    return false;
+  }
+}
+
+function playAlert() { return playSound("new_load.mp3"); }
+function playBookedSound() { return playSound("successbook.mp3"); }
 
 // ============================================================
 // DETECTION LOGIC
 // ============================================================
-function detectChanges(newLoads) {
-  pruneRecentlyMissingLoads();
+function detectChanges(newLoads, options = {}) {
+  const trackMissing = options.trackMissing !== false;
 
   // Deduplicate by ID — if same load appears twice, keep the one with higher payout
   const dedupMap = new Map();
@@ -3253,14 +3382,8 @@ function detectChanges(newLoads) {
     const shortId = wo.id.substring(0, 8);
 
     if (!prev) {
-      if (wasRecentlyMissing(wo.id)) {
-        recentlyMissingLoads.delete(wo.id);
-        missingCounts.delete(wo.id);
-        goneLoads.delete(wo.id);
-      } else {
-        if (passesDetectionAlertRules(wo)) {
-          alerts.push({ wo, badge: "NEW", badgeClass: "badge-new" });
-        }
+      if (passesDetectionAlertRules(wo)) {
+        alerts.push({ wo, badge: "NEW", badgeClass: "badge-new" });
       }
       seenLoads.set(wo.id, { version: newVer, payout: newPay, pickupTime: newPickup });
     } else {
@@ -3298,25 +3421,28 @@ function detectChanges(newLoads) {
       } else {
       }
       missingCounts.delete(wo.id);
+      goneLoads.delete(wo.id);
     }
   }
 
-  // Case 4: Disappeared loads
-  for (const [id] of seenLoads) {
-    if (!currentIds.has(id)) {
-      const count = (missingCounts.get(id) || 0) + 1;
-      missingCounts.set(id, count);
-      markRecentlyMissing(id);
-      if (count >= 2) {
-        goneLoads.add(id);
-        setTimeout(() => {
-          if (!missingCounts.has(id)) return;
-          seenLoads.delete(id);
-          missingCounts.delete(id);
-          goneLoads.delete(id);
-          allLoads = allLoads.filter(w => w.id !== id);
-          if (aiModeActive) injectCards();
-        }, 5000);
+  // Only complete snapshots can prove that a load disappeared. Partial pages may
+  // detect additions immediately, but must never remove loads from other pages.
+  if (trackMissing) {
+    for (const [id] of seenLoads) {
+      if (!currentIds.has(id)) {
+        const count = (missingCounts.get(id) || 0) + 1;
+        missingCounts.set(id, count);
+        if (count >= 2) {
+          goneLoads.add(id);
+          setTimeout(() => {
+            if (!missingCounts.has(id)) return;
+            seenLoads.delete(id);
+            missingCounts.delete(id);
+            goneLoads.delete(id);
+            allLoads = allLoads.filter(w => w.id !== id);
+            if (aiModeActive) injectCards();
+          }, 5000);
+        }
       }
     }
   }
@@ -3350,6 +3476,9 @@ const CSS = `
   --rfx-warning-bg: #fff8e1;
   --rfx-warning-text: #8a5a00;
   --rfx-danger-bg: #fdecea;
+  --rfx-warning-card-bg: #fff4f4;
+  --rfx-warning-card-border: #e88f8f;
+  --rfx-warning-card-shadow: rgba(204, 51, 51, 0.16);
   --rfx-new-bg: #fff5e0;
   --rfx-profit-bg: #e6f7f2;
   --rfx-profit-border: #b7e4d2;
@@ -3385,6 +3514,9 @@ const CSS = `
   --rfx-warning-bg: #35270b;
   --rfx-warning-text: #ffd27a;
   --rfx-danger-bg: #3a1515;
+  --rfx-warning-card-bg: #2c1919;
+  --rfx-warning-card-border: #c95f5f;
+  --rfx-warning-card-shadow: rgba(248, 113, 113, 0.18);
   --rfx-new-bg: #2c2110;
   --rfx-profit-bg: #0f3129;
   --rfx-profit-border: #1f6d5b;
@@ -3419,6 +3551,9 @@ const CSS = `
     --rfx-warning-bg: #35270b;
     --rfx-warning-text: #ffd27a;
     --rfx-danger-bg: #3a1515;
+    --rfx-warning-card-bg: #2c1919;
+    --rfx-warning-card-border: #c95f5f;
+    --rfx-warning-card-shadow: rgba(248, 113, 113, 0.18);
     --rfx-new-bg: #2c2110;
     --rfx-profit-bg: #0f3129;
     --rfx-profit-border: #1f6d5b;
@@ -3596,6 +3731,11 @@ const CSS = `
 }
 .rfx-card:hover { box-shadow: var(--rfx-shadow); border-color: var(--rfx-muted); }
 .rfx-card.new-load { background: var(--rfx-new-bg); border-color: var(--rfx-orange); box-shadow: 0 0 12px rgba(255,153,0,0.25); }
+.rfx-card.warning-load,
+.rfx-card.warning-load:hover {
+  background: var(--rfx-warning-card-bg); border: 2px solid var(--rfx-warning-card-border);
+  box-shadow: 0 0 14px var(--rfx-warning-card-shadow);
+}
 .rfx-card.gone { opacity: 0.4; }
 
 .rfx-body { display: flex; gap: 24px; }
@@ -4282,6 +4422,7 @@ function renderCard(wo, extraClass, changeBadge) {
   const timingRisk = settings.showTimingRisk ? getTimingRisk(wo) : null;
   const stemWarning = getStemTimeWarning(wo);
   const timeConflict = settings.bookedTimeBlockMode === "warn" ? getBookedTimeConflict(wo) : null;
+  const hasWarning = !!(timingRisk || stemWarning || timeConflict);
   const privateLoad = isPrivateLoad(wo);
   const loadDisplayId = getLoadDisplayId(wo);
   const flexibleArrival = settings.showFlexibleArrivalWindow
@@ -4299,6 +4440,7 @@ function renderCard(wo, extraClass, changeBadge) {
     "rfx-card",
     goneLoads.has(wo.id) ? "gone" : "",
     bState === "pending" ? "booking-pending" : "",
+    hasWarning ? "warning-load" : "",
     extraClass || "",
   ].filter(Boolean).join(" ");
 
@@ -4655,12 +4797,34 @@ function placeCustomBoardHost() {
   return true;
 }
 
+function isEditingExtensionField() {
+  const active = shadowRoot?.activeElement;
+  return !!active?.matches?.("input:not([type='checkbox']):not([type='radio']):not([type='button']):not([type='submit']):not([type='reset']), textarea, select");
+}
+
+function installDeferredInjectListener() {
+  if (!shadowRoot || injectFocusRoot === shadowRoot) return;
+  injectFocusRoot = shadowRoot;
+  shadowRoot.addEventListener("focusout", () => {
+    setTimeout(() => {
+      if (!pendingInjectAfterEdit || isEditingExtensionField()) return;
+      pendingInjectAfterEdit = false;
+      injectCards();
+    }, 0);
+  });
+}
+
 // ============================================================
 // INJECT INTO AMAZON'S LOAD CARDS
 // ============================================================
 function injectCards() {
   if (!isLoadBoardPage()) return;
   if (!aiModeActive) return;
+  if (isEditingExtensionField()) {
+    pendingInjectAfterEdit = true;
+    return;
+  }
+  pendingInjectAfterEdit = false;
   applyPageTheme();
 
   // Find Amazon's load-list
@@ -4843,6 +5007,7 @@ function injectCards() {
 
   const customLoadBoard = renderCustomLoadBoard();
   shadowRoot.innerHTML = `<style>${CSS}</style><div class="rfx-root ${getThemeClass()}">${statusBar}${autoBookWarning}${settingsPanel}${customLoadBoard}${renderPatModal()}</div>`;
+  installDeferredInjectListener();
   syncChatVisibility();
 
   // Bind control panel listeners
@@ -4900,7 +5065,6 @@ function injectCards() {
       else if (key === "autoBook" && cb.checked) {
         settings.fastBook = false;
         settings.autoResume = false;
-        settings.amazonOnlyFacilities = true;
       }
       if (key === "autoBook") {
         cancelAutoResume();
@@ -5663,6 +5827,8 @@ function removeOurCards() {
   if (style) style.remove();
 
   if (ourHost) { ourHost.remove(); ourHost = null; shadowRoot = null; }
+  pendingInjectAfterEdit = false;
+  injectFocusRoot = null;
   amazonContainer = null;
 }
 
@@ -5698,6 +5864,7 @@ function toggleAiMode() {
 // ============================================================
 async function startBot(options = {}) {
   if (botRunning || botStarting) return;
+  unlockSoundPlayers();
   cancelAutoResume();
   if (botStartWatchdog) {
     clearTimeout(botStartWatchdog);
@@ -5722,7 +5889,6 @@ async function startBot(options = {}) {
     autoBookAwaitingBaseline = true;
     seenLoads.clear();
     missingCounts.clear();
-    recentlyMissingLoads.clear();
     goneLoads.clear();
     alertedLoads = [];
     isFirstPoll = true;
@@ -5796,6 +5962,8 @@ function stopBot(options = {}) {
   botStarting = false;
   botRunning = false;
   autoBookAwaitingBaseline = false;
+  pollInFlight = false;
+  activePollRequestId = ++nextPollRequestId;
   if (botStartWatchdog) { clearTimeout(botStartWatchdog); botStartWatchdog = null; }
   if (botTimer) { clearTimeout(botTimer); botTimer = null; }
   try { chrome.runtime.sendMessage({ action: "botStopped" }).catch(() => {}); } catch {}
@@ -5808,11 +5976,12 @@ function resetBot() {
   cancelAutoResume();
   seenLoads.clear();
   missingCounts.clear();
-  recentlyMissingLoads.clear();
   alertedLoads = [];
   goneLoads.clear();
   autoBookAwaitingBaseline = false;
   autoBookCandidate = null;
+  pollInFlight = false;
+  activePollRequestId = ++nextPollRequestId;
   isFirstPoll = true;
   lastPollTime = null;
   if (aiModeActive) injectCards();
@@ -5859,6 +6028,8 @@ function handleDetectedAlerts(alerts, sourceLabel = "Bot") {
     botStarting = false;
     botRunning = false;
     autoBookAwaitingBaseline = false;
+    pollInFlight = false;
+    activePollRequestId = ++nextPollRequestId;
     cancelAutoResume();
     if (botStartWatchdog) { clearTimeout(botStartWatchdog); botStartWatchdog = null; }
     if (botTimer) { clearTimeout(botTimer); botTimer = null; }
@@ -5869,6 +6040,8 @@ function handleDetectedAlerts(alerts, sourceLabel = "Bot") {
   }
 
   botRunning = false;
+  pollInFlight = false;
+  activePollRequestId = ++nextPollRequestId;
   if (botTimer) { clearTimeout(botTimer); botTimer = null; }
   alertedLoads.push(...alerts);
   playAlert();
@@ -5879,34 +6052,23 @@ function handleDetectedAlerts(alerts, sourceLabel = "Bot") {
 }
 
 function doPoll() {
+  if (pollInFlight) return false;
+  pollInFlight = true;
+  activePollRequestId = ++nextPollRequestId;
   lastPollTime = Date.now();
-
-  const fallback = {
-    workOpportunityTypeList: ["ONE_WAY", "ROUND_TRIP", "HOSTLER_SHUTTLE"],
-    originCity: null, liveCity: null,
-    originCities: [{ displayValue: "TRACY, CA", stateCode: "CA", isCityLive: false, latitude: 37.724328, longitude: -121.444622, name: "TRACY" }],
-    startCityName: null, startCityStateCode: null, startCityLatitude: null, startCityLongitude: null, startCityDisplayValue: null,
-    isOriginCityLive: null, startCityRadius: 50, destinationCity: null,
-    originCitiesRadiusFilters: [{ cityLatitude: 37.724328, cityLongitude: -121.444622, cityName: "TRACY", cityStateCode: "CA", cityDisplayValue: "TRACY, CA", radius: 50 }],
-    destinationCitiesRadiusFilters: [], exclusionCitiesFilter: null, endCityName: null, endCityStateCode: null, endCityDisplayValue: null,
-    endCityLatitude: null, endCityLongitude: null, isDestinationCityLive: null, endCityRadius: 5, startDate: null, endDate: null,
-    minDistance: null, maxDistance: null, minimumDurationInMillis: null, maximumDurationInMillis: null, minPayout: null, minPricePerDistance: null,
-    driverTypeFilters: ["SINGLE_DRIVER", "TEAM_DRIVER"], uiiaCertificationsFilter: [], workOpportunityOperatingRegionFilter: [],
-    loadingTypeFilters: ["LIVE", "DROP"], maximumNumberOfStops: 3, workOpportunityAccessType: null,
-    sortByField: "relevanceForSearchTab", sortOrder: "asc", visibilityStatusType: "ALL",
-    categorizedEquipmentTypeList: [{ equipmentCategory: "PROVIDED", equipmentsList: ["FIFTY_THREE_FOOT_TRUCK", "SKIRTED_FIFTY_THREE_FOOT_TRUCK", "FIFTY_THREE_FOOT_DRY_VAN", "FIFTY_THREE_FOOT_A5_AIR_TRAILER", "FORTY_FIVE_FOOT_TRUCK", "FIFTY_THREE_FOOT_CONTAINER"] }],
-    categorizedEquipmentTypeListForFilterPills: [{ equipmentCategory: "PROVIDED", equipmentsList: ["FIFTY_THREE_FOOT_TRUCK", "FIFTY_THREE_FOOT_CONTAINER"] }],
-    nextItemToken: 0, resultSize: 50, searchURL: "", isAutoRefreshCall: false, notificationId: "",
-    auditContextMap: JSON.stringify({ rlbChannel: "EXACT_MATCH", isOriginCityLive: "false", isDestinationCityLive: "false", userAgent: navigator.userAgent, source: "AVAILABLE_WORK" }),
-  };
-
-  window.dispatchEvent(new CustomEvent("relay-fetcher-poll", { detail: JSON.stringify({ payload: fallback }) }));
+  window.dispatchEvent(new CustomEvent("relay-fetcher-poll", {
+    detail: JSON.stringify({ requestId: activePollRequestId }),
+  }));
+  return true;
 }
 
 // Handle poll results
 window.addEventListener("relay-fetcher-poll-result", (e) => {
   try {
-    const { status, data, error, seq } = JSON.parse(e.detail);
+    const { status, data, error, seq, requestId } = JSON.parse(e.detail);
+    const resultRequestId = Number(requestId);
+    if (Number.isFinite(resultRequestId) && resultRequestId !== activePollRequestId) return;
+    pollInFlight = false;
     const pollSeq = Number(seq);
     if (Number.isFinite(pollSeq) && pollSeq < latestAutoSearchSeq) return;
     if (!botRunning && !botStarting) return;
@@ -5923,6 +6085,11 @@ window.addEventListener("relay-fetcher-poll-result", (e) => {
           if (dot) { dot.className = "rfx-dot red"; }
           if (txt) { txt.innerHTML = "<b style='color:#cc3333'>Session expired — please refresh the page</b>"; }
         }
+        return;
+      }
+      if (/no search filters/i.test(msg)) {
+        stopBot({ allowAutoResume: false });
+        showToast("No Amazon filters captured. Refresh the Relay search, then press Start again.");
         return;
       }
       console.warn("[Bot] Poll error:", msg);
@@ -5942,11 +6109,9 @@ window.addEventListener("relay-fetcher-poll-result", (e) => {
       allLoads = dedupeLoads(loads);
       alertedLoads = [];
       missingCounts.clear();
-      recentlyMissingLoads.clear();
       goneLoads.clear();
       seedSeenLoads(allLoads);
       isFirstPoll = false;
-      if (loads.length > 0) lastNonEmptySearchAt = Date.now();
       processLookoutAlerts(allLoads, "auto-book-baseline");
       if (aiModeActive) injectCards();
       return;
@@ -5959,23 +6124,14 @@ window.addEventListener("relay-fetcher-poll-result", (e) => {
       allLoads = dedupeLoads(loads);
       alertedLoads = [];
       missingCounts.clear();
-      recentlyMissingLoads.clear();
       goneLoads.clear();
       seedSeenLoads(allLoads);
       isFirstPoll = allLoads.length === 0;
-      if (loads.length > 0) lastNonEmptySearchAt = Date.now();
       processLookoutAlerts(allLoads, "bot-filter-change-complete");
       if (aiModeActive) injectCards();
       return;
     }
 
-    if (loads.length === 0 && shouldIgnoreEmptySearchResult("Bot:Poll")) {
-      if (aiModeActive) injectCards();
-      return;
-    }
-    if (loads.length > 0) lastNonEmptySearchAt = Date.now();
-
-    const wasFirstPoll = isFirstPoll;
 
     // Run detection even on 0 loads (handles first-poll seeding and disappearances)
     const alerts = detectChanges(loads);
@@ -6558,8 +6714,8 @@ function submitPatForm(form) {
     runType: String(fd.get("runType") || prefill.runType),
     originRadius: Number(fd.get("originRadius")) || 25,
     destinationRadius: Number(fd.get("destinationRadius")) || 25,
-    origin: parseCityInfoInput(fd.get("origin"), prefill.origin),
-    destination: parseCityInfoInput(fd.get("destination"), prefill.destination),
+    origin: prefill.origin,
+    destination: prefill.destination,
     driverTypes: prefill.driverTypes,
     loadingTypeList: prefill.loadingTypeList,
     maxStops: prefill.maxStops,
@@ -6570,7 +6726,33 @@ function submitPatForm(form) {
     return;
   }
 
-  const payload = buildPatPayload(wo, values);
+  if (new Date(values.endTime).getTime() <= new Date(values.startTime).getTime()) {
+    showToast("PAT: end time must be after start time.");
+    return;
+  }
+
+  if (values.payout <= 0) {
+    showToast("PAT: payout must be greater than zero.");
+    return;
+  }
+
+  if (values.distanceMax > 0 && values.distanceMin > values.distanceMax) {
+    showToast("PAT: maximum distance must be greater than or equal to minimum distance.");
+    return;
+  }
+
+  if (!values.origin || !values.destination) {
+    showToast("PAT: origin and destination must match cities selected in Amazon Relay.");
+    return;
+  }
+
+  let payload;
+  try {
+    payload = buildPatPayload(wo, values);
+  } catch (err) {
+    showToast(`PAT: ${err?.message || "invalid order data"}.`);
+    return;
+  }
   patState.set(woId, "posting");
   patModalWoId = null;
   if (aiModeActive) injectCards();
@@ -6639,8 +6821,9 @@ window.addEventListener("relay-fetcher-book-direct-result", (e) => {
 window.addEventListener("relay-fetcher-pat-template", (e) => {
   try {
     const { url, payload } = JSON.parse(e.detail);
-    if (url) localStorage.setItem(PAT_ENDPOINT_KEY, url);
-    if (payload) localStorage.setItem(PAT_TEMPLATE_KEY, JSON.stringify(payload));
+    if (url && isSafePatCreateEndpoint(url)) localStorage.setItem(PAT_ENDPOINT_KEY, url);
+    if (payload && url && isSafePatCreateEndpoint(url)) localStorage.setItem(PAT_TEMPLATE_KEY, JSON.stringify(payload));
+    if (payload) rememberCanonicalPatCities(payload);
   } catch (err) {
     console.warn("[PAT] Could not save captured template:", err);
   }
@@ -6649,6 +6832,7 @@ window.addEventListener("relay-fetcher-pat-template", (e) => {
 window.addEventListener("relay-fetcher-pat-orders", (e) => {
   try {
     const { data } = JSON.parse(e.detail);
+    rememberCanonicalPatCities(data);
     const orders = extractPatOrders(data);
     savePatOrders(orders);
     if (orders.length && aiModeActive) injectCards();
@@ -6962,7 +7146,10 @@ function fetchAllLoads() {
       window.removeEventListener("relay-fetcher-progress", onProgress);
       const { data, error } = JSON.parse(e.detail);
       if (btn) btn.textContent = "Fetch All";
-      if (error || data?.errorCode) { resolve(); return; }
+      if (error || data?.errorCode) {
+        resolve({ error: error || data?.defaultErrorMessage || data?.errorCode || "Relay fetch failed" });
+        return;
+      }
       carrierDetails = data?.carrierDetails || carrierDetails;
       currentSearchAuditId = data?.searchAuditId || currentSearchAuditId;
       allLoads = filterCustomExcludedLoads(data?.workOpportunities || []);
@@ -6976,28 +7163,15 @@ function fetchAllLoads() {
       isFirstPoll = false;
       if (aiModeActive) injectCards();
       if (!aiModeActive && allLoads.length > 0) toggleAiMode();
-      resolve();
+      resolve({
+        success: true,
+        loadCount: allLoads.length,
+        totalResults: Number(data?.totalResultsSize) || allLoads.length,
+      });
     }
     window.addEventListener("relay-fetcher-result", onResult);
 
-    const fallback = {
-      workOpportunityTypeList: ["ONE_WAY", "ROUND_TRIP", "HOSTLER_SHUTTLE"], originCity: null, liveCity: null,
-      originCities: [{ displayValue: "TRACY, CA", stateCode: "CA", isCityLive: false, latitude: 37.724328, longitude: -121.444622, name: "TRACY" }],
-      startCityName: null, startCityStateCode: null, startCityLatitude: null, startCityLongitude: null, startCityDisplayValue: null,
-      isOriginCityLive: null, startCityRadius: 50, destinationCity: null,
-      originCitiesRadiusFilters: [{ cityLatitude: 37.724328, cityLongitude: -121.444622, cityName: "TRACY", cityStateCode: "CA", cityDisplayValue: "TRACY, CA", radius: 50 }],
-      destinationCitiesRadiusFilters: [], exclusionCitiesFilter: null, endCityName: null, endCityStateCode: null, endCityDisplayValue: null,
-      endCityLatitude: null, endCityLongitude: null, isDestinationCityLive: null, endCityRadius: 5, startDate: null, endDate: null,
-      minDistance: null, maxDistance: null, minimumDurationInMillis: null, maximumDurationInMillis: null, minPayout: null, minPricePerDistance: null,
-      driverTypeFilters: ["SINGLE_DRIVER", "TEAM_DRIVER"], uiiaCertificationsFilter: [], workOpportunityOperatingRegionFilter: [],
-      loadingTypeFilters: ["LIVE", "DROP"], maximumNumberOfStops: 3, workOpportunityAccessType: null,
-      sortByField: "relevanceForSearchTab", sortOrder: "asc", visibilityStatusType: "ALL",
-      categorizedEquipmentTypeList: [{ equipmentCategory: "PROVIDED", equipmentsList: ["FIFTY_THREE_FOOT_TRUCK", "SKIRTED_FIFTY_THREE_FOOT_TRUCK", "FIFTY_THREE_FOOT_DRY_VAN", "FIFTY_THREE_FOOT_A5_AIR_TRAILER", "FORTY_FIVE_FOOT_TRUCK", "FIFTY_THREE_FOOT_CONTAINER"] }],
-      categorizedEquipmentTypeListForFilterPills: [{ equipmentCategory: "PROVIDED", equipmentsList: ["FIFTY_THREE_FOOT_TRUCK", "FIFTY_THREE_FOOT_CONTAINER"] }],
-      nextItemToken: 0, resultSize: 50, searchURL: "", isAutoRefreshCall: false, notificationId: "",
-      auditContextMap: JSON.stringify({ rlbChannel: "EXACT_MATCH", isOriginCityLive: "false", isDestinationCityLive: "false", userAgent: navigator.userAgent, source: "AVAILABLE_WORK" }),
-    };
-    window.dispatchEvent(new CustomEvent("relay-fetcher-fetch", { detail: JSON.stringify({ payload: fallback }) }));
+    window.dispatchEvent(new CustomEvent("relay-fetcher-fetch", { detail: JSON.stringify({}) }));
   });
 }
 
@@ -7010,6 +7184,8 @@ window.addEventListener("relay-fetcher-search-start", (e) => {
     const searchSeq = Number(seq);
     if (Number.isFinite(searchSeq) && searchSeq > latestAutoSearchSeq) {
       latestAutoSearchSeq = searchSeq;
+      pollInFlight = false;
+      activePollRequestId = ++nextPollRequestId;
     }
   } catch (err) {
     console.error("[Relay Fetcher] Search-start error:", err);
@@ -7019,6 +7195,7 @@ window.addEventListener("relay-fetcher-search-start", (e) => {
 window.addEventListener("relay-fetcher-auto-update", (e) => {
   try {
     const { data, payload, seq } = JSON.parse(e.detail);
+    rememberCanonicalPatCities(payload);
     if (Number.isFinite(Number(seq))) {
       if (Number(seq) < latestAutoSearchSeq) return;
       latestAutoSearchSeq = Number(seq);
@@ -7041,17 +7218,26 @@ window.addEventListener("relay-fetcher-auto-update", (e) => {
         pendingPartialSearchSignature = "";
       }
 
-      // A partial response for the current filters adds no new information. For a newly
-      // changed filter, however, it is the fastest authoritative result set available.
-      if (isPartialPage && !filterChanged) return;
+      const canDetectLiveSearch = botRunning && !(settings.autoBook && autoBookAwaitingBaseline);
 
-      if (pageLoads.length > 0) lastNonEmptySearchAt = Date.now();
+      // A first page can safely reveal additions, but cannot prove that loads from later
+      // pages disappeared. Detect additions now so short-lived loads are not missed.
+      if (isPartialPage && !filterChanged) {
+        if (canDetectLiveSearch && !isFirstPoll) {
+          const alerts = detectChanges(pageLoads, { trackMissing: false });
+          allLoads = dedupeLoads([...allLoads, ...pageLoads]);
+          processLookoutAlerts(allLoads, "page-search-partial");
+          if (alerts.length > 0) handleDetectedAlerts(alerts, "Amazon:LiveSearch");
+          if (aiModeActive) injectCards();
+        }
+        return;
+      }
+
 
       if (replacesSearchResults) {
         allLoads = dedupeLoads(pageLoads);
         alertedLoads = [];
         missingCounts.clear();
-        recentlyMissingLoads.clear();
         goneLoads.clear();
         seedSeenLoads(allLoads);
         isFirstPoll = allLoads.length === 0;
@@ -7060,22 +7246,46 @@ window.addEventListener("relay-fetcher-auto-update", (e) => {
         return;
       }
 
-      if (pageLoads.length === 0 && shouldIgnoreEmptySearchResult("Bot:AutoUpdate")) {
-        if (aiModeActive) injectCards();
-        return;
-      }
-
       if (pageLoads.length === 0) {
+        if (canDetectLiveSearch && !data._rfxPaginationFailed) {
+          detectChanges([]);
+          allLoads = [];
+          processLookoutAlerts(allLoads, "page-search-empty");
+          if (aiModeActive) injectCards();
+          return;
+        }
         if (botRunning || botStarting || alertPaused) {
+          if (alertPaused && !data._rfxPaginationFailed) {
+            allLoads = [];
+            processLookoutAlerts(allLoads, "page-search-paused-empty");
+            if (aiModeActive) injectCards();
+          }
           return;
         }
         allLoads = [];
         alertedLoads = [];
         seenLoads.clear();
         missingCounts.clear();
-        recentlyMissingLoads.clear();
         goneLoads.clear();
         isFirstPoll = false;
+        if (aiModeActive) injectCards();
+        return;
+      }
+
+      // A complete current-filter response is authoritative. Run detection immediately
+      // and replace the board so a load booked by someone else does not remain stale.
+      if (canDetectLiveSearch && !data._rfxPaginationFailed) {
+        const alerts = detectChanges(pageLoads);
+        allLoads = dedupeLoads(pageLoads);
+        processLookoutAlerts(allLoads, "page-search-complete");
+        if (alerts.length > 0) handleDetectedAlerts(alerts, "Amazon:LiveSearch");
+        if (aiModeActive) injectCards();
+        return;
+      }
+
+      if (alertPaused && !data._rfxPaginationFailed) {
+        allLoads = dedupeLoads(pageLoads);
+        processLookoutAlerts(allLoads, "page-search-paused-complete");
         if (aiModeActive) injectCards();
         return;
       }
@@ -7106,8 +7316,19 @@ window.addEventListener("relay-fetcher-auto-update", (e) => {
   } catch (err) { console.error("[Relay Fetcher] Auto-update error:", err); }
 });
 
-// Keepalive handler
-chrome.runtime.onMessage.addListener((msg) => { if (msg.action === "keepalive") return; });
+// Popup and keepalive bridge
+chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
+  if (msg.action === "keepalive") {
+    sendResponse?.({ ok: true });
+    return;
+  }
+  if (msg.action === "fetchLoads") {
+    fetchAllLoads()
+      .then(result => sendResponse(result || { error: "Relay fetch returned no result" }))
+      .catch(err => sendResponse({ error: err?.message || String(err) }));
+    return true;
+  }
+});
 
 // ============================================================
 // TRIPS PAGES — fuel profit badges for upcoming/in-transit/history
@@ -7277,6 +7498,9 @@ const observer = new MutationObserver((mutations) => {
     return;
   }
   if (!isLoadBoardPage()) return;
+  ensureInterceptorInjected();
+  ensureBackButton();
+  setupChatObserver();
   for (const m of mutations) {
     if (m.target.id === "rfx-host" || m.target.closest?.("#rfx-host")) return;
   }
@@ -7309,18 +7533,8 @@ function ensureObserverStarted() {
 // ============================================================
 // INIT
 // ============================================================
-function init() {
-  ensurePageFontReset();
-  applyPageTheme();
-  ensurePageThemeMediaListener();
-  ensureObserverStarted();
-  if (isTripsPage()) {
-    scheduleTripsProfitCalculator(800);
-    return;
-  }
-  if (!isLoadBoardPage()) return;
-
-  // Persistent "AI Loads" button — injected into the same area as the load list
+function ensureBackButton() {
+  if (!document.body || document.getElementById("rfx-back-btn")) return;
   const backBtn = document.createElement("div");
   backBtn.id = "rfx-back-btn";
   backBtn.style.cssText = "display:none; padding:12px 0;";
@@ -7332,7 +7546,20 @@ function init() {
   ">AI Loads</button>`;
   backBtn.querySelector("button").addEventListener("click", toggleAiMode);
   document.body.appendChild(backBtn);
+}
 
+function init() {
+  ensurePageFontReset();
+  applyPageTheme();
+  ensurePageThemeMediaListener();
+  ensureObserverStarted();
+  if (isTripsPage()) {
+    scheduleTripsProfitCalculator(800);
+    return;
+  }
+  if (!isLoadBoardPage()) return;
+  ensureInterceptorInjected();
+  ensureBackButton();
   setupChatObserver();
   scheduleDisableAmazonAutoRefresh(800);
   setTimeout(disableAmazonAutoRefreshIfEnabled, 2500);
