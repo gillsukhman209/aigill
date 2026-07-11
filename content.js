@@ -140,6 +140,7 @@ const DEFAULT_SETTINGS = {
   removedDefaultExcludedCityKeys: [],
   ignoredLoadIds: [],
   discordWebhookUrl: "https://discord.com/api/webhooks/1519115434975297677/i9M8iFOM_e1BOTnxGDmHSFKvQQ2wIHAOMM84K147MqO97_axmqQi5l4QxeXerydPweFL",
+  discordNewLoadAlerts: true,
   lookoutEnabled: false,
   lookoutGroups: [],
   lookoutRules: [],
@@ -2396,6 +2397,31 @@ function buildLookoutDiscordPayload(rule, wo, match, alertInfo) {
   };
 }
 
+function buildNewLoadDiscordPayload(wo, sourceLabel) {
+  const stops = getAllStops(wo);
+  const first = stops[0] || null;
+  const last = stops[stops.length - 1] || first;
+  const route = `${stopCityState(first)} → ${stopCityState(last)}`;
+  const start = fmtStopDateTime(getStopCheckin(first), first?.location?.timeZone);
+  const end = fmtStopDateTime(getStopCheckout(last) || getStopCheckin(last), last?.location?.timeZone);
+  return {
+    content: `New Relay load: ${route} - ${fmt$(Number(wo?.payout?.value) || 0)}`,
+    embeds: [{
+      title: "New Relay Load",
+      description: route,
+      color: 0x00a67e,
+      fields: [
+        { name: "Start", value: start || "N/A", inline: true },
+        { name: "End", value: end || "N/A", inline: true },
+        { name: "Details", value: truncateDiscordValue(getLookoutLoadDetails(wo)), inline: false },
+        { name: "Stops", value: truncateDiscordValue(getLookoutStopLines(wo).join("\n\n")), inline: false },
+      ],
+      footer: { text: sourceLabel || "Relay Load Fetcher" },
+      timestamp: new Date().toISOString(),
+    }],
+  };
+}
+
 function sendDiscordPayload(payload) {
   return new Promise((resolve, reject) => {
     const webhookUrl = settings.discordWebhookUrl;
@@ -2415,6 +2441,20 @@ function sendDiscordPayload(payload) {
       resolve(response);
     });
   });
+}
+
+async function sendNewLoadDiscordAlerts(alerts, sourceLabel) {
+  if (!settings.discordNewLoadAlerts || !settings.discordWebhookUrl) return;
+  for (const alert of alerts || []) {
+    const wo = alert?.wo;
+    if (!wo?.id) continue;
+    try {
+      await sendDiscordPayload(buildNewLoadDiscordPayload(wo, sourceLabel));
+      console.log(`[Discord] Sent new-load alert: ${String(wo.id).slice(0, 8)}`);
+    } catch (err) {
+      console.warn(`[Discord] New-load alert failed for ${String(wo.id).slice(0, 8)}:`, err);
+    }
+  }
 }
 
 async function processLookoutAlerts(loads, source = "search") {
@@ -4887,6 +4927,7 @@ function injectCards() {
           ${chk("amazonOnlyFacilities", "Amazon facilities only")}
           ${chk("patEnabled", "PAT — show Post A Truck button on loads")}
           ${chk("hideFuzzyPatFooter", "Hide close-match PAT footer")}
+          ${chk("discordNewLoadAlerts", "Discord alerts for new loads")}
           <div class="rfx-setting-row">
             <input type="checkbox" id="rfx-theme-dark-toggle" ${isPageDarkThemeActive() ? "checked" : ""}>
             <label for="rfx-theme-dark-toggle">Dark mode</label>
@@ -6010,6 +6051,7 @@ function handleDetectedAlerts(alerts, sourceLabel = "Bot") {
   if (!alerts.length) return false;
 
   const newLoads = alerts.filter(a => a.badge === "NEW");
+  if (newLoads.length) sendNewLoadDiscordAlerts(newLoads, sourceLabel);
 
   if (settings.autoBook) {
     const selected = selectAutoBookCandidate(newLoads);
