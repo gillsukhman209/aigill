@@ -137,6 +137,8 @@ const DEFAULT_SETTINGS = {
   roundTripRequireSameEquipment: true,
   roundTripsCollapsed: false,
   customExcludedCities: DEFAULT_CUSTOM_EXCLUDED_CITIES,
+  excludedWarehouseCodesEnabled: false,
+  excludedWarehouseCodes: [],
   removedDefaultExcludedCityKeys: [],
   ignoredLoadIds: [],
   discordWebhookUrl: "https://discord.com/api/webhooks/1519115434975297677/i9M8iFOM_e1BOTnxGDmHSFKvQQ2wIHAOMM84K147MqO97_axmqQi5l4QxeXerydPweFL",
@@ -166,6 +168,7 @@ let settings = { ...DEFAULT_SETTINGS };
 function loadSettings() {
   try { const s = JSON.parse(localStorage.getItem(SETTINGS_KEY)); if (s) settings = { ...DEFAULT_SETTINGS, ...s }; } catch {}
   settings.customExcludedCities = normalizeCustomExcludedCityList(settings.customExcludedCities);
+  settings.excludedWarehouseCodes = normalizeExcludedWarehouseCodes(settings.excludedWarehouseCodes);
   settings.bookedTimeBlocks = normalizeBookedTimeBlocks(settings.bookedTimeBlocks);
   if (!["warn", "hide"].includes(settings.bookedTimeBlockMode)) settings.bookedTimeBlockMode = "warn";
   if (!["system", "light", "dark"].includes(settings.themeMode)) settings.themeMode = "system";
@@ -1795,6 +1798,57 @@ function passesCustomExcludedCities(wo) {
   );
 }
 
+function normalizeWarehouseCode(value) {
+  return String(value || "")
+    .trim()
+    .toUpperCase()
+    .replace(/\s+/g, "")
+    .replace(/[^A-Z0-9_-]/g, "")
+    .slice(0, 40);
+}
+
+function normalizeExcludedWarehouseCodes(codes) {
+  const values = Array.isArray(codes)
+    ? codes
+    : typeof codes === "string"
+      ? codes.split(/[\s,]+/)
+      : [];
+  return Array.from(new Set(values.map(normalizeWarehouseCode).filter(Boolean))).sort();
+}
+
+function getExcludedWarehouseCodes() {
+  return normalizeExcludedWarehouseCodes(settings.excludedWarehouseCodes);
+}
+
+function saveExcludedWarehouseCodes(codes) {
+  settings.excludedWarehouseCodes = normalizeExcludedWarehouseCodes(codes);
+  saveSettings();
+}
+
+function getStopWarehouseCodes(stop) {
+  const loc = stop?.location || {};
+  return normalizeExcludedWarehouseCodes([
+    loc.label,
+    loc.stopCode,
+    loc.facilityCode,
+    loc.locationCode,
+    loc.nodeCode,
+    stop?.facilityCode,
+  ]);
+}
+
+function getLoadWarehouseCodes(wo) {
+  return new Set(getAllStops(wo).flatMap(getStopWarehouseCodes));
+}
+
+function passesExcludedWarehouseCodes(wo) {
+  if (!settings.excludedWarehouseCodesEnabled) return true;
+  const excluded = getExcludedWarehouseCodes();
+  if (!excluded.length) return true;
+  const loadCodes = getLoadWarehouseCodes(wo);
+  return !excluded.some(code => loadCodes.has(code));
+}
+
 function filterCustomExcludedLoads(loads) {
   return (loads || []).filter(wo => passesCustomExcludedCities(wo) && passesAmazonOnlyFacilities(wo) && !isIgnoredLoad(wo?.id));
 }
@@ -1842,6 +1896,25 @@ function renderCustomExcludedCitySettings() {
       <datalist id="rfx-excluded-city-list">${options}</datalist>
     </div>
     <div class="rfx-city-help">Cleans typos/spaces/symbols and autocorrects against cities seen in Relay results.</div>
+    <div class="rfx-city-chips">${chips}</div>
+  </div>`;
+}
+
+function renderExcludedWarehouseSettings() {
+  const codes = getExcludedWarehouseCodes();
+  const chips = codes.length
+    ? codes.map(code => `<button type="button" class="rfx-city-chip" data-remove-warehouse-code="${escapeHtml(code)}">${escapeHtml(code)} ×</button>`).join("")
+    : `<span class="rfx-city-empty">No excluded warehouse codes</span>`;
+  return `<div class="rfx-city-exclude-box">
+    <div class="rfx-setting-row">
+      <input type="checkbox" id="rfx-s-excludedWarehouseCodesEnabled" ${settings.excludedWarehouseCodesEnabled ? "checked" : ""} data-key="excludedWarehouseCodesEnabled">
+      <label for="rfx-s-excludedWarehouseCodesEnabled">Hide loads containing an excluded warehouse</label>
+    </div>
+    <div class="rfx-city-input-row">
+      <input type="text" id="rfx-excluded-warehouse-input" placeholder="Warehouse code, e.g. SCK4" maxlength="40" autocapitalize="characters" spellcheck="false">
+      <button type="button" id="rfx-add-excluded-warehouse">Add</button>
+    </div>
+    <div class="rfx-city-help">Exact code matching, case-insensitive. Every pickup and drop-off on the load is checked.</div>
     <div class="rfx-city-chips">${chips}</div>
   </div>`;
 }
@@ -2060,7 +2133,7 @@ function getLoadLookoutEndMs(wo) {
 
 function matchesLookoutRule(wo, rule, groupsById) {
   if (!wo?.id || !rule?.enabled) return { ok: false, reason: "disabled" };
-  if (isIgnoredLoad(wo.id) || !passesCustomExcludedCities(wo)) return { ok: false, reason: "hidden" };
+  if (isIgnoredLoad(wo.id) || !passesCustomExcludedCities(wo) || !passesExcludedWarehouseCodes(wo)) return { ok: false, reason: "hidden" };
   if (rule.amazonOnly && isPrivateLoad(wo)) return { ok: false, reason: "private" };
 
   const originGroup = groupsById.get(rule.originGroupId);
@@ -2121,7 +2194,7 @@ function refreshDetectionGroupCoordinates() {
 
 function matchesDetectionRule(wo, rule, groupsById) {
   if (!wo?.id || !rule?.enabled) return { ok: false, reason: "disabled" };
-  if (isIgnoredLoad(wo.id) || !passesCustomExcludedCities(wo) || !passesAmazonOnlyFacilities(wo)) return { ok: false, reason: "hidden" };
+  if (isIgnoredLoad(wo.id) || !passesCustomExcludedCities(wo) || !passesExcludedWarehouseCodes(wo) || !passesAmazonOnlyFacilities(wo)) return { ok: false, reason: "hidden" };
   if (rule.amazonOnly && isPrivateLoad(wo)) return { ok: false, reason: "private" };
 
   const originGroups = uniqueGroupIds(rule.originGroupIds?.length ? rule.originGroupIds : rule.originGroupId)
@@ -2191,6 +2264,7 @@ function passesDetectionDisplayRules(wo) {
 }
 
 function passesDetectionAlertRules(wo) {
+  if (!passesExcludedWarehouseCodes(wo)) return false;
   if (!passesCustomDateFilter(wo)) return false;
   if (!passesBookedTimeBlockFilter(wo)) return false;
   if (!settings.detectionOnlyAlertMatchingRules || !getActiveDetectionRules().length) return true;
@@ -2200,6 +2274,7 @@ function passesDetectionAlertRules(wo) {
 function passesDisplayedLoadFilters(wo) {
   return !!wo?.id
     && passesCustomExcludedCities(wo)
+    && passesExcludedWarehouseCodes(wo)
     && passesAmazonOnlyFacilities(wo)
     && passesDetectionDisplayRules(wo)
     && passesCustomDateFilter(wo)
@@ -4698,11 +4773,12 @@ function renderCustomLoadBoard() {
     Array.from(loadMap.values()).filter(wo => !alertMap.has(wo.id) && passesDisplayedLoadFilters(wo))
   );
   const hiddenByCity = Array.from(loadMap.values()).filter(wo => !passesCustomExcludedCities(wo)).length;
-  const hiddenByFacility = Array.from(loadMap.values()).filter(wo => passesCustomExcludedCities(wo) && !passesAmazonOnlyFacilities(wo)).length;
-  const hiddenByDetection = Array.from(loadMap.values()).filter(wo => passesCustomExcludedCities(wo) && passesAmazonOnlyFacilities(wo) && !passesDetectionDisplayRules(wo)).length;
-  const hiddenByDate = Array.from(loadMap.values()).filter(wo => passesCustomExcludedCities(wo) && passesAmazonOnlyFacilities(wo) && passesDetectionDisplayRules(wo) && !passesCustomDateFilter(wo)).length;
-  const hiddenByTimeBlock = Array.from(loadMap.values()).filter(wo => passesCustomExcludedCities(wo) && passesAmazonOnlyFacilities(wo) && passesDetectionDisplayRules(wo) && passesCustomDateFilter(wo) && !passesBookedTimeBlockFilter(wo)).length;
-  const hiddenByLoad = Array.from(loadMap.values()).filter(wo => passesCustomExcludedCities(wo) && passesAmazonOnlyFacilities(wo) && passesDetectionDisplayRules(wo) && passesCustomDateFilter(wo) && passesBookedTimeBlockFilter(wo) && isIgnoredLoad(wo.id)).length;
+  const hiddenByWarehouse = Array.from(loadMap.values()).filter(wo => passesCustomExcludedCities(wo) && !passesExcludedWarehouseCodes(wo)).length;
+  const hiddenByFacility = Array.from(loadMap.values()).filter(wo => passesCustomExcludedCities(wo) && passesExcludedWarehouseCodes(wo) && !passesAmazonOnlyFacilities(wo)).length;
+  const hiddenByDetection = Array.from(loadMap.values()).filter(wo => passesCustomExcludedCities(wo) && passesExcludedWarehouseCodes(wo) && passesAmazonOnlyFacilities(wo) && !passesDetectionDisplayRules(wo)).length;
+  const hiddenByDate = Array.from(loadMap.values()).filter(wo => passesCustomExcludedCities(wo) && passesExcludedWarehouseCodes(wo) && passesAmazonOnlyFacilities(wo) && passesDetectionDisplayRules(wo) && !passesCustomDateFilter(wo)).length;
+  const hiddenByTimeBlock = Array.from(loadMap.values()).filter(wo => passesCustomExcludedCities(wo) && passesExcludedWarehouseCodes(wo) && passesAmazonOnlyFacilities(wo) && passesDetectionDisplayRules(wo) && passesCustomDateFilter(wo) && !passesBookedTimeBlockFilter(wo)).length;
+  const hiddenByLoad = Array.from(loadMap.values()).filter(wo => passesCustomExcludedCities(wo) && passesExcludedWarehouseCodes(wo) && passesAmazonOnlyFacilities(wo) && passesDetectionDisplayRules(wo) && passesCustomDateFilter(wo) && passesBookedTimeBlockFilter(wo) && isIgnoredLoad(wo.id)).length;
 
   const sortBtn = (key, label) => {
     const active = currentSort === key ? " active" : "";
@@ -4719,9 +4795,10 @@ function renderCustomLoadBoard() {
   ].join("");
   const boardLoads = Array.from(loadMap.values()).filter(passesDisplayedLoadFilters);
   const roundTripsHtml = renderRoundTripMatches(boardLoads, alertMap);
-  const hiddenTotal = hiddenByCity + hiddenByFacility + hiddenByDetection + hiddenByDate + hiddenByTimeBlock + hiddenByLoad;
+  const hiddenTotal = hiddenByCity + hiddenByWarehouse + hiddenByFacility + hiddenByDetection + hiddenByDate + hiddenByTimeBlock + hiddenByLoad;
   const hiddenReasons = [
     hiddenByCity ? `${hiddenByCity} excluded city` : "",
+    hiddenByWarehouse ? `${hiddenByWarehouse} excluded warehouse` : "",
     hiddenByFacility ? `${hiddenByFacility} non-Amazon/private` : "",
     hiddenByDetection ? `${hiddenByDetection} detection rule` : "",
     hiddenByDate ? `${hiddenByDate} date window` : "",
@@ -4974,6 +5051,10 @@ function injectCards() {
         <div class="rfx-settings-section rfx-settings-section-full">
           <div class="rfx-settings-section-title">Custom Excluded Cities</div>
           ${renderCustomExcludedCitySettings()}
+        </div>
+        <div class="rfx-settings-section rfx-settings-section-full">
+          <div class="rfx-settings-section-title">Excluded Warehouses</div>
+          ${renderExcludedWarehouseSettings()}
         </div>
         <div class="rfx-settings-section">
           <div class="rfx-settings-section-title">Hidden Loads</div>
@@ -5272,6 +5353,34 @@ function injectCards() {
 	      injectCards();
 	    });
 	  });
+	  const addExcludedWarehouse = () => {
+	    const input = shadowRoot.getElementById("rfx-excluded-warehouse-input");
+	    const code = normalizeWarehouseCode(input?.value || "");
+	    if (!code) {
+	      showToast("Enter a valid warehouse code.");
+	      return;
+	    }
+	    settings.excludedWarehouseCodesEnabled = true;
+	    saveExcludedWarehouseCodes([...getExcludedWarehouseCodes(), code]);
+	    injectCards();
+	  };
+	  const excludedWarehouseInput = shadowRoot.getElementById("rfx-excluded-warehouse-input");
+	  const addExcludedWarehouseBtn = shadowRoot.getElementById("rfx-add-excluded-warehouse");
+	  if (addExcludedWarehouseBtn) addExcludedWarehouseBtn.addEventListener("click", addExcludedWarehouse);
+	  if (excludedWarehouseInput) {
+	    excludedWarehouseInput.addEventListener("keydown", (e) => {
+	      if (e.key === "Enter") {
+	        e.preventDefault();
+	        addExcludedWarehouse();
+	      }
+	    });
+	  }
+	  shadowRoot.querySelectorAll("[data-remove-warehouse-code]").forEach(btn => {
+	    btn.addEventListener("click", () => {
+	      saveExcludedWarehouseCodes(getExcludedWarehouseCodes().filter(code => code !== btn.dataset.removeWarehouseCode));
+	      injectCards();
+	    });
+	  });
 	  shadowRoot.querySelectorAll("[data-hide-load-id]").forEach(btn => {
 	    btn.addEventListener("click", (e) => {
 	      e.preventDefault();
@@ -5474,6 +5583,11 @@ function styleAmazonLoadCards() {
 	    }
 	    if (isIgnoredLoad(woId)) {
 	      card.classList.add("rfx-load-ignored");
+	      return;
+	    }
+	    if (!passesExcludedWarehouseCodes(wo)) {
+	      card.classList.add("rfx-no-match");
+	      hideUnmatchedLoadCard(card);
 	      return;
 	    }
 	    if (!passesDetectionDisplayRules(wo)) {
